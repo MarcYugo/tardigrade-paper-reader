@@ -17,6 +17,15 @@ def _text(block_id, text, y):
     }
 
 
+def _text_at(block_id, text, y, x):
+    """同 `_text`，但可以指定左侧 x（参考文献区的悬挂缩进靠它）。"""
+    block = _text(block_id, text, y)
+    block["x"] = x
+    block["lines"][0]["x"] = x
+    block["lines"][0]["w"] = 500 - (x - 10)
+    return block
+
+
 class ReferenceFallbackTest(unittest.TestCase):
     def test_author_year_tokens_match_entries_without_links(self):
         doc = {
@@ -80,6 +89,133 @@ class ReferenceFallbackTest(unittest.TestCase):
         result = build_refs(doc)
 
         self.assertEqual(result["links"], [])
+
+    def test_heading_merged_with_first_author_year_entry(self):
+        """本地解析方案会把标题和第一条并进同一个块（`References [Smith…]`）。"""
+        doc = {
+            "parser": "pymupdf",
+            "parser_info": {"links_total": 0},
+            "pages": [
+                {"texts": [
+                    _text("p0b0", "See [Smith, 2020] and [Wu et al., 2021].", 20),
+                ]},
+                {"texts": [
+                    _text("p1b0",
+                          "References [Smith and Jones, 2020] First paper. "
+                          "ACM, 2020. [Wu et al., 2021] Second paper.", 30),
+                ]},
+            ],
+        }
+
+        result = build_refs(doc)
+
+        self.assertEqual(result["section_page"], 1)
+        self.assertEqual([entry["n"] for entry in result["entries"]], [None, None])
+        self.assertEqual(
+            [entry["label"] for entry in result["entries"]],
+            ["[Smith and Jones, 2020]", "[Wu et al., 2021]"],
+        )
+        # 块中间的标签也要切开：上一条的结尾（ACM, 2020.）不能并进下一条。
+        self.assertTrue(result["entries"][0]["text"].endswith("ACM, 2020."))
+        self.assertTrue(result["entries"][1]["text"].startswith("[Wu et al., 2021]"))
+        self.assertEqual(
+            [(link["token"], link["refs"]) for link in result["links"]],
+            [("[Smith, 2020]", [0]), ("[Wu et al., 2021]", [1])],
+        )
+
+    def test_author_year_scan_is_merged_with_goto_links(self):
+        """PDF 只给部分引用做了 hyperref 时，其余作者-年份引用也要标出来。"""
+        doc = {
+            "parser": "pymupdf",
+            "parser_info": {"links_total": 1},
+            "pages": [
+                {
+                    "texts": [_text(
+                        "p0b0",
+                        "Prior [Smith et al., 2020] and [Wu et al., 2021].",
+                        20,
+                    )],
+                    "links": [{"kind": "goto", "rect": [10, 20, 70, 32],
+                               "page": 1, "to": [10, 30]}],
+                },
+                {"texts": [
+                    _text("p1b0", "References", 10),
+                    _text("p1b1", "[Smith and Jones, 2020] First paper.", 30),
+                    _text("p1b2", "[Wu et al., 2021] Second paper.", 60),
+                ]},
+            ],
+        }
+
+        result = build_refs(doc)
+
+        self.assertEqual(
+            [(link["token"], link["refs"]) for link in result["links"]],
+            [("[Smith et al., 2020]", [0]), ("[Wu et al., 2021]", [1])],
+        )
+
+    def test_unlabelled_author_year_list_is_split_by_hanging_indent(self):
+        """ACL/arXiv 风格的参考文献没有 `[作者, 年份]` 标签：条目行首直接是作者名。
+
+        PyMuPDF 句子级块会把一条文献切成「作者 / 标题+年份 / 出处」几块，标题块
+        **含年份**——旧规则“含年份的块起条目”会让每条变成「标题+年份 + 下一条作者」，
+        作者与年份永远不在同一条目里，作者-年份令牌全部标不出来。
+        """
+        doc = {
+            "parser": "pymupdf",
+            "parser_info": {"links_total": 0},
+            "pages": [{
+                "texts": [
+                    _text("p0b0", "We build on (Smith et al., 2020) and (Lee et al., 2020).", 20),
+                    _text("p0b1", "References", 10),
+                    # 条目首行齐左边缘（x=10），标题/出处缩进 10pt
+                    _text_at("p0b2", "Alan Smith, Bo Chen, and Cy Doe.", 30, 10),
+                    _text_at("p0b3", "A study of flows. arXiv preprint arXiv:2001.01234, 2020. "
+                                    "(page 6)", 42, 20),
+                    _text_at("p0b4", "Chanhyuk Lee, Dana Wu, and Eli Kim.", 60, 10),
+                    _text_at("p0b5", "Looped language models. PMLR, 2020. (pages 1, 3)", 72, 20),
+                ],
+            }],
+        }
+
+        result = build_refs(doc)
+
+        self.assertEqual(result["counts"]["entries"], 2)
+        # 一条 = 作者 + 标题 + 出处；反向页码标记不该留在条目文字里
+        self.assertTrue(result["entries"][0]["text"].startswith("Alan Smith, Bo Chen"))
+        self.assertTrue(result["entries"][0]["text"].endswith("2020."))
+        self.assertNotIn("(page", result["entries"][0]["text"])
+        # 无标签条目也要有人看得懂的标签（前端卡片徽标）
+        self.assertEqual([e["label"] for e in result["entries"]],
+                         ["[Smith, 2020]", "[Lee, 2020]"])
+        self.assertEqual(
+            [(link["token"], link["refs"]) for link in result["links"]],
+            [("(Smith et al., 2020)", [0]), ("(Lee et al., 2020)", [1])],
+        )
+
+    def test_first_author_beats_coauthor_for_author_year_tokens(self):
+        """共同作者不该让同年的其他文献也挂到同一个引用上。"""
+        doc = {
+            "parser": "pymupdf",
+            "parser_info": {"links_total": 0},
+            "pages": [{
+                "texts": [
+                    _text("p0b0", "Compared with (Wu et al., 2021).", 20),
+                    _text("p0b1", "References", 10),
+                    _text_at("p0b2", "Chanhyuk Lee, Dana Wu, and Eli Kim.", 30, 10),
+                    _text_at("p0b3", "First paper. PMLR, 2021.", 42, 20),
+                    _text_at("p0b4", "Dana Wu and Alan Smith.", 60, 10),
+                    _text_at("p0b5", "Second paper. PMLR, 2021.", 72, 20),
+                ],
+            }],
+        }
+
+        result = build_refs(doc)
+
+        # Wu 是第一条的共同作者、第二条的第一作者 → 只认第二条
+        self.assertEqual(
+            [(link["token"], link["refs"]) for link in result["links"]],
+            [("(Wu et al., 2021)", [1])],
+        )
 
 
 class SuryaReferenceTest(unittest.TestCase):
@@ -222,6 +358,69 @@ class SuryaReferenceTest(unittest.TestCase):
         self.assertEqual(
             [(link["token"], link["refs"]) for link in result["links"]],
             [("[Smith et al., 2020]", [0]), ("[Wu et al., 2021]", [1])],
+        )
+
+    def test_unlabelled_author_year_references_split_by_line(self):
+        """ACL/arXiv 风格（条目首行直接是作者名）也要按行拆成独立块。"""
+        references = _text(
+            "p1b1",
+            "Manan Agarwal, Sheel Shah, and Jinwoo Kim. Posterior refinement: "
+            "Fast language generation via any-order flow maps. arXiv preprint "
+            "arXiv:2606.24773, 2026. (page 6)\n"
+            # 姓名缩写不带句点（`S`）：以前这一行认不出条目开头，整条被并进上一条
+            "Michael S Albergo and Eric Vanden-Eijnden. Building normalizing flows "
+            "with stochastic interpolants. arXiv preprint arXiv:2209.15571, 2022. "
+            "(page 6)\n"
+            # 折行条目：上一行没有句末标点，续行不能当新条目
+            "Cem Anil, Shaojie Bai, and J Zico Kolter. Path independent equilibrium "
+            "models can better exploit test-time computation. Advances in Neural "
+            "Information\n"
+            "Processing Systems, 35:7796–7809, 2022. (page 6)\n"
+            "Alan Baddeley. Working memory. Science, 255(5044):556–559, 1992. (page 1)",
+            30,
+        )
+        references.update({"h": 80, "size": 10, "kind": "list"})
+        references["lines"][0]["h"] = 80
+        pages = [{"texts": [
+            _text("p0b0", "Prior work (Albergo and Vanden-Eijnden, 2022) and "
+                  "(Baddeley, 1992).", 20),
+            _text("p1b0", "References", 10),
+            references,
+        ]}]
+
+        added = split_surya_reference_blocks(pages)
+        blocks = pages[0]["texts"][2:]
+
+        self.assertEqual(added, {"list": 3})
+        self.assertTrue(all(block.get("ref_entry") for block in blocks))
+        self.assertEqual([block["ref_number"] for block in blocks],
+                         [None, None, None, None])
+        self.assertTrue(blocks[0]["text"].startswith("Manan Agarwal,"))
+        self.assertTrue(blocks[1]["text"].startswith("Michael S Albergo and"))
+        # 折行条目仍是**一条**（`Processing Systems, …` 不另起）
+        self.assertEqual(" ".join(blocks[2]["text"].split()),
+                         "Cem Anil, Shaojie Bai, and J Zico Kolter. Path independent "
+                         "equilibrium models can better exploit test-time computation. "
+                         "Advances in Neural Information Processing Systems, "
+                         "35:7796–7809, 2022. (page 6)")
+        self.assertEqual(blocks[3]["text"],
+                         "Alan Baddeley. Working memory. Science, "
+                         "255(5044):556–559, 1992. (page 1)")
+
+        result = build_refs({
+            "parser": "surya",
+            "parser_info": {"links_total": 0},
+            "pages": pages,
+        })
+
+        self.assertEqual(result["counts"]["entries"], 4)
+        # 无标签条目也要有卡片徽标（第一作者姓氏 + 年份）
+        self.assertEqual([entry["label"] for entry in result["entries"]],
+                         ["[Agarwal, 2026]", "[Albergo, 2022]", "[Anil, 2022]",
+                          "[Baddeley, 1992]"])
+        self.assertEqual(
+            [(link["token"], link["refs"]) for link in result["links"]],
+            [("(Albergo and Vanden-Eijnden, 2022)", [1]), ("(Baddeley, 1992)", [3])],
         )
 
     def test_surya_scans_unlinked_numeric_citations_alongside_goto_links(self):

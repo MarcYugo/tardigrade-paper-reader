@@ -8,7 +8,7 @@
    - **多账号 / 切换账号**：登录页本身就有「登录 / 注册新账号」两个页签 —— **不登录也能注册**（默认开启，见 `ALLOW_SIGNUP`）、也能直接换另一个账号登录（登录页的「使用其他账号登录 →」会清空输入框，避开浏览器回填）；右上角头像 →「账号」页签可以查看全部账号（含各自论文数）、新增账号、删除其他账号（可选是否连论文一起删）。**切换账号有两种方式**：点列表里的某个账号（整行可点，登录页会把**账号名自动填好**，只需输密码），或用「切换账号（退出登录）」按钮。**论文数据按账号隔离**，各账号互不可见（详见下方「数据存储」与功能 8）。
    - **注销账号（自助删除）**：同一个「账号」页签底部有「⚠️ 注销当前账号」——需重输**当前密码 + 用户名**并二次确认，之后账号与它名下的**全部论文数据**（版式数据/高亮/笔记/译文/图片）一起永久删除、无法恢复，随后自动退出到登录页。若注销的是最后一个账号，服务会回到「首次使用 · 创建管理员账号」状态。
 2. **版式还原**：文字块与图片按原 PDF 坐标/字号/字体/颜色重建；每条文字行还会自动按 PDF 线框适配宽度，双栏/紧排时不会因字体宽度差异而侵入中间空隙造成文字重合。
-3. **图片与公式识别有三个后端可选**：默认 `auto` = PyMuPDF 提取文字版式 + detection-service-group 检测 `Figure`/公式框；`surya` = 整页 OCR（文字 / 公式 `<math>`→LaTeX / 插图裁图全部来自 Surya 2，前端按 Surya 数据独立渲染，不回落 PyMuPDF）；`unlimited_ocr` = 整页 OCR（文字 / 公式 LaTeX / 表格 / 插图裁图全部来自 Unlimited-OCR，前端按它自己的数据独立渲染，不回落 PyMuPDF）。服务不可用时文字版式仍可用（仅 PyMuPDF 路线），两条整页 OCR 路线则直接报错。
+3. **图片与公式识别有三个可用后端**：`pymupdf`/`auto`/`detection_service_group` = **本地解析方案**（PyMuPDF 文字层 + `local_parse_pipeline` 的 texify 公式识别、OXR（D-FINE）版面分析定位表格/插图、SLANet_plus 表格转 HTML、矢量图/位图提取，前端逐行绝对定位渲染）；`surya` = 整页 OCR（文字 / 公式 `<math>`→LaTeX / 插图裁图全部来自 Surya 2，前端按 Surya 数据独立渲染）；`unlimited_ocr` = 整页 OCR（文字 / 公式 LaTeX / 表格 / 插图裁图全部来自 Unlimited-OCR，前端按它自己的数据独立渲染）。
 4. **翻译（非实时、英译中）**：
    - 点击任意句子 → “译本段”，在**该段之后**显示整段中文译文，并自动把后续版式内容顶开、不遮挡；
    - **多选句子时只翻译所选句**：拖选多句后点 `翻译所选句子`，只把**选中的那几个句子**送去翻译，结果显示在一张带 `所选句译文` 标题的卡片里（虚线黄框，可点 `清除`）；选区跨段落时按段落切成多段分别翻译再合并展示，再点一次同一选区即可收起；
@@ -25,7 +25,7 @@
    - 卡片字号跟随页面渲染比例缩放（`--page-scale`，夹在 0.78~1.2 之间），页面缩小时笔记字也跟着变小，观感与正文一致（译文卡同一套比例）；
    - 正文中该句同时带下划线标记；顶部“显示笔记”总开关可临时隐藏全部笔记卡片；
    - 顶部“📝 笔记”打开右侧“全部笔记”总览（只做一览/定位/删除，编辑仍在正文卡片里）。
-6. **阅读记录**：首页管理全部论文——上传、进度、页数、标注/笔记数、未读/在读/读完状态；进度自动保存，再次打开自动回到上次位置。
+6. **阅读记录**：首页管理全部论文——上传、进度、页数、标注/笔记数、未读/在读/读完状态；进度自动保存，再次打开自动回到上次位置。阅读页顶栏的**论文名称可以直接点开重命名**（Enter 保存 / Esc 取消 / 点别处即保存），改完首页列表同步显示新名字（名字存在阅读记录与版式文档两处，与解析数据无关；只读共享的论文不能改）。
 7. **数据存 MongoDB**：论文元数据/版式数据/**插图**/高亮/笔记/译文缓存，以及**账号、登录会话、LLM 配置**都落在 MongoDB（集合划分见下方「数据存储」）；连接参数直接读 `mongo_configuration/.env`，不用再配一遍。连不上数据库时自动回退本地 JSON 并在页面提示，点「重试连接」可热切回（不用重启）。插图存在 GridFS（`images.files`/`images.chunks`）：服务重启、重建容器、换机器都不会再丢图，`mongodump` 也能连图一起备走。
 8. **论文数据按账号隔离**：每篇论文记一个 `owner`（上传者），列表/打开/翻译/标注/删除都按当前账号过滤 —— 新账号进去就是**空列表**，只能看到并操作自己上传的论文（别人的论文一律 404，不泄露存在性）。删账号时可选“连它名下的论文一起删”。想看别人的，让对方在首页点「🔗 共享」（见功能 9）。
 
@@ -49,7 +49,7 @@
     - **高亮改成荧光**：暗色下不用半透明色块，而是「很淡的同色底 + 高亮度霓虹字 + 外发光（`text-shadow`）」，调色盘里的色块也跟着发光——所以暗色下高亮看着像荧光笔。日间仍是原来的半透明底色。
     - 主题**两级存储**：`localStorage` 让首屏由 `<head>` 里一行小脚本先套上 class（不会闪一下白），登录后以**账号偏好**（`/api/prefs` 的 `theme`）为准、跟着账号走。整套配色靠 CSS 变量（`:root` 与 `html.dark` 各一份语义色板），组件里不再写死浅色。
 
-13. **引用跳转（正文引用 ↔ 参考文献）**：正文里的 `[12]` / `[3,5]` / `[10–12]` 以及作者-年份式引用（`[Smith et al., 2020]` 方括号写法与 `(Smith et al., 2020)` 圆括号写法）会变成**可点击的小标记**，点一下**就地弹卡片**显示对应参考文献条目（条目原文 + `定位原文 ↧`（滚到参考文献那一条并闪烁）+ `复制` + 条目带 DOI/arXiv 链接时 `打开链接`），不用再往后翻。数字令牌会展开成编号能对上的全部条目。引用解析按后端分发：PyMuPDF 与 Unlimited-OCR 使用通用内部链接/数字令牌与作者-年份令牌回退逻辑；Surya 独立处理 OCR 块，并可从同一块拆分多条参考文献（编号制与 `[作者, 年份]` 标签的作者-年份制都拆）；数字与作者-年份引用扫描都不依赖 PDF 是否带内部跳转。所有映射均由后端纯本地计算（零 LLM 成本），前端 `r2-refs.js` 按映射打标记、弹卡片。
+13. **引用跳转（正文引用 ↔ 参考文献）**：正文里的 `[12]` / `[3,5]` / `[10–12]` 以及作者-年份式引用（`[Smith et al., 2020]` 方括号写法与 `(Smith et al., 2020)` 圆括号写法）会变成**可点击的小标记**，点一下**就地弹卡片**显示对应参考文献条目（条目原文 + `定位原文 ↧`（滚到参考文献那一条并闪烁）+ `复制` + 条目带 DOI/arXiv 链接时 `打开链接`），不用再往后翻。数字令牌会展开成编号能对上的全部条目。引用解析按后端分发：PyMuPDF 与 Unlimited-OCR 使用通用内部链接/数字令牌与作者-年份令牌回退逻辑；Surya 独立处理 OCR 块，并可从同一块拆分多条参考文献（编号制、`[作者, 年份]` 标签的作者-年份制，以及**无标签**（行首直接是作者名）的作者-年份制都拆）；数字与作者-年份引用扫描都不依赖 PDF 是否带内部跳转。所有映射均由后端纯本地计算（零 LLM 成本），前端 `r2-refs.js` 按映射打标记、弹卡片。
     ```mermaid
     flowchart LR
     A[正文引用候选<br>正则扫描] --> C{关联层}
@@ -60,6 +60,12 @@
     D --> E[存库 + GET/POST refs 接口]
     E --> F[前端 .cite 点击<br>浮层卡片 / 跳到条目]
     ```
+
+还需要继续增加agent功能，通过搜索校验参考文献是否真实存在。
+    
+14. 笔记导出功能，能够以json形式带出，也可以以图片形式导出
+    
+15. ai辅助阅读和笔记栏页面显示设计更新为弹窗式的，并且更新为agent，使其可以添加的笔记块，并加那个笔记块作为上下文进行搜索等功能。
 
 ## 项目结构
 
@@ -76,12 +82,12 @@ backend/           后端(FastAPI)
     text_layer.py  文字层抽取(字体族、行框、行内样式)
     sentences.py   按句子重切块（一个块 = 恰好一句）
     images.py      插图检测区域去重影 / 挖洞
-    backend_pymupdf.py  版式后端 · PyMuPDF（公式字形 → 等长空格）
+    backend_pymupdf.py  版式后端 · 本地解析方案（PyMuPDF + local_parse_pipeline）
     backend_detection_service_group.py  图片/公式增强 · detection-service-group
     backend_surya.py    版式后端 · Surya 2 整页 OCR（块级数据，前端独立渲染）
     backend_unlimited_ocr.py  版式后端 · Unlimited-OCR 整页 OCR（块级数据，前端独立渲染，与 Surya 各自维护）
     math_text.py / math_font.py   公式：文本工具 / 字体判据与字形→空格
-    links.py       链接注释采集（内部跳转/URI；三个后端统一，引用跳转的数据源）
+    links.py       链接注释采集（内部跳转/URI；各后统一，引用跳转的数据源）
     entry.py       入口 parse_pdf(+ 公式后处理挂载点)
   detection_service_group.py  detection-service-group 客户端(图片/公式/表格服务组，JSON+base64 页面图)
   surya_parser.py  Surya 2 推理服务客户端（整页 OCR / 插图裁剪 / 块 HTML→文本·runs·LaTeX）
@@ -215,10 +221,11 @@ API Key 只存在服务端，接口返回一律是打码串（`sk-4****8cca`）�
 | GET | `/api/auth/users` | 账号列表（需登录；不返回口令哈希） |
 | POST | `/api/auth/users` | 新增账号（需登录，用于“先建好第二个账号再切换”） |
 | DELETE | `/api/auth/users/{name}?purge=1` | 删除账号（需登录；不能删自己，也不能删最后一个）。`purge=1`（默认）连它名下的论文数据一起删，`purge=0` 只删账号 |
+| POST | `/api/doc/{id}/title` | 给论文**改名**（`{title}`，≥「可写」权限）：同时写回阅读记录与版式文档的 `title`，首页列表随之更新；只动名字，不碰解析数据，笔记/译文/进度都不受影响 |
 | GET | `/api/doc/{id}/seltrans` | 该论文的「所选句译文」卡片列表 |
 | POST | `/api/doc/{id}/seltrans` | 保存一张卡片（同 `key` 覆盖） |
 | DELETE | `/api/doc/{id}/seltrans?key=…` | 删一张卡片；不传 `key` 则清空该论文的全部卡片 |
-| GET | `/api/doc/{id}/refs` | 引用跳转映射：`entries`（参考文献条目）+ `links`（正文引用标记 →「块 id + 字符区间 + 条目下标」）。纯本地现算、不缓存；`scan:"no-links-data"` 表示旧解析数据缺少 PDF 链接注释（编号式引用仍会尝试回退匹配） |
+| GET | `/api/doc/{id}/refs` | 引用跳转映射：`entries`（参考文献条目）+ `links`（正文引用标记 →「块 id + 字符区间 + 条目下标」）。纯本地现算、不缓存；`scan:"no-links-data"` 表示旧解析数据缺少 PDF 链接注释（数字式与作者-年份式引用仍会回退匹配） |
 | GET | `/api/doc/{id}/ai` | 文末 AI 面板的状态：已生成的笔记整理、对话记录、`stale`（笔记是否又改过）、`trigger_progress` |
 | POST | `/api/doc/{id}/ai/summary` | 把笔记整理成结构化摘要并保存（`{notes:[{sent,note,page}], force?}`；笔记没改且已有整理时直接返回缓存，不重复花 token。**重新整理时会带上上一版整理（含你手改过的内容）+ 已发生的对话**当素材） |
 | POST | `/api/doc/{id}/ai/summary/save` | 保存**手工编辑**后的整理（`{summary:{…}}`，整份覆盖；用宽松上限清洗，不会把写长的句子截掉） |
@@ -359,19 +366,34 @@ python tools/selftest.py xxx.pdf --backend unlimited_ocr   # 走 Unlimited-OCR �
 python tools/reparse_layout.py --list               # 看已上传的论文用哪个后端/有多少公式框
 python tools/mongo_check.py       # MongoDB 连接体检(参数从哪读/能否连上/怎么修)
 python tools/mongo_check.py --create-user   # 用 .env 里的 root 账号补建业务账号
-python data/tmp/test_refs.py       # 引用跳转：现造带内部链接的 PDF → 采集/映射全链路自检
+python -m unittest tests.test_refs   # 引用跳转：编号/作者-年份、标题并块、链接+回退合并
 # 然后把 samples/sample.pdf 拖到首页即可体验完整阅读流程
 # （旧的「空位 × OCR LaTeX」配对自检已随 PaddleOCR 链路一起删除，不再提供）
 ```
 
-## 文档解析后端（PyMuPDF+detection-service-group / Surya 2 / Unlimited-OCR 三条路线）
+## 文档解析后端（本地解析方案 / Surya 2 / Unlimited-OCR）
+
+> `auto` / `detection_service_group` / `pymupdf` 三个取值都走**本地解析方案**：
+> PyMuPDF 文字层 + `local_parse_pipeline.process_pages()`（texify 公式识别、
+> OXR（D-FINE）版面分析定位表格/插图、SLANet_plus 表格转 HTML、矢量图/位图提取）。前端按
+> `parser === "pymupdf"` 逐行绝对定位渲染，公式用页面级 `.fbox` 覆盖层（KaTeX，
+> 失败时用裁图兜底）。模型/依赖缺失时 `parse_pdf` 直接抛
+> `LocalParseUnavailable`，不会悄悄回退其它后端。
+>
+> 旋转文字（竖排页边章、倒排文字）按 PyMuPDF 的 `line["dir"]` 识别：行上额外下发
+> `rot`（CSS 旋转角）/ `ox`·`oy`（未旋转时的左上角）/ `rw`·`rh`（未旋转时的宽高），
+> 前端用 `transform: rotate()` 摆回去；这些行不参与按句切块，整块带 `vertical: True`。
 
 解析后端由 `config.json` 的 `parser` 段控制（环境变量优先于配置文件），也可在网页
 「⚙ 设置 → 存储 / OCR」里直接切换（安装级配置，写回 `config.json`）：
 
 | 配置 | 说明 |
 | --- | --- |
-| `backend` | `auto`(默认) / `detection_service_group` / `surya` / `unlimited_ocr` / `pymupdf`。`auto`/`detection_service_group`：PyMuPDF 文字版式 + detection-service-group 提供 **Figure 裁图与公式增强**；`pymupdf` 不调用外部服务且不显示 Figure；`surya`：**整页 OCR**——文字/公式（`<math>`→LaTeX）/插图全部来自 Surya 2，前端按 `parser === "surya"` 独立渲染（需本机装 `surya-ocr` 客户端，见 `requirements.txt`）；`unlimited_ocr`：**整页 OCR**——文字/公式（LaTeX）/表格/插图全部来自 Unlimited-OCR，前端按 `parser === "unlimited_ocr"` 独立渲染。两条 OCR 链都**不使用 PyMuPDF 版式**，不可用时直接报错不回退。旧值 `ftgroup`（等同 `detection_service_group`）仍被接受；旧值 `paddle` 已随代码删除、不再识别（按 `auto` 处理并记一条 warning） |
+| `backend` | `pymupdf` / `auto`(默认) / `detection_service_group` = **本地解析方案**（PyMuPDF + `local_parse_pipeline`，依赖与模型见 `backend/pdf_parser/local_parse_pipeline/`）；`surya` = 整页 OCR（文字/公式 `<math>`→LaTeX/插图全部来自 Surya 2，前端按 `parser === "surya"` 独立渲染，需本机装 `surya-ocr` 客户端）；`unlimited_ocr` = 整页 OCR（文字/公式 LaTeX/表格/插图全部来自 Unlimited-OCR，前端按 `parser === "unlimited_ocr"` 独立渲染）。旧值 `ftgroup`（等同 `detection_service_group`）仍被接受；旧值 `paddle` 已随代码删除、不再识别（按 `auto` 处理并记一条 warning） |
+| `local_device` | 本地方案推理设备：空/`auto` = 自动（cuda > mps > cpu），也可填 `cpu` / `cuda` / `mps` |
+| `local_dpi` | 本地方案公式框裁剪的渲染 dpi（默认 300） |
+| `local_padding` | 公式框裁剪四周外扩（pt，默认 2.0） |
+| `local_keep_crops` | 是否把公式裁图落盘（KaTeX 失败时的兜底，默认开） |
 | `detection_service_group_url` | detection-service-group（formula_table_service_group 的 router_service）地址，默认 `http://127.0.0.1:9003/v1` |
 | `detection_service_group_timeout` | 一次预测（检测+识别）整体超时秒数(默认 600；长文档识别需等待数分钟) |
 | `detection_service_group_conf` | 检测置信度阈值(默认 0.25) |
@@ -406,19 +428,14 @@ python data/tmp/test_refs.py       # 引用跳转：现造带内部链接的 PDF
 
 ### 现在的分工（2026-10）
 
-- **两条解析链，在「⚙ 设置 → 存储 / OCR」里选**：
-  - `auto` / `detection_service_group` / `pymupdf`：**PyMuPDF 文字版式**（精确行框/字号/粗斜体；
-    Figure 图片不使用 PyMuPDF 的内嵌位图/矢量图提取）。
-  - `surya` / `unlimited_ocr`：**整页 OCR**（Surya 2 与 Unlimited-OCR 各一条**独立**链，见下节）。
-- **图片（PyMuPDF 路线）**：detection-service-group 检测 `Figure` 框，将服务组返回的 `crop` 和 PDF 坐标写入
-  `pages[].images`，前端仍通过文档图片接口加载；裁图里已烘焙的文字不会重复叠加。
-- **公式占位（本地）**：公式按**字体名**判出来后
-  擦成**等长空格**（`math_font._blank_math_spans`），所以正文不会被公式碎片污染，
-  句子切分与翻译照常。
-- **公式内容（可选）**：**detection-service-group**（`formula_table_service_group` 服务组：
-  YOLOv13 检测 → pp-formulanet-plus-l 识别）对**有公式空位的页**返回「公式框 + LaTeX」，
-  写进 `pages[].formula_boxes`；前端按 `bbox_norm × 页面显示宽高` 在页面上覆盖 KaTeX
-  （位置来自公式框、内容来自服务组；见下面「公式是怎么补进来的」）。
+- **三条解析链可用，在「⚙ 设置 → 存储 / OCR」里选**：
+  - `pymupdf` / `auto` / `detection_service_group`：**本地解析方案**（PyMuPDF 版式
+    + texify 公式 + OXR 版面 / SLANet 表格 + 插图提取，见 `backend_pymupdf.py`
+    与 `local_parse_pipeline/`）；
+  - `surya`：Surya 2 整页 OCR（见下节）；
+  - `unlimited_ocr`：Unlimited-OCR 整页 OCR（见下节）。
+- 本地解析方案依赖本地模型权重（`local_parse_pipeline/models/`）与本机 Python 依赖
+  （texify / paddleocr / torch），状态面板会用 `local_ready` / `local_message` 如实显示。
 
 ### Surya 2 后端（`backend=surya`：整页 OCR + 前端独立渲染）
 
@@ -517,7 +534,11 @@ python data/tmp/test_refs.py       # 引用跳转：现造带内部链接的 PDF
   其余用 `p{页}s{序号}` —— 所以重解析后，**被切碎过的那几块**上的旧笔记会显示
   「原文句已不存在」（笔记正文不丢）。译文缓存键是块文本的 sha1，不受影响。
 
-#### 公式是怎么补进来的（版式不动）
+#### 公式是怎么补进来的（历史说明：detection-service-group 版本）
+
+> ⚠️ 下面的流程是早期「PyMuPDF + detection-service-group」实现，已不参与运行；
+> 现在的**本地解析方案**由 `local_parse_pipeline` 完成公式聚合/裁剪/texify 识别
+> （见 `backend_pymupdf.py` 与 `local_parse_pipeline/README.md`）。本节仅作历史参考。
 
 电子版 PDF 的**正文与版式完全用 PyMuPDF 的**（精确行框/字号/粗斜体），
 **detection-service-group** 只负责补它搞不定的**公式内容**：公式在 PDF 里是一堆碎片化字形
@@ -563,8 +584,8 @@ python data/tmp/test_refs.py       # 引用跳转：现造带内部链接的 PDF
 - **宁缺勿错**：服务组没返回、返回空、或某条 `latex` 为空就留空，绝不硬猜；
   失败一律只加一条 warning，**不抛异常** —— 绝不因为服务挂了让整篇解析失败。
 - **服务不可达时要快**：请求前先做一次快速 TCP 探测（≤ 5s），避免解析被读超时拖住。
-- 用 `detection_service_group_enable=false` 可整体关闭服务组图片/公式检测；这时不再回退到
-  PyMuPDF 图片提取。`backend=pymupdf` 也不会显示 Figure 图片。
+- 现在 `backend=pymupdf` 由本地解析方案处理：公式来自 texify、表格来自
+  OXR（D-FINE）版面分析定位 + SLANet、Figure/Picture 来自 OXR 版面检出的 Picture 框（矢量图默认关闭）。
 - 旧的「整页 OCR → 前后文配对 → 内联进正文」链路（`backend_paddle.py` /
   `formula_match.py` / `tools/check_formula_match.py`）**已随代码整体删除**；
   旧码归档在 `history_versions/paddle-ocr-cleared-20261003/`。
@@ -592,8 +613,9 @@ python tools/reparse_layout.py <doc_id> 原PDF.pdf             # 原地重解析
 译文是按「块文本的 sha1」缓存的，解析升级可能改块文本（重切句等）→ 工具会自动把老译文的键
 **迁到新文本**上（对得上就不用重译，迁移条数会打印出来）。
 > ⚠️ 旧版「OCR 整页解析 + 把 LaTeX 注入正文 + 合成 `kind="formula"` 块」已删除；
-> 现在是「PyMuPDF 版式 + detection-service-group 公式框」这一条路，
-> 见本文前面的说明与 `backend/pdf_parser/backend_detection_service_group.py`。
+> 本地解析方案现在是「PyMuPDF 版式 + `local_parse_pipeline` 的 texify 公式框/表格/
+> 插图」，见 `backend/pdf_parser/backend_pymupdf.py` 与
+> `backend/pdf_parser/local_parse_pipeline/README.md`。
 
 ### 引用跳转（正文引用 → 参考文献卡片）
 
@@ -603,37 +625,58 @@ python tools/reparse_layout.py <doc_id> 原PDF.pdf             # 原地重解析
 则按正文引用令牌与参考文献条目做文本回退匹配（数字编号式与作者-年份式都支持）。
 两种方式都不使用 LLM：
 
-1. **采集**（解析时，三个后端统一）：`pdf_parser/links.py` 用 `page.get_links()`
+1. **采集**（解析时，各后端统一）：`pdf_parser/links.py` 用 `page.get_links()`
    把内部跳转（源侧 `rect` + 目标 `page`/`to`）与 URI 外链写进 `pages[].links`
    （PDF 坐标 pt，与块 bbox 同口径）。链接来自 PDF 注释本身、与“文字版式来自
    哪个后端”无关，`pymupdf` / `surya` / `unlimited_ocr` 一条都不落。
 2. **映射**（`GET /api/doc/{id}/refs`，纯本地毫秒级、**不缓存、每次现算**）：
    `backend/refs.py` 按 `parser` 分发到各策略。PyMuPDF 与 Unlimited-OCR 使用通用流程：
    找参考文献区（全文档**最后一个** `References`/`Bibliography`/`参考文献` 标题块；
+   标题与第一条并进同一个块时（本地解析方案常见）按前缀识别并只保留标题后的正文；
    Unlimited-OCR 还能用 `kind="reference"` 兜底）→ 条目化（编号制 `[n]`/`n.` 起新条目、
-   不带编号的块并进上一条；作者-年份制按“含年份”起条目）→ 先按内部链接的目标点、
-   源矩形匹配引用令牌；没有映射出内部跳转时再回退扫描正文引用令牌 —— 数字令牌
+   不带编号的块并进上一条；作者-年份制优先按 `[作者, 年份]` 条目标签切分，标签落在块中间
+   也能切开；**没有标签时（ACL/arXiv 风格，条目行首直接是作者名）按“悬挂缩进”切**
+   —— 区里缩进 8~10pt 的续行/标题/出版社并进上一条、齐左边缘的块起新条目；判不出缩进
+   时退回“行首像作者姓名”的文本规则）→ 先按内部链接的目标点、
+   源矩形匹配引用令牌；作者-年份回退扫描**始终与链接映射合并**（PDF 只给部分引用做了
+   hyperref 时其余引用也能标出），没有映射出内部跳转时再回退扫描数字令牌 —— 数字令牌
    （`[n]`）关联编号条目，作者-年份令牌（`[Smith et al., 2020]` 与 `(Smith et al., 2020)`）
-   按“年份 + 姓氏/实词”关联无编号条目（校验从严、宁缺勿错）。Surya 使用独立策略
+   按“年份 + 姓氏/实词”关联无编号条目（校验从严、宁缺勿错），并分三档：令牌首姓名
+   **等于条目第一作者** > 令牌里的姓名**全落在条目作者段** > 年份 + 实词/姓氏的弱匹配；
+   多引用令牌 `(作者, 年份; 作者, 年份)` 先按 `;` 拆成单条引用、**逐段各自匹配**，
+   同一段内只保留最高档，避免共同作者让一批同年文献都挂到同一个引用上。Surya 使用独立策略
    （`backend/pdf_refs/refs_surya.py`）：保留 OCR 块内换行，在行首识别并拆分同一块中的多条
-   文献（编号制与 `[作者, 年份]` 标签的作者-年份制都拆）；然后按正文数字/作者-年份令牌直接
+   文献（编号制、`[作者, 年份]` 标签的作者-年份制，以及**无标签**作者-年份制 —— Surya 的
+   参考文献常是一条一行、行首直接是作者名，按“行首像作者姓名 **且** 上一行已写完
+   （句末标点/右括号，或已有年份）”切，折行条目的续行（`… Advances in Neural` /
+   `Processing Systems, 35:…`）不会被劈开）；然后按正文数字/作者-年份令牌直接
    映射，不会因为 PDF 中另有无关内部链接而跳过其余引用。单条文献独占一个 OCR 块时，
    仍可用 PDF 内部跳转映射。
 3. **展示**（前端 `r2-refs.js`）：按 `links[].block/start/end`（块 canonical 文本的
-   字符区间，与笔记/高亮同口径）把引用包成 `.cite` 标记；点击弹卡片（条目原文 +
+   字符区间，与笔记/高亮同口径）把引用包成 `.cite` 标记；点击弹卡片（条目原文 + 
    `定位原文`（滚到参考文献那一条并闪烁）+ `复制` + 条目带 DOI/arXiv 链接时
-   `打开链接`）。标记是**幂等**的：选句/高亮/缩放导致块重建后自动重打；点引用
-   **不会**触发“选中该句”（点击事件在捕获阶段接管、拦住冒泡）。
+   `打开链接`）。编号条目显示 `[n]`，作者-年份条目显示“第一作者姓氏 + 年份”
+   （如 `Chen 2019`）而不是笼统的圆点。标记是**幂等**的：选句/高亮/缩放导致块重建后
+   自动重打；点引用**不会**触发“选中该句”（点击事件在捕获阶段接管、拦住冒泡）。
+   **一条引用 = 一个整体**：解析侧按颜色切 run 后，一条引用常横跨好几个 `[data-g]` 片段
+   （编号制连 `[` / `12` / `]` 都可能落在不同字体段），前端会把这些**同一行内连续**的
+   片段收进同一个 `.cite` —— 悬停高亮、点击弹卡都是一整组，不会碎成几块。
 
 已知边界：
 
 * 编号式方括号引用在 PDF 没有内部跳转时会按 `[n]` 与参考文献编号回退匹配；作者-年份
   引用（`[Smith et al., 2020]` / `(Smith et al., 2020)`）按“年份 + 姓氏/实词”回退匹配
-  （校验从严，两类都对不上时不标）。纯上标数字式引用（`…text¹`）不支持。
+  （校验从严，两类都对不上时不标）。作者-年份回退**不要求 PDF 带内部跳转**，也会与
+  已有的链接映射合并；纯上标数字式引用（`…text¹`）不支持。
+* 引用令牌跨行断开时（如 `[Whit-` 换行 `ley, 1994]`，或长多引用 `…Movahedi` 换行
+  `et al., 2026)`）按**每条行内一片**下发锚点（后端 `refs.py::_range_pieces`），前端每一片
+  各自包成 `.cite`、共用同一批条目 —— 不再整段放弃（前端 `wrapRange` 遇换行“洞”仍会
+  拒绝单跨行标记，所以必须拆片）。
 * Surya 的同块多条文献拆分依赖 OCR 保留每条文献开头的换行；如果模型把不同条目的
-  开头和正文合并到同一行，当前无法可靠判断条目边界（编号制与 `[作者, 年份]` 标签的
-  作者-年份制都拆不动）。作者-年份条目的回退匹配不要求条目带标签，但没有标签时
-  无法逐条拆分、卡片「定位原文」只能落到整块。
+  开头和正文合并到同一行，当前无法可靠判断条目边界（编号制、带 `[作者, 年份]` 标签与
+  无标签的作者-年份制都拆不动）。无标签条目的拆条规则是“行首像作者姓名 + 上一行已写完”，
+  因此以出版信息开头的续行（`Machine Learning, pages …`）不会被误当成新条目；反过来，
+  缺句末标点且上一行也没年份时，两条相邻文献可能仍并成一条。
 * 回退匹配缺少 PDF 链接注释提供的几何校验，因此正文中与有效参考文献编号相同的数学
   方括号表达式也可能被识别为引用；PDF 有内部跳转时仍优先使用精确映射。
 * `[10–12]` 这类数字令牌会展开成**范围内能对上的全部条目**：卡片里列出 10/11/12
@@ -644,9 +687,11 @@ python tools/reparse_layout.py <doc_id> 原PDF.pdf             # 原地重解析
 
 公式由 **KaTeX** 渲染（同步 API，随项目内置），落地方式：
 
-- **公式框覆盖层**（新数据，`pages[].formula_boxes`）：detection-service-group 返回的
-  「`bbox_norm` + `latex`」按**页面显示宽高**定位，`buildFormulaBoxes` 就地渲染并把
-  KaTeX 等比缩放到框内（`r2-math.js`）。渲染失败就显示 LaTeX 源码兜底。
+- **页面公式框覆盖层（本地解析方案）**：解析侧下发 `pages[].formula_boxes`
+  （`bbox_norm` + `latex` + 裁图 `file` + `copy` 字符区间），前端
+  `r2-math.js::buildFormulaBoxes` 按页面显示宽高定位 `.fbox`，把 KaTeX 等比缩放到框内；
+  KaTeX 未就绪/渲染失败时用裁图铺满框兜底，再不行显示 LaTeX 源码。
+  选句/高亮会同步到公式框，复制时还原成 LaTeX。
 - **旧数据的兼容路径**（重解析前的 doc.json）：
   * **独立公式块**（`kind="formula"` + `latex`）：用 `katex.render(..., {displayMode:true})`
     渲染到块覆盖层上，成功才隐藏原来的字形文本；**渲染失败保留原字形**。
@@ -744,7 +789,7 @@ python tools/reparse_layout.py <doc_id> 原PDF.pdf             # 原地重解析
 | --- | --- |
 | `surya` | 公式块标签是 `Equation`（`raw_label` 为 `Equation-Block`），其 `<math>` 里**装的就是 LaTeX 源码**，用 `latex_from_html()` 抽出 |
 | `unlimited_ocr` | 正文里 `\(…\)` / `\[…\]` / `$$…$$`（少见单 `$…$`，保守判据）摘成字符区间；`equation` 块剥掉 `\[ … \]` 定界符 → `latex`；解析侧不猜、不注入 |
-| `pymupdf` | 无数学语义，保持文字 |
+| `pymupdf` | 本地解析方案：PyMuPDF 字体/位置聚合公式框 → texify 识别成 LaTeX，写入 `pages[].formula_boxes`；正文里对应字形替换为占位空格 |
 
 > ⚠️ Surya 的 `<math>` **不是 MathML** —— 例如
 > `<math display="block">\ell_t(W)=\text{CE}(f(x_{t-1};W),x_t).\quad(1)</math>`。
@@ -863,7 +908,7 @@ docker compose up -d --build                 # CPU 版
 curl http://127.0.0.1:8060/health            # 验证服务
 ```
 
-安装客户端依赖（不装则自动走 PyMuPDF 后端）：
+安装客户端依赖（不装则 `surya` 后端直接报错，不会再回退本地 PyMuPDF）：
 
 ```bash
 pip install -r requirements.txt
@@ -919,7 +964,7 @@ curl http://127.0.0.1:8000/api/config        # 查看解析后端/服务就绪�
 - `标注` 弹出调色盘：**6 个色块**＝黄/绿/粉 + 3 个自定义色（虚线描边的三个是自定义位，用下方「自定义」里的三个取色器改颜色，改完自动存到**当前账号**名下）；点击色块即用**半透明底色**高亮整句，当前句已用的颜色会加白圈标出；同色再点一次即取消，或点 `清除高亮`。句内的**公式框会跟着同色高亮**（与文字同款底色；暗夜下同款霓虹字色 + 外发光）—— 公式是页面级覆盖层，由 `reader2.js` 的 `paintFormulaMarks()` 按几何与高亮句匹配后上色。
 - `笔记` 直接在页面右侧弹出卡片（与选中句子同高，不挤占正文），写完保存即可；卡片上带句子原文摘要，正文里同时有下划线标记。顶部“显示笔记”可一键收起全部笔记卡片。
 - 顶部“📑 目录”打开**左侧目录栏**：建论文时就存下了 **PDF 自带书签**（零成本、最准）；PDF 没书签时，首次展开面板会自动让 **LLM 读全文排一份目录**（每页只喂“候选标题行”，省 token），结果存库、不再重复提取；点目录项直接跳页，滚动时自动高亮当前所在小节，底部有「重新提取」。展开目录时正文会整体右移并自动适宽，不会被盖住。
-- 正文里的**引用标记**（`[12]`、`[3,5]`、`[10–12]`）可以**点击**：就地弹出参考文献卡片，`定位原文 ↧` 滚到参考文献那一条并闪烁，`复制` 复制条目原文；条目带 DOI/arXiv 链接时还能直接打开。优先使用 PDF 内部链接；没有时按编号回退匹配。
+- 正文里的**引用标记**（`[12]`、`[3,5]`、`[10–12]`）可以**点击**：就地弹出参考文献卡片，`定位原文 ↧` 滚到参考文献那一条并闪烁，`复制` 复制条目原文；条目带 DOI/arXiv 链接时还能直接打开。优先使用 PDF 内部链接；没有时按编号回退匹配。一条引用（多个作者 / 多个编号）**整体标记**：悬停高亮、点击弹卡都是一整组。条目多时卡片**自己能滚**（滚轮、触控板、拖卡片里的滚动条都行，滚到两端也不会带着页面一起动），鼠标在卡片里操作时卡片**不会消失** —— 只有点卡片外的区域、或按 `Esc` 才收起。
 - 顶部“翻译本页 / 翻译全文”用于批量离线翻译；配合“显示译文”开关查看双语；译文卡字号会随页面缩放一起变化。
 - 底部居中的**页码可以点**：直接输入页号按 `回车` 跳到该页（`Esc` 取消）；页码超出范围会提示并留在原页。滚动时它会自动跟着更新。
 - 选中**多个句子**后，工具条按钮变为 `翻译所选句子`：只翻译选中的句子（选区跨段落时按段落分片），结果显示为独立卡片，挂在**最后一个被选句子**下方（多句连选不会插在所选句中间）；不同选区的卡片**可以同时留着**，卡内 `清除` 或再点一次按钮收起。它与整段译文**互斥**（两者不同时显示，切换时另一边自动收起）。单选一句仍是原来的 `译本段`（整段翻译）。
@@ -952,4 +997,5 @@ curl http://127.0.0.1:8000/api/config        # 查看解析后端/服务就绪�
 - 笔记卡默认贴在页面右侧、纵向对齐句子首行。有笔记时会预留批注栏宽度（`--note-reserve`，按窗口宽度在 210–330px 间自适应）：放得下就保持页面原尺寸，放不下则**自动适宽**（页面等比缩小，顶部比例标签同步显示实际比例，悬停有提示）；可用宽 < 520px 或右侧抽屉展开时改为句子下方内嵌。同页多张卡自上而下依次避让（间距 10px）。
 - Surya 后端每页一次 VLM 调用，速度取决于服务端算力；扫描件(无文本层)的行框按块高近似还原，句子级高亮的定位可能略有偏差。
 - 去重影会把“已烘焙进插图”的文字行整行删除：观感不再叠字，但这些行也**不再可选/可翻译**（扫描件尤其明显）。旧文档需要重新上传转换才会生效。
-- **引用跳转**优先使用 PDF 内部链接；没有内部链接时，编号式方括号引用按参考文献编号回退匹配，作者-年份引用（`[Smith et al., 2020]` / `(Smith et al., 2020)`）按“年份 + 姓氏/实词”回退匹配（校验从严，宁缺勿错）。纯上标数字式引用（`…text¹`）识别不了；无标签又无编号的作者-年份条目无法逐条拆分/定位。
+- **引用跳转**优先使用 PDF 内部链接；没有内部链接时，编号式方括号引用按参考文献编号回退匹配，作者-年份引用（`[Smith et al., 2020]` / `(Smith et al., 2020)`）按“年份 + 姓氏/实词”回退匹配（校验从严，宁缺勿错）。纯上标数字式引用（`…text¹`）识别不了；无标签又无编号的作者-年份条目依赖参考文献区的悬挂缩进分条，整区都没有缩进信息时可能只能落到整块。
+- **正文里引用/交叉引用带链接色（蓝）是原文档的样式**：`\cite`/`\ref` 被 hyperref 染色时，只染引用那几个字（解析侧按颜色切段保留该边界）。所以看到蓝字不等于“引用标记标多了”——`.cite` 的高亮底与蓝字是两回事，悬停/点击时以底色和弹卡为准。旧文档需要重新解析才会按颜色切段。

@@ -6,10 +6,12 @@
 输出: 实际使用的后端、页数、文字块/图片数、版面标签统计，
       并把图片落盘到 data/selftest_images/。
 
-文字版式由 PyMuPDF 本地抽取；auto/detection_service_group 时会再调 **detection-service-group**
-（formula_table_service_group 服务组）识别 Figure 图片与公式框 + LaTeX（先按服务组 README 起服务）:
-    python tools/selftest.py samples/latex_sample.pdf --backend detection_service_group
-    python tools/selftest.py samples/sample.pdf --backend pymupdf     # 纯本地、不连服务
+`pymupdf` / `auto` / `detection_service_group` 走**本地解析方案**：PyMuPDF 文字层 +
+`local_parse_pipeline.process_pages()`（texify 公式 / OXR 版面 + SLANet 表格 / 插图），
+需要本机模型权重与依赖（见 `backend/pdf_parser/local_parse_pipeline/README.md`）：
+    python tools/selftest.py samples/latex_sample.pdf --backend pymupdf
+    python tools/selftest.py samples/latex_sample.pdf --backend surya      # 需 Surya 服务
+    python tools/selftest.py samples/latex_sample.pdf --backend unlimited_ocr
 """
 from __future__ import annotations
 

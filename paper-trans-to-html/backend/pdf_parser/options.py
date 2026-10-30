@@ -2,11 +2,12 @@
 
 见包文档 `backend/pdf_parser/__init__.py`。
 
-「文字版式后端」有三个实现：
+「文字版式后端」当前有三个实现：
 
-  * **PyMuPDF**（`backend_pymupdf.py`）：本地抽取文字层；Figure 图片和公式框由
-    **detection-service-group**（`formula_table_service_group` 服务组）提供
-    （见 `backend_detection_service_group.py`）；
+  * **本地解析方案**（`backend_pymupdf.py` + `local_parse_pipeline/`）：PyMuPDF
+    文字层 + texify 公式识别 + OXR 版面分析（D-FINE）/ SLANet 表格识别 + 插图提取；后端取值
+    `pymupdf` / `auto` / `detection_service_group` 都对应这一条链路，前端逐行绝对
+    定位渲染；
   * **Surya 2**（`../surya_parser.py` + `backend_surya.py`）：整页 OCR，文字 /
     公式 / 插图全部来自 Surya，前端按 `parser === "surya"` 独立渲染；
   * **Unlimited-OCR**（`../unlimited_ocr.py` + `backend_unlimited_ocr.py`）：整页
@@ -56,6 +57,7 @@ from ..unlimited_ocr import (
     DEFAULT_URL as DEFAULT_UNLIMITED_OCR_URL,
     PROBE_TIMEOUT as UNLIMITED_OCR_PROBE_TIMEOUT,
     check_server as unlimited_ocr_check)
+from .backend_pymupdf import local_status as local_parse_status
 
 
 # =====================================================================
@@ -71,10 +73,10 @@ from ..unlimited_ocr import (
 #    改这里时顺手对一下 `app.py::CONFIG_FILE`（两者必须指向同一份）。
 CONFIG_FILE = Path(__file__).resolve().parents[2] / "config.json"
 
-# 合法的后端取值。旧配置里的 `ftgroup` 会映射成 `detection_service_group`（历史取值，
-# 保留识别只为把老配置安顿好；旧 PaddleOCR 链路的 `paddle` 已随代码删除，不再识别）。
-# `surya` / `unlimited_ocr` 都是独立整页 OCR 链（分别见 `backend_surya.py` /
-# `backend_unlimited_ocr.py`）。
+# 合法的后端取值。`auto` / `detection_service_group` / `pymupdf` 都走**本地解析方案**
+# （PyMuPDF + local_parse_pipeline，见 backend_pymupdf.py）；`detection_service_group`
+# 只是历史取值，不再调用该服务。旧配置里的 `ftgroup` 会映射成
+# `detection_service_group`（保留识别只为把老配置安顿好）。
 PARSER_MODES = ("auto", "detection_service_group", "surya", "unlimited_ocr", "pymupdf")
 
 # ---- 图片/公式检测增强(detection-service-group)与两条整页 OCR 链的默认参数 ----
@@ -84,7 +86,18 @@ PARSER_MODES = ("auto", "detection_service_group", "surya", "unlimited_ocr", "py
 #   unlimited_ocr           -> ../unlimited_ocr.py（默认地址与 unlimited_ocr_service 端口一致）
 
 DEFAULT_OPTIONS: dict = {
-    "backend": "auto",                # auto | detection_service_group | surya | unlimited_ocr | pymupdf
+    # auto / detection_service_group / pymupdf → 本地解析方案（PyMuPDF + 本地模型）
+    "backend": "auto",
+    # ---- 本地解析方案（backend_pymupdf.py + local_parse_pipeline）----
+    "local_device": "",              # 空/auto = 自动（cuda > mps > cpu）
+    "local_dpi": 300,                 # 公式框裁剪渲染 dpi
+    "local_padding": 2.0,             # 公式框外扩（pt）
+    "local_temperature": 0.0,         # texify 解码温度（0 = 贪心）
+    "local_max_tokens": 384,          # texify 单条公式最大 token
+    "local_keep_crops": True,         # 公式裁图落盘（KaTeX 失败时的兜底）
+    "local_min_figure_size": 24,      # 插图（检测框/矢量图）最小宽高（pt）
+    "local_max_figures": 24,          # 每页最多保留的插图数
+    "local_use_vector_figures": False,  # 关：插图只用 OXR 版面检出的 Picture 框；开：再加 get_drawings 矢量矩形
     "surya_url": DEFAULT_SURYA_URL,
     "surya_backend": DEFAULT_SURYA_BACKEND,
     "unlimited_ocr_url": DEFAULT_UNLIMITED_OCR_URL,        # 推理服务地址
@@ -110,6 +123,11 @@ DEFAULT_OPTIONS: dict = {
 
 _ENV_KEYS = {
     "backend": "PDF_PARSER_BACKEND",
+    "local_device": "LOCAL_PARSER_DEVICE",
+    "local_dpi": "LOCAL_PARSER_DPI",
+    "local_padding": "LOCAL_PARSER_PADDING",
+    "local_temperature": "LOCAL_PARSER_TEMPERATURE",
+    "local_max_tokens": "LOCAL_PARSER_MAX_TOKENS",
     "surya_url": "SURYA_INFERENCE_URL",
     "surya_backend": "SURYA_INFERENCE_BACKEND",
     "unlimited_ocr_url": "UNLIMITED_OCR_URL",
@@ -256,6 +274,33 @@ def load_options(config_file: Optional[Path] = None,
     except (TypeError, ValueError):
         opts["text_in_image_overlap"] = DEFAULT_OPTIONS["text_in_image_overlap"]
     opts["image_labels"] = _resolve_image_labels(opts["image_labels"])
+    # ---- 本地解析方案 ----
+    opts["local_device"] = str(opts.get("local_device") or "").strip().lower()
+    if opts["local_device"] in ("auto", "none"):
+        opts["local_device"] = ""
+    try:
+        opts["local_dpi"] = max(96, min(600, int(opts["local_dpi"])))
+    except (TypeError, ValueError):
+        opts["local_dpi"] = DEFAULT_OPTIONS["local_dpi"]
+    try:
+        opts["local_padding"] = max(0.0, min(24.0, float(opts["local_padding"])))
+    except (TypeError, ValueError):
+        opts["local_padding"] = DEFAULT_OPTIONS["local_padding"]
+    try:
+        opts["local_temperature"] = max(0.0, min(2.0, float(opts["local_temperature"])))
+    except (TypeError, ValueError):
+        opts["local_temperature"] = DEFAULT_OPTIONS["local_temperature"]
+    try:
+        opts["local_max_tokens"] = max(64, min(2048, int(opts["local_max_tokens"])))
+    except (TypeError, ValueError):
+        opts["local_max_tokens"] = DEFAULT_OPTIONS["local_max_tokens"]
+    for key in ("local_keep_crops", "local_use_vector_figures"):
+        opts[key] = _to_bool(opts[key], DEFAULT_OPTIONS[key])
+    for key in ("local_min_figure_size", "local_max_figures"):
+        try:
+            opts[key] = max(1, int(opts[key]))
+        except (TypeError, ValueError):
+            opts[key] = DEFAULT_OPTIONS[key]
     opts["surya_url"] = _normalize_url(opts["surya_url"], DEFAULT_SURYA_URL)
     opts["surya_backend"] = (str(opts["surya_backend"] or "").strip().lower()
                              or DEFAULT_SURYA_BACKEND)
@@ -288,11 +333,13 @@ def status(config_file: Optional[Path] = None) -> dict:
     """解析后端状态(供 /api/config 与 /api/settings/parser 展示)。
 
     返回字段是对外契约（前端 `common.js::renderParser` 在读）：
-      * `effective` —— 实际生效的版式后端：`surya`（配置为 surya 时）或 `pymupdf`；
-      * `detection_service_group_ready` 是**真探测**（`GET /health`，超时
-        `PROBE_TIMEOUT`=2s，免得面板拉状态时卡住）；它用于检测 Figure 并识别公式；
-      * `detection_service_group_enabled` 说明当前配置下**本次解析会不会**跑检测增强
-        （surya 后端不跑）；
+      * `effective` —— 实际生效的版式后端：`pymupdf`（本地解析方案）/ `surya` /
+        `unlimited_ocr`；本机缺少本地模型依赖时本地方案为 `unavailable`；
+      * `local_ready` / `local_message` —— 本地解析方案的依赖与模型是否就绪
+        （不导入 torch/texify/paddle，只看模块可否找到与权重文件是否齐全）；
+      * `detection_service_group_ready` 仍保留真探测（`GET /health`），但**本地
+        解析方案不再使用该服务**（`detection_service_group_enabled` 恒为 False，
+        仅为兼容旧前端展示）；
       * `surya_ready` 是**真探测**（`GET /models`）**且**本机 surya-ocr 客户端依赖
         就绪（`surya_client_ready`）—— 两者都满足才能用 surya 后端解析；
         `surya_service_ready` 单独给出服务端探测结果，`surya_message` 是明细。
@@ -300,7 +347,13 @@ def status(config_file: Optional[Path] = None) -> dict:
     try:
         opts, warnings = load_options(config_file)
     except Exception as exc:  # pragma: no cover - 配置损坏时不应影响服务
-        return {"backend": "pymupdf", "effective": "pymupdf", "message": str(exc)}
+        return {"backend": "auto", "effective": "unavailable", "message": str(exc)}
+
+    try:
+        local = local_parse_status()
+    except Exception as exc:  # 探测本身出错不影响其它后端的状态
+        local = {"ready": False, "missing": [], "message": f"探测失败：{exc}",
+                 "model_dir": ""}
 
     try:
         f_ok, f_msg = detection_service_group_check(
@@ -324,8 +377,8 @@ def status(config_file: Optional[Path] = None) -> dict:
         u_ok, u_msg = False, f"探测失败：{exc}"
 
     backend = opts["backend"]
-    enhance_on = bool(opts.get("detection_service_group_enable")) and backend in (
-        "auto", "detection_service_group")
+    # 本地解析方案不再调用 detection-service-group（公式/表格/插图都由本地模型完成）
+    enhance_on = False
     if backend == "surya":
         if s_ok and c_ok:
             message = ("文字版式、公式（<math>→LaTeX）与插图由 Surya 2 整页 OCR 提供，"
@@ -341,15 +394,23 @@ def status(config_file: Optional[Path] = None) -> dict:
             message = ("解析后端现为 unlimited_ocr，但 Unlimited-OCR 推理服务不可用"
                        " —— 上传 / 重解析会失败（见下方明细）")
     else:
-        message = ("文字版式走 PyMuPDF 本地解析；detection-service-group "
-                   "用于提供 Figure 图片并识别公式框与 LaTeX"
-                   + ("（服务已就绪）" if f_ok else "（服务不可用，本次跳过检测增强）"))
+        if local["ready"]:
+            message = ("本地解析方案：PyMuPDF 版式 + texify 公式识别 + "
+                       "OXR 版面分析 + SLANet 表格识别；公式用页面覆盖层渲染")
+        else:
+            message = (f"解析后端现为 '{backend}'（本地解析方案），但本机还不具备条件："
+                       + local["message"] + "；上传 / 重解析会失败（见下方明细）")
+    effective = ("surya" if backend == "surya"
+                 else "unlimited_ocr" if backend == "unlimited_ocr"
+                 else "pymupdf" if local["ready"] else "unavailable")
     return {
         "backend": backend,              # 用户保存的值(auto/detection_service_group/…)
-        # 实际生效的版式后端：surya / unlimited_ocr 是独立整页 OCR 链，其余走 PyMuPDF
-        "effective": ("surya" if backend == "surya"
-                      else "unlimited_ocr" if backend == "unlimited_ocr"
-                      else "pymupdf"),
+        # 实际生效的版式后端：pymupdf（本地解析方案）/ surya / unlimited_ocr
+        "effective": effective,
+        "local_ready": bool(local["ready"]),
+        "local_message": local["message"],
+        "local_missing": list(local.get("missing") or []),
+        "local_model_dir": local.get("model_dir") or "",
         "env_override": bool(os.environ.get(_ENV_KEYS["backend"])),
         "detection_service_group_url": opts["detection_service_group_url"],
         "detection_service_group_ready": f_ok,
@@ -369,6 +430,8 @@ def status(config_file: Optional[Path] = None) -> dict:
         "unlimited_ocr_message": u_msg,
         "dpi": opts["dpi"],
         "image_dpi": opts["image_dpi"],
+        "local_device": opts["local_device"] or "auto",
+        "local_dpi": opts["local_dpi"],
         "message": message,
         "warnings": warnings,
     }

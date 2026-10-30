@@ -18,32 +18,24 @@
   const docId = queryId("id");
   const pagesEl = document.getElementById("pages");
 
+  /* 滚动位置由我们自己还原（`META.last_pos`，见 restoreLastPos）：关掉浏览器的
+     自动滚动恢复，否则刷新/后退时它会按旧的像素偏移再滚一次，和我们的还原打架。 */
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+
   let DOC = null, META = null;
   let zoomIdx = 1;
+  let posRestored = false;   // 首次进入是否已按服务端的 `last_pos` 定位过（见 restoreLastPos）
   const ZOOM = () => ZOOMS[zoomIdx];
-  /* 缩放是“整体缩放”：把缩放比写到 <html> 的 zoom 上，顶栏 / 目录 / 笔记栏 / AI 面板
-     连同正文一起放大，而不只是把页面撑宽。zoom 生效后测量 API 分成两套坐标，别混用：
-       · getBoundingClientRect() / offsetWidth|Height             → 布局坐标(未乘 zoom)
-       · clientWidth|Height / innerWidth|Height / scrollY|Height  → 视觉坐标(已乘 zoom)
-     凡是两套坐标相遇的地方(滚动、点击取句、视口宽度)，都用下面几个换算函数过一手。 */
-  const ZOOM_OK = "zoom" in document.documentElement.style;
-  const GZ = () => (ZOOM_OK ? ZOOM() : 1);                          // 真正作用在整页上的缩放比
-  const vpW = () => document.documentElement.clientWidth / GZ();    // 视口宽(布局坐标)
-  const vpH = () => window.innerHeight / GZ();                      // 视口高(布局坐标)
-  const scrolled = () => window.scrollY / GZ();                     // 已滚动距离(布局坐标)
-  const toScrollTop = (y) => Math.max(0, Math.round(y * GZ()));     // 布局坐标 → scrollTo 的视觉坐标
-  const toScrollDelta = (d) => Math.round(d * GZ());                // 布局位移 → scrollBy 的视觉位移
-  function applyZoom() {
-    // 不支持 CSS zoom 的老浏览器退回旧行为(只缩放正文页宽)，不至于点了按钮没反应
-    if (ZOOM_OK) document.documentElement.style.zoom = String(ZOOM());
-  }
   const pages = [];
   const itemById = {};
   const zh = {};            // 段落(块)id -> 中文
   const noZh = new Set();
   let anno = { highlights: {}, notes: [] };
+  /* 暗夜下正文颜色的反色缓存（r2-color.js 的 pageInk 用，r2-notes.js 换主题时清空） */
+  const inkCache = new Map();
   let sel = null;           // 选中：{ sents: [{item, si}, …] }，按阅读顺序(支持拖拽多选)
   let ordSeq = 0;           // 文字块全页连续序号(重置于 render)，用于比较先后
+  const nextOrd = () => ordSeq++;   // 交给 js/items/* 里的块渲染器分配（render 时归零）
   let showZhOn = false;
   let showNotesOn = true;   // 笔记默认展开，和正文一起看
   let editingKey = null;    // 正在内嵌编辑的句子 key("p0b3#1")
@@ -53,80 +45,40 @@
   let noteSide = true, noteW = 300, noteLeft = 0;
   let curPageW = 0;         // 当前渲染的页面宽度(px)：变化需要整体 render
   const NOTE_GAP = 10;      // 右侧相邻笔记卡的最小垂直间距
-  let busy = false, cancelAll = false;
+  let _fontsHook = false;      // 字体就绪后的基线重排只挂一次
   const ZH_STORE_OLD = "paperReader.showZh";   // 旧版本的浏览器本地开关（升级后不再使用）
 
   const $ = (id) => document.getElementById(id);
 
-  /* ================= 句子分割(学术英文) ================= */
-  const _ABBR = new Set(["fig", "figs", "eq", "eqs", "sec", "sect", "ref", "refs", "no", "nos",
-    "tab", "tabs", "ch", "chaps", "app", "pp", "vol", "vols", "approx", "et", "al", "dept", "univ"]);
-  const _TITLE = new Set(["dr", "prof", "mr", "mrs", "ms", "st", "mt", "fr", "jr", "sr",
-    "rev", "gen", "col", "lt", "capt", "sgt", "adm", "rep", "sen", "gov", "corp", "inc", "ltd", "co"]);
+  /* ---- 纯工具模块装配（都无状态，装配一次即可） ----
+     · r2-text.js  句子切分 / 字符区间 / 复制文本 / 句子 key
+     · r2-color.js HSL 换算 / 暗夜反色（共用上面的 inkCache）
+     · r2-fit.js   逐行横向压缩（本地解析方案的绝对定位行）
+     · r2-view.js  缩放 / 视口坐标换算 / 滚动位置还原（META、posRestored 用 getter） */
+  const { splitSentences, sentOf, sentRange, lineOfChar,
+          sentKey, keyParts, copyRangeText, copySentenceText, itemCopyText,
+          normTrans } = R2Text();
+  const { hex2rgb, rgb2hsl, hsl2hex, invertInk, pageInk, hexToRgba } =
+    R2Color({ inkCache, isDark });
+  const { gapStats, fitLineEl, fitItemLines } = R2Fit();
+  const { ZOOM_OK, GZ, vpW, vpH, scrolled, toScrollTop, toScrollDelta, applyZoom,
+          anchorProbe, pageAnchor, restoreAnchor, posValid, posIsTail,
+          restoreLastPos } = R2View({
+    ZOOM, pages,
+    get META() { return META; },
+    get posRestored() { return posRestored; },
+    set posRestored(v) { posRestored = v; },
+  });
 
-  function splitSentences(text) {
-    const n = text.length, ends = [];
-    let i = 0;
-    while (i < n) {
-      const c = text[i];
-      if (c === "." || c === "!" || c === "?") {
-        let j = i + 1;
-        while (j < n && /[.!?…]/.test(text[j])) j++;
-        while (j < n && /[)\]}”’»"'’]/.test(text[j])) j++;
-        const ws = j;
-        while (j < n && /\s/.test(text[j])) j++;
-        if (j >= n) { ends.push(ws); break; }
-        const next = text[j];
-        const mm = text.slice(0, i).match(/([A-Za-z]+)\s*$/);
-        const tok = mm ? mm[1].toLowerCase() : "";
-        let boundary = false;
-        if (/[A-Z0-9"'“’(]/.test(next)) {
-          const numeral = /^\d/.test(next) && _ABBR.has(tok);
-          const nameLike = _TITLE.has(tok);
-          const etAl = tok === "al" && /(^|\s)et\s*$/i.test(text.slice(0, ws));
-          boundary = !numeral && !nameLike && !etAl;
-        }
-        // 小数点/编号不切（`1.1`、`3.14`）：后端 `pdf_parser.sentences.split_sentences`
-        // 是同一口径 —— 数据层现在已经「一个块 = 恰好一句」，两边不一致的话会把一个块
-        // 在界面上切回两句（笔记/高亮的句号就对不上了）。
-        if (boundary && i > 0 && /\d/.test(text[i - 1]) && /\d/.test(next)) {
-          boundary = false;
-        }
-        if (boundary) ends.push(ws);
-        i = j;
-      } else { i++; }
-    }
-    const sents = [];
-    let start = 0;
-    for (const e of ends) {
-      if (e <= start) continue;
-      sents.push({ s: start, e });
-      start = e;
-    }
-    // ⚠️ 句子区间必须**铺满整块文本**：句末标点后的空白、结尾的换行、以及最后一行
-    // 被擦成空格的公式空位，都归**前一句**。否则这些字符「既不是上一句的也不是下一句的」——
-    // 永远选不中(sentOf 只能回落到相邻句)，选中高亮/笔记下划线会在行中间留出空洞，
-    // 看上去像排版坏了。文本抽取侧不用管：sentenceText/selFragText 都会 trim+压缩空白。
-    if (start < n) {
-      if (/\S/.test(text.slice(start))) sents.push({ s: start, e: n });
-      else if (sents.length) sents[sents.length - 1].e = n;   // 尾巴整段是空白(含换行) → 并进前一句
-    }
-    return sents;
+  /* 解析后端名字 → 界面显示名（doc.json 里存的是稳定取值） */
+  function parserLabel(name) {
+    return name === "pymupdf" ? "本地解析方案"
+         : name === "surya" ? "Surya 2"
+         : name === "unlimited_ocr" ? "Unlimited-OCR"
+         : (name || "?");
   }
-  function sentOf(item, idx) {
-    const L = item.canonical.length;
-    let i = idx == null ? 0 : idx;
-    i = Math.max(0, Math.min(L - 1, i));
-    const ss = item.sents;
-    if (!ss.length) return 0;
-    if (i < ss[0].s) return 0;
-    for (let k = 0; k < ss.length; k++) if (i >= ss[k].s && i < ss[k].e) return k;
-    return ss.length - 1;
-  }
-  function sentRange(item, si) {
-    const ss = item.sents[si];
-    return ss ? { a: ss.s, b: ss.e } : { a: 0, b: Math.max(0, item.canonical.length - 1) };
-  }
+
+  /* 句子切分 / 字符区间 / 复制文本 / 句子 key：实现在 r2-text.js（装配见上方 R2Text） */
 
   /* ================= 基础查询 ================= */
   function findItem(id) { return itemById[id] || null; }
@@ -134,116 +86,30 @@
     const ss = item.sents[si];
     return ss ? item.canonical.slice(ss.s, ss.e).replace(/\n+/g, " ").trim() : "";
   }
-  function sentKey(item, si) { return item.id + "#" + si; }
-  function copySentenceText(item, si) {
-    const ss = item.sents[si];
-    if (!ss) return "";
-    let text = item.canonical.slice(ss.s, ss.e);
-    const formulas = (item.formulaBoxes || [])
-      .filter(box => box._copyRange && box._copyRange.start < ss.e && box._copyRange.end > ss.s)
-      .sort((a, b) => b._copyRange.start - a._copyRange.start);
-    for (const box of formulas) {
-      const a = Math.max(0, box._copyRange.start - ss.s);
-      const b = Math.min(text.length, box._copyRange.end - ss.s);
-      text = text.slice(0, a) + "$" + box.dataset.latex + "$" + text.slice(b);
-    }
-    return text.replace(/\n+/g, " ").trim();
-  }
-  function keyParts(key) {
-    const k = String(key || "");
-    const p = k.lastIndexOf("#");
-    return p > 0 ? { id: k.slice(0, p), si: parseInt(k.slice(p + 1), 10) || 0 } : { id: k, si: -1 };
-  }
   function noteOf(key) { return (anno.notes || []).find(x => x.block_id === key) || null; }
 
-  /* ---- 选中：句子级(可多句) ---- */
-  function selCount() { return sel ? sel.sents.length : 0; }
-  function selAnchor() { return sel && sel.sents.length ? sel.sents[0] : null; }   // 工具条/笔记卡锚定的那一句
-  function selItems() {                                                            // 去重后的文字块(保持顺序)
-    const out = [];
-    if (sel) for (const r of sel.sents) if (out.indexOf(r.item) < 0) out.push(r.item);
-    return out;
-  }
-  function selKeys() { return sel ? sel.sents.map(r => sentKey(r.item, r.si)) : []; }
-  function isSelRef(item, si) {
-    return !!sel && sel.sents.some(r => r.item === item && r.si === si);
-  }
-  function ordOf(ref) { return ref.item.ord * 1e6 + ref.si; }
-  // 阅读顺序里 a→b 之间(含两端)的**整句**，跨块、跨页都支持
-  function refsBetween(a, b) {
-    const lo = ordOf(a) <= ordOf(b) ? a : b;
-    const hi = lo === a ? b : a;
-    const out = [];
-    for (const pg of pages) {
-      for (const it of pg.items) {
-        if (it.kind !== "blk" || !it.sents.length) continue;
-        if (it.ord < lo.item.ord || it.ord > hi.item.ord) continue;
-        const from = it === lo.item ? lo.si : 0;
-        const to = it === hi.item ? hi.si : it.sents.length - 1;
-        for (let si = from; si <= to; si++) out.push({ item: it, si });
-      }
-    }
-    return out.length ? out : [{ item: lo.item, si: lo.si }];
-  }
-  function pageOfItem(item) {
-    for (let pi = 0; pi < pages.length; pi++)
-      if (pages[pi].items.indexOf(item) >= 0) return pi + 1;
-    return "";
-  }
+  /* ================= 选中（句子级，可多句）：已拆到 js/select/selection.js =================
+     本段持有“选中”的全部交互：点 / 拖拽取句、公式框选句锚定、选中态重绘，
+     以及挂在 pagesEl、document 上的鼠标事件。
+     · `sel` 是**跨模块共享的可变状态**（render / 布局 / 笔记 / 工具条都会读它）→
+       装配用 getter + setter，改的还是本作用域里这个 `sel`；
+     · `DOC` 换论文时会整体替换 → getter；
+     · placeBar / updateBar / hideBar 来自后面的《浮动工具条》段，装配这一刻还在
+       TDZ → 包一层转发，等真正调用时再去读。 */
+  const { selCount, selAnchor, selItems, selKeys, isSelRef, refsBetween, pageOfItem,
+          setSelection, clearSelection, selectSentence, refreshSelectionVisual,
+          attachFormulaBoxes, applySelRanges } = R2Selection({
+    get DOC() { return DOC; },
+    get sel() { return sel; }, set sel(v) { sel = v; },
+    findItem, itemById, lineOfChar, pages, pagesEl, GZ,
+    paintFormulaMarks, rebuildItem, sentKey, sentOf, sentRange, setAnnoRanges,
+    placeBar: (...a) => placeBar(...a),
+    updateBar: (...a) => updateBar(...a),
+    hideBar: (...a) => hideBar(...a),
+  });
 
   /* ================= 渲染 ================= */
-  /* ---- 主题：暗夜下正文颜色“保留色相、反转明度” ----
-     PDF 里的字色是写死的（大多是黑），直接黑字配枪灰底就看不见了；
-     所以按 HSL 把明度翻过来并夹到可读区间：黑字→近白、彩色字→同色系提亮。
-     换主题时清缓存重算（见文件末尾的 themechange 监听）。 */
-  const inkCache = new Map();
-  function hex2rgb(hex) {
-    let s = String(hex || "").replace("#", "").trim();
-    if (s.length === 3) s = s.split("").map(ch => ch + ch).join("");
-    if (s.length !== 6) return null;
-    const n = parseInt(s, 16);
-    return isNaN(n) ? null : [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-  }
-  function rgb2hsl(r, g, b) {
-    r /= 255; g /= 255; b /= 255;
-    const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
-    if (mx === mn) return [0, 0, l];
-    const d = mx - mn;
-    const s = l > .5 ? d / (2 - mx - mn) : d / (mx + mn);
-    let h;
-    if (mx === r) h = (g - b) / d + (g < b ? 6 : 0);
-    else if (mx === g) h = (b - r) / d + 2;
-    else h = (r - g) / d + 4;
-    return [h / 6, s, l];
-  }
-  const _h2 = x => Math.round(x * 255).toString(16).padStart(2, "0");
-  function hsl2hex(h, s, l) {
-    if (s <= 0) { const v = _h2(l); return "#" + v + v + v; }
-    const q = l < .5 ? l * (1 + s) : l + s - l * s;
-    const p = 2 * l - q;
-    const f = t => {
-      if (t < 0) t += 1;
-      if (t > 1) t -= 1;
-      if (t < 1 / 6) return p + (q - p) * 6 * t;
-      if (t < 1 / 2) return q;
-      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-      return p;
-    };
-    return "#" + _h2(f(h + 1 / 3)) + _h2(f(h)) + _h2(f(h - 1 / 3));
-  }
-  function invertInk(hex) {
-    const rgb = hex2rgb(hex);
-    if (!rgb) return hex;
-    const [h, s, l] = rgb2hsl(rgb[0], rgb[1], rgb[2]);
-    const nl = Math.min(.98, Math.max(.62, 1 - l));    // 夹住，别变成看不见的灰
-    return hsl2hex(h, s <= 0 ? 0 : Math.min(1, s * .95 + .05), nl);
-  }
-  function pageInk(c) {
-    const key = c || "#000";
-    if (!isDark()) return key;
-    if (!inkCache.has(key)) inkCache.set(key, invertInk(key));
-    return inkCache.get(key);
-  }
+  /* 主题配色（HSL 换算 / 暗夜反色 / hex→rgba）：实现在 r2-color.js（装配见上方 R2Color） */
 
   function styleRun(sp, r, bodyS) {
     sp.style.fontFamily = FONT[r.fam] || FONT.serif;
@@ -252,12 +118,20 @@
     if (r.b) sp.style.fontWeight = "700";
     if (r.i) sp.style.fontStyle = "italic";
     if (r.up) {
-      sp.style.verticalAlign = "super";
-      // 上标字号：PDF 有两种排法 —— TeX 直接把字排小(7pt)，旧排版/Word 用 Ts
-      // 只抬升、字号不变。统一取「本身字号」与「正文×0.7」的**较小值**：
-      // 前者不会被缩两次，后者能补出上标该有的视觉大小。
-      const s = bodyS > 0 ? Math.min(r.s, bodyS * 0.7) : r.s;
-      sp.style.fontSize = Math.max(s * r.S, 1) + "px";
+      // 上标只认「确实比正文小」的 run。PyMuPDF 的 flags bit0 是按**行首 span
+      // 的基线**判定的：行内公式所在的行往往以公式下标/小字号字形开头，紧跟其后的
+      // 整段正文会被误标成上标（latex_sample 实测 21 个 up 里 19 个是正文）。
+      // 这类假上标字号与正文一致，若照旧乘 0.7 就会明显变小、还整体抬高。
+      // TeX 的真上标会直接把字排小（约正文 0.7×），用字号当闸门即可分辨；
+      // 代价是 Word 式「只抬升、不缩小」的上标不再抬升，但学术 PDF 里极少见。
+      const isSup = bodyS > 0 && r.s <= bodyS * 0.9 + 1e-6;
+      if (isSup) {
+        sp.style.verticalAlign = "super";
+        // 字号取「本身字号」与「正文×0.7」的较小值：前者不会被缩两次，
+        // 后者能补出上标该有的视觉大小。
+        const s = Math.min(r.s, bodyS * 0.7);
+        sp.style.fontSize = Math.max(s * r.S, 1) + "px";
+      }
     }
   }
 
@@ -277,196 +151,81 @@
                           ", 0 0 2px " + hexToRgba(c.color, .9);
   }
 
-  /* ---- 公式框的“跟随高亮” ----
-     页面级公式覆盖层（.fbox）是绝对定位的独立元素：盖在公式空位上方、底色是页面底色
-     （要挡住尚未擦除的原字形）。高亮只画在文字 span 上，公式就成了高亮区域里一个
-     “洞”。这里按几何把**落在高亮句子里**的公式框也刷上同一套高亮样式：与某个高亮
-     span（含公式空位 span —— 它在句子区间里、同样带 .hl）有实质重叠即算命中，颜色
-     沿用那个 span 的 data-hl（与 hlPaint 同一套调色盘）。 */
+  /* ---- 页面级公式框（.fbox）的高亮 ----
+     本地解析方案把公式渲染成页面级覆盖层；选句/高亮时需要让公式框跟着变色。
+     公式框与句子通过 `_copyRange`（解析侧下发的字符区间）对应。 */
   function paintFormulaHl(fb, key) {
+    if (!fb) return;
+    if (!key) {
+      fb.style.background = ""; fb.style.color = ""; fb.style.textShadow = "";
+      return;
+    }
     const c = hlColor(key);
-    const tint = hexToRgba(c.color, isDark() ? .2 : c.alpha);
-    // 高亮色叠在页面底色上（公式框底色必须仍然不透明，继续挡原字形）
+    const tint = hexToRgba(c.color, isDark() ? .2 : Math.min(0.6, c.alpha));
+    // 底色**叠在页面底色上**：.fbox 必须仍然不透明，继续挡住框内尚未擦除的原字形
     fb.style.background = "linear-gradient(" + tint + "," + tint + "), var(--page-bg)";
     if (!isDark()) { fb.style.color = ""; fb.style.textShadow = ""; return; }
+    // 暗夜：与正文 span(.rn.hl / hlPaint) 完全同一套荧光字 —— KaTeX 文本从 .fbox 继承 color
     const rgb = hex2rgb(c.color) || [255, 214, 74];
     const [h, s] = rgb2hsl(rgb[0], rgb[1], rgb[2]);
-    fb.style.color = hsl2hex(h, Math.min(1, s * 1.1 + .15), .76);   // KaTeX 文本继承
+    fb.style.color = hsl2hex(h, Math.min(1, s * 1.1 + .15), .76);
     fb.style.textShadow = "0 0 8px " + hexToRgba(c.color, .95) +
                           ", 0 0 2px " + hexToRgba(c.color, .9);
   }
   function paintFormulaMarks() {
-    for (const pg of pages) {
-      if (!pg.el) continue;
-      for (const fb of pg.el.querySelectorAll(".fbox.hltint")) {   // 先清旧色，再重算
-        fb.classList.remove("hltint");
-        fb.style.background = "";
-        fb.style.color = "";
-        fb.style.textShadow = "";
-      }
-      const marks = [...pg.el.querySelectorAll(".rn.hl[data-hl]")]
-        .map(sp => ({ r: sp.getBoundingClientRect(), key: sp.dataset.hl }))
-        .filter(m => m.r.width > 0 && m.r.height > 0);
-      if (!marks.length) continue;
-      for (const fb of pg.el.querySelectorAll(".fbox")) {
-        const r = fb.getBoundingClientRect();
-        if (!r.width || !r.height) continue;
-        let best = null, bestArea = 0;
-        for (const m of marks) {
-          const ox = Math.min(r.right, m.r.right) - Math.max(r.left, m.r.left);
-          const oy = Math.min(r.bottom, m.r.bottom) - Math.max(r.top, m.r.top);
-          if (ox <= 0 || oy <= 0) continue;
-          const area = ox * oy;
-          if (area > bestArea) { bestArea = area; best = m; }
+    for (const id in itemById) {
+      const it = itemById[id];
+      for (const box of it.formulaBoxes || []) {
+        const rg = box._copyRange;
+        if (!rg && !box._selectRef) continue;
+        // 选句/高亮一律跟随**锚点句子**（`_selectRef`，见 attachFormulaBoxes）。
+        // ⚠️ 不要再按 `_copyRange` 与句子区间相交判断：分离式公式（∑ 的上下限、
+        // 分式分母）的占位常落在别的段落块里，按区间相交会把别的公式框一起染色。
+        const anchorRef = box._selectRef;
+        let color = null, selected = false;
+        if (anchorRef) {
+          const key = sentKey(anchorRef.item, anchorRef.si);
+          const c = (anno.highlights || {})[key];
+          if (c) color = c.color || "yellow";
+          if (sel && sel.sents && sel.sents.some(r =>
+              r.item === anchorRef.item && r.si === anchorRef.si)) selected = true;
+        } else if (rg) {
+          // 没有锚点（极旧数据 / 公式框缺 bbox）：退回 copy 区间相交的老口径
+          for (const [key, c] of Object.entries(anno.highlights || {})) {
+            const p = keyParts(key);
+            if (p.id !== it.id || p.si < 0 || p.si >= it.sents.length) continue;
+            const sr = sentRange(it, p.si);
+            if (sr.a < rg.end && sr.b > rg.start) {
+              color = (c && c.color) || "yellow";
+              break;
+            }
+          }
+          if (sel && sel.sents) {
+            for (const ref of sel.sents) {
+              if (ref.item !== it) continue;
+              const sr = sentRange(it, ref.si);
+              if (sr.a < rg.end && sr.b > rg.start) { selected = true; break; }
+            }
+          }
         }
-        if (!best) continue;
-        const cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-        const inside = cx >= best.r.left - 4 && cx <= best.r.right + 4 &&
-                       cy >= best.r.top - 4 && cy <= best.r.bottom + 4;
-        // 中心不在高亮 span 里时，要求重叠面积够大 —— 否则贴着高亮句边缘的别的公式会被误染
-        if (!inside && bestArea < r.width * r.height * 0.3) continue;
-        fb.classList.add("hltint");
-        paintFormulaHl(fb, best.key);
+        paintFormulaHl(box, color);
+        box.classList.toggle("formula-sel",
+          selected || !!(sel && sel.formulaBox === box));
       }
     }
   }
 
-  /* ---- 公式空位（被擦成空格的那截）与行宽适配 ----
-     解析侧把公式字形换成空格（见 pdf_parser/math_font._blank_math_spans），并且**已经
-     用行框宽度 `ln.w` 反推出每条空位的原宽**、随行级 `ln.gaps` 一起下发（解析侧是
-     唯一实现）。空格个数也由那个宽度反推，所以自然排出来就接近原宽；前端只做两件事：
+  /* 逐行横向压缩：实现在 r2-fit.js（装配见上方 R2Fit） */
 
-       1. 按 `data-gw`(原宽) 用 `word-spacing` **只加在空位 span** 上，把那段空格精确
-          撑/收到原宽 —— 公式后面的正文因此落回原 x（加在 .ln 上会连正文词间格一起变）；
-       2. 剩下的差只可能是**字体度量**（浏览器用 Georgia 替 PDF 内嵌字体），均摊到普通
-          词间格上，让整行宽度与行框一致。
-
-     前端**不再自己反推空位宽度**：`ln.gaps` 没带宽度（旧数据）时就不给空位定宽，
-     那些空格按普通空格参与第 2 步。 */
-  /* 本行的公式空位：`[[起, 止, 原宽 pt], …]` —— **只认解析侧下发的 `ln.gaps`**。
-     空位原宽由后端「行框宽度反推」算好(见 backend/pdf_parser/math_font._line_gap_widths)，
-     前端不自己反推：没有宽度(旧数据)就不把这段当空位，按普通空格排。 */
-  function lineGaps(ln, text) {
-    const out = [];
-    for (const g of (ln && ln.gaps) || []) {
-      const a = g[0] | 0, n = g[1] | 0, w = g[2];
-      if (n > 0 && a >= 0 && a + n <= text.length && typeof w === "number" && w > 0)
-        out.push([a, a + n, w]);
-    }
-    return out;
-  }
-  function gapAt(ld, x, y) {               // 块内区间 [x,y) 整段落在哪个空位里
-    for (const g of ld.gaps || [])
-      if (x >= ld.gs + g[0] && y <= ld.gs + g[1]) return g;
-    return null;
-  }
-  function normalSpaceCount(el) {           // 行内「普通词间格」个数（空位 span 不算）
-    let n = 0;
-    for (const sp of el.children) {
-      if (sp.classList.contains("rngap")) continue;
-      const m = sp.textContent.match(/ /g);
-      if (m) n += m.length;
-    }
-    return n;
-  }
-  /* 一行文字的**自然宽度**：用 Range 量(分数精度)。不要用 scrollWidth —— 它是整数、
-     而且会把绝对定位的行内公式覆盖层算进去。 */
-  function lineTextWidth(el) {
-    const r = document.createRange();
-    r.selectNodeContents(el);
-    return r.getBoundingClientRect().width;
-  }
-  function fitLineEl(ld) {
-    const el = ld.el;
-    if (ld.free) return;      // Surya 块：流式排版（自然宽度），不按 PDF 行框拉伸/压缩
-    const S = (ld.runs[0] && ld.runs[0].S) || 1;         // PDF pt → 布局 px
-    el.style.transformOrigin = "left center";
-    el.style.transform = "";
-    el.style.wordSpacing = "";
-    const gaps = [...el.querySelectorAll(".rngap")];
-    for (const sp of gaps) sp.style.wordSpacing = "";   // 幂等：先复原上一轮的补偿再量
-    const boxW = el.getBoundingClientRect().width;       // PDF 行框宽 = 原稿这一行排到哪
-    let textW = lineTextWidth(el);
-    for (const sp of gaps) {
-      // 空位：原宽已由解析侧算好(行框宽度反推)，这里只把它撑/收到正好 gw
-      // —— 空格的字宽 ≠ 原公式宽度，不撑的话公式后面的正文会整体左移。
-      const n = sp.textContent.length;
-      const gw = parseFloat(sp.dataset.gw) * S;          // 原公式宽度(px)
-      if (!n || !(gw > 0)) continue;
-      const nat = sp.getBoundingClientRect().width;
-      const adv = nat / n;                               // 空格字宽
-      const ws = Math.max((gw - nat) / n, -0.9 * adv);    // 别把空格压成负宽
-      sp.style.wordSpacing = ws.toFixed(3) + "px";
-      textW += ws * n;
-    }
-    // 行里剩下的差只可能是**字体度量**（浏览器用 Georgia 替 PDF 内嵌字体）：均摊到
-    // 普通词间格上，让整行宽度与行框一致。空位有自己的内联值，不受行级影响。
-    const rest = boxW - textW;
-    const wn = normalSpaceCount(el);
-    if (wn && Math.abs(rest) > 0.5) {
-      const ws = clamp(rest / wn, -1.5, 3);
-      el.style.wordSpacing = ws.toFixed(3) + "px";
-      textW += ws * wn;
-    }
-    // 还有溢出的（空位收窄被下限拦住 / 整行真排不下）→ 整体压缩兜底
-    if (textW > boxW + 2) el.style.transform = "scaleX(" + (boxW / textW).toFixed(4) + ")";
-  }
-  /* 把块内每一行的行宽适配跑一遍。
-     ⚠️ 时机很重要：**必须在所有会改行宽的东西之后**。
-     行内公式注入进来的是 `\(…\)` **源码**文本，比渲染出的 KaTeX 宽得多
-     （`\(\sigma_p\)` 11 个字符 vs KaTeX 约 28px），先量会把整行压过头 ——
-     实测本样本 25 行含公式的行全部被多压，平均 0.839 vs 应有 0.921，
-     最狠的 `return of the portfolio, …` 压到 0.68（应为 0.911），
-     正文跟着缩到 68% 宽，看着就是「这几行字号比别的小」；
-     727 行不含公式的行「施加值 vs 应有值」完全相等，可作对照。 */
-  function fitItemLines(item) {
-    for (const ld of item.linesData) fitLineEl(ld);
-  }
-
-  /* ---- 重排时的“视觉锚点” ----
-     缩放 / 窗口变化 / 目录与笔记栏开关都会改变页面尺寸，进而整页重建；
-     重建后如果不按**同一处内容**还原滚动位置，用户就会莫名其妙地“跳页”
-     （尤其是目录跳转之后 —— 旧行为是每次重排都滚回读到过的最后一页）。
-     锚点记成「第几页 + 页内比例」，重排完再换算回新的像素位置。
-     注意：getBoundingClientRect() 是**视口坐标**，探针也必须用视口坐标量，
-     否则会算出“文档坐标减视口坐标”这种毫无意义的比值。 */
-  function anchorProbe() {
-    // 顶栏是 sticky 的，量它的底边：正文里第一行「看得见」的内容就在这下面一点
-    const bar = document.querySelector(".topbar");
-    return (bar ? bar.getBoundingClientRect().bottom : 0) + 8;
-  }
-  function pageAnchor() {
-    if (!pages.length) return null;
-    const probe = anchorProbe();
-    const last = pages[pages.length - 1].el.getBoundingClientRect();
-    if (last.bottom <= probe) {
-      // 视口已经在正文下方（正在看文末的 AI 面板）：按“离文档底部多远”记，
-      // 重排后照样停在 AI 面板那一段
-      return { pi: -1, fromBottom: (document.documentElement.scrollHeight - window.scrollY) / GZ() };
-    }
-    let pi = 0;
-    for (let i = 0; i < pages.length; i++) {
-      if (pages[i].el.getBoundingClientRect().top <= probe) pi = i;
-    }
-    const r = pages[pi].el.getBoundingClientRect();
-    return { pi, ratio: clamp((probe - r.top) / (r.height || 1), 0, 1) };
-  }
-  function restoreAnchor(a) {
-    if (!a) return;
-    if (a.pi < 0) {
-      const top = document.documentElement.scrollHeight / GZ() - a.fromBottom;
-      window.scrollTo({ top: toScrollTop(top), behavior: "auto" });
-      return;
-    }
-    if (!pages[a.pi]) return;
-    const r = pages[a.pi].el.getBoundingClientRect();
-    const top = scrolled() + r.top + a.ratio * r.height - anchorProbe();
-    window.scrollTo({ top: toScrollTop(top), behavior: "auto" });
-  }
+  /* 视觉锚点 / 滚动位置还原：实现在 r2-view.js（装配见上方 R2View） */
 
   function render(preAnchor) {
     if (!DOC) return;              // 文档还没到（缺 ?id= / 数据未加载）：别让缩放之类把这里点到抛错
-    const anchor = preAnchor || pageAnchor();   // 首次渲染（还没有页面）为 null → 走“上次读到哪一页”
+    // 首次进入还没按 last_pos 定位过时，**预先量到的锚点不可信**：正文刚建好、屏幕还停在
+    // 0，量出来的是“页首”。KaTeX 加载完那次重排（init 里 render(pageAnchor())）就踩过这个坑
+    // —— 它会把刚还原好的位置又拽回文首。所以定位过一次之后才认 preAnchor。
+    const useLast = !posRestored && posValid(META && META.last_pos);
+    const anchor = useLast ? null : (preAnchor || pageAnchor());   // 首次渲染（还没有页面）为 null → 走“上次读到哪一页”
     const keepSel = sel ? sel.sents.map(r => ({ id: r.item.id, si: r.si })) : null;  // 重排后保留选中
     // 重排(缩放/窗口变化/批注栏开关)后保留已展开的译文卡，别让用户重新点一遍
     const keepTrans = Object.keys(itemById).filter(id => !itemById[id].tsec.hidden);
@@ -480,9 +239,10 @@
     ordSeq = 0;
     sel = null; hideBar();
 
-    // 整页 OCR 文档（surya / unlimited_ocr）：块级数据（bbox + 文本/html），各走
-    // 独立的流式渲染分支（buildSuryaItem / buildUnlimitedItem）；其余后端仍是
-    // PyMuPDF 的“逐行绝对定位”渲染。
+    // 三条渲染分支：
+    //   · surya / unlimited_ocr：块级数据（bbox + 文本/html），各自流式渲染；
+    //   · 本地解析方案（parser=pymupdf）：逐行几何 + 页面级公式框，走 buildTextItem；
+    //     旧 doc.json（parser=pymupdf）同样是这套结构，一并兼容。
     const surya = DOC.parser === "surya";
     const unlimited = DOC.parser === "unlimited_ocr";
     DOC.pages.forEach((pg, pi) => {
@@ -491,7 +251,12 @@
       pageEl.style.width = pg.w * S + "px";
       pageEl.style.height = pg.h * S + "px";
       pageEl.appendChild(el("div", "pagenum", "Page " + (pi + 1)));
-      const pgObj = { el: pageEl, w: pg.w * S, h: pg.h * S, items: [] };
+      // `formula_boxes` 必须留在渲染状态里：attachFormulaBoxes 会按它把 .fbox 与
+      // 文字块的 copy 区间接上（选句高亮、复制还原 LaTeX、基线对齐都依赖这一步）。
+      const pgObj = {
+        el: pageEl, w: pg.w * S, h: pg.h * S, items: [],
+        formula_boxes: pg.formula_boxes || [],
+      };
 
       for (const im of pg.images || []) {
         const div = el("div", "img");
@@ -517,12 +282,10 @@
         const item = surya ? buildSuryaItem(t, S, pageEl, pi)
                    : unlimited ? buildUnlimitedItem(t, S, pageEl, pi)
                    : buildTextItem(t, S, pageEl, pi);
-        pgObj.items.push(item);
+        if (item) pgObj.items.push(item);
       }
 
-      // detection-service-group 公式框覆盖层：按 bbox_norm × 页面显示宽高定位在页面上
-      // （内容来自服务组回包的 latex，见 r2-math.js 的 buildFormulaBoxes）。
-      // surya 文档没有这一层（公式来自块里的 <math>/latex），调用是空转。
+      // 本地解析方案：页面级公式框（KaTeX / 裁图兜底）
       buildFormulaBoxes(pg, pageEl, S, pi);
 
       pagesEl.appendChild(pageEl);
@@ -531,14 +294,25 @@
 
     // 套用标注并重画
     for (const id in itemById) { const it = itemById[id]; setAnnoRanges(it); rebuildItem(it); }
-    for (const page of pages) attachFormulaBoxes(page, page.el);
+    for (const page of pages) attachFormulaBoxes(page, page.el);   // 公式框 → 文字块段落/字符区间
     finalizeDisplayMath();     // 公式覆盖层已挂到文档上 → 量真实高度并回填块高
-    finalizeInlineMath();      // 行内公式：量原字形矩形 → 顶上 KaTeX
-    finalizeFormulaBoxes();    // 页面公式框：量自然尺寸 → 等比缩放到框内（等字体就绪）
+    finalizeInlineMath();      // 旧「行内公式覆盖层」接口（本地方案用页面级 .fbox）
+    finalizeFormulaBoxes();    // 页面级公式框：按框尺寸等比缩放 KaTeX
     finalizeSuryaBlocks();     // surya 块：量流式内容的真实高度 → 回填 contentH / 卡片位置
     settleSuryaVertical();     // surya 块：算内容纵向避让量 syShift（relayoutPage 应用）
     finalizeUnlimitedBlocks(); // unlimited-ocr 块：同上的收尾（独立一套）
     settleUnlimitedVertical(); // unlimited-ocr 块：算内容纵向避让量 ulShift
+    finalizeLocalBlocks();     // 本地解析方案：按基线摆行 + 压缩行宽 + 回填表格高度
+    // 字体晚到会改变字体的 ascent/descent（行内基线）与 KaTeX 的缩放：就绪后再摆一次。
+    // finalizeLocalBlocks 是幂等的（top 绝对值、公式先回中再量）。
+    if (document.fonts && document.fonts.ready && !_fontsHook) {
+      _fontsHook = true;
+      document.fonts.ready.then(() => {
+        if (!DOC) return;
+        finalizeLocalBlocks();
+        paintFormulaMarks();
+      }).catch(() => {});
+    }
     const paraMode = !selTransList.length;      // 有“所选句译文”时不展开整段译文(两者互斥)
     if (showZhOn && paraMode) openAllTrans();
     if (paraMode) {
@@ -553,15 +327,17 @@
     relayoutAll();
     refreshZoomLabel();
     requestAnimationFrame(() => {
-      // 读完的文章等会儿会直接落到文末的 AI 面板，这里就别多滚一次了
-      const toAi = META && META.status === "done" && !anchor;
       if (anchor) {
         restoreAnchor(anchor);      // 重排：停在原来那处内容上，不跳页
-      } else if (!toAi && META && META.last_page) {
-        // META.last_page 存的是“页码”(从 1 开始)，scrollToPage 收的是“下标”，
-        // 这里必须减 1 并夹紧，否则读到最后一页时 pages[n] 为 undefined 会抛异常，
-        // 连带后面的 updatePageInd() 也不执行(页码指示器一直停在 “-”)。
-        scrollToPage(clamp(META.last_page - 1, 0, Math.max(0, pages.length - 1)), "instant");
+      } else if (!restoreLastPos(false)) {
+        // 没有精确位置（老论文）：退回“上次读到的最远一页”。
+        // 连页码都没有（从没滚过）且已读完的，才在 init() 里落到文末 AI 面板。
+        if (META && META.last_page) {
+          // META.last_page 存的是“页码”(从 1 开始)，scrollToPage 收的是“下标”，
+          // 这里必须减 1 并夹紧，否则读到最后一页时 pages[n] 为 undefined 会抛异常，
+          // 连带后面的 updatePageInd() 也不执行(页码指示器一直停在 “-”)。
+          scrollToPage(clamp(META.last_page - 1, 0, Math.max(0, pages.length - 1)), "instant");
+        }
       }
       if (sel) placeBar(true);
       updatePageInd();
@@ -575,10 +351,11 @@
        · katexReady 是模块内部的 let（加载完才置 true），只能按函数取。
      原来的 KATEX_* 常量、_katexP / _katexReady、各类对齐与宽度缓存都随模块走了。 */
   const {
-    ensureKatex, docNeedsMath, renderInlineMath, inlineMathOf, _mathIdxAt, _rightAfterMath,
+    ensureKatex, docNeedsMath, renderInlineMath, renderKnownLatex,
+    inlineMathOf, _mathIdxAt, _rightAfterMath,
     finalizeInlineMath, _inlineMathRoom, finalizeDisplayMath, formulaBodyWidth, mathSizePx,
     katexRender, mathTexOf, mathBlockOf, formulaBaseSize, _katexBoxes,
-    buildFormulaBoxes, finalizeFormulaBoxes,
+    buildFormulaBoxes, finalizeFormulaBoxes, refitFormulaBoxes,
     katexReady,
   } = R2Math({
     docId, findItem, itemById, fitItemLines,
@@ -592,864 +369,54 @@
     ? R2Refs({ root: pagesEl })
     : { set() {}, markAll() {}, markItem() {} };
 
-  function buildTextItem(t, S, pageEl, pi) {
-    const bx = t.x * S, by = t.y * S;
-    const blk = el("div", "blk");
-    Object.assign(blk.style, { left: bx + "px", top: by + "px", width: t.w * S + "px" });
-    blk.dataset.id = t.id;
-    // 公式块整块内容都在 `latex` 里 —— **不建任何行元素**：后端也不再下发原字形
-    // (旧数据里的 `lines[*].runs` 同样不渲染)。于是「公式覆盖掉原文字形」是结构上的
-    // 事实：不依赖 `.has-math .ln{visibility:hidden}`，KaTeX 没渲染成也不会露出
-    // 乱码碎片(CMEX 的大括号被读成 n/o、拆散的上下标)。`lines` 只用来摆覆盖层与
-    // 按原文主体宽度缩放。
-    const mb = mathBlockOf(t);
+  /* ============ 块级渲染器：已拆到 js/items/ ============
+     · items/item-unlimited.js  Unlimited-OCR（块级流式排版，DOM 类名 ul-*）
+     · items/item-surya.js      Surya 2（块级流式排版，DOM 类名 sy-*）
+     · items/item-local.js      PyMuPDF 逐行几何 + 页面级公式框基线对齐
+     ⚠️ 装配顺序有依赖：local 复用 unlimited 的表格白名单（ulCleanNode）和 surya 的
+     单元格公式识别（suryaTableMath），所以先 ul → surya → local。
+     三个模块都只负责“造 DOM + 量高/避让”；重建（高亮/选中/笔记）仍走本文件的
+     rebuildItem。 */
+  const { buildUnlimitedItem, ulInlineMath, ulLineBreaks, ulCleanNode,
+          finalizeUnlimitedBlocks, settleUnlimitedVertical } = R2ItemUl({
+    el, splitSentences, bodyRunOf, mathBlockOf, mathSizePx, katexReady, katexRender,
+    _katexBoxes, itemById, nextOrd, pages,
+  });
+  const { buildSuryaItem, suryaInlineMath, suryaLineBreaks, suryaTableMath,
+          finalizeSuryaBlocks, settleSuryaVertical } = R2ItemSurya({
+    el, splitSentences, bodyRunOf, mathBlockOf, mathSizePx, katexReady, katexRender,
+    renderInlineMath, _katexBoxes, itemById, nextOrd, pages,
+  });
+  const { buildTextItem, finalizeLocalBlocks } = R2ItemLocal({
+    el, FONT, splitSentences, bodyRunOf, katexReady, renderInlineMath,
+    fitItemLines, refitFormulaBoxes, itemById, nextOrd, ulCleanNode, suryaTableMath,
+  });
 
-    const linesData = [];
-    let contentH = t.h * S;                  // 公式块没有行元素 → 块高直接用外框
-    if (!mb) {
-      // ⚠️ 新数据里一行**只有一个 run**（后端 `text_layer._merge_line_runs`），
-      // 所以下面循环里每行只会切出一个 `<span class="rn">`。
-      for (const ln of (t.lines || [])) {
-        const dy = (ln.y - t.y) * S;         // 该行相对文字块顶部的偏移(px)
-        const ld = {
-          ln, dy, runs: (ln.runs || []).map(r => Object.assign({}, r, { S, g: 0 })),
-          el: null, text: "", gs: 0,
-        };
-        ld.text = ld.runs.map(r => r.t).join("");
-        const lineEl = el("div", "ln");
-        Object.assign(lineEl.style, {
-          left: (ln.x - t.x) * S + "px", top: dy + "px",
-          width: ln.w * S + "px",
-        });
-        ld.el = lineEl;
-        blk.appendChild(lineEl);
-        contentH = Math.max(contentH, (ln.y - t.y + ln.h) * S);
-        linesData.push(ld);
-      }
-    }
+  /* ============ 高亮调色盘 + 浮动工具条 + “所选句译文”卡：已拆到 js/select/bar.js ============
+     这里只保留装配。`sel` / `anno` / `selTransList` 是跨模块共享、且会被**整体替换**的
+     可变状态 → getter + setter；其余是稳定引用（函数声明会提升，装配时取一次即可）。
+     ⚠️ 装配出的 hideBar / placeBar / updateBar 也是上面 R2Selection 用到的那三个
+     （它那边是转发调用），所以装配顺序不能颠倒。 */
+  const { hlColor, applyHlColors, renderHmenuSwatches, bindHlColorInputs,
+          hideBar, placeBar, updateBar, isTransOpen, renderSelTrans,
+          clearSelTrans, enterParaTransMode, selGroups, selFragKey } = R2Bar({
+    $, docId, itemById, findItem, noteOf,
+    selCount, selAnchor, selItems, selKeys, clearSelection, refreshSelectionVisual,
+    sentKey, sentRange, normTrans, copySentenceText, copyRangeText,
+    needWrite, savePrefs, renderInlineMath, renderKnownLatex, vpW, mathTexOf,
+    // 下面几个在“翻译”/“布局”段装配（在本段之后）——此刻还在 TDZ，只能转发
+    relayoutAll: (...a) => relayoutAll(...a),
+    onTranslateClick: (...a) => onTranslateClick(...a),
+    syncExp: (...a) => syncExp(...a),
+    selTransMathLatex: (...a) => selTransMathLatex(...a),
+    closeAllTrans: (...a) => closeAllTrans(...a), openNoteEditor: (...a) => openNoteEditor(...a),
+    get sel() { return sel; },
+    get anno() { return anno; }, set anno(v) { anno = v; },
+    get selTransList() { return selTransList; },
+    set selTransList(v) { selTransList = v; },
+    zh, noZh,
+  });
 
-    // ---------- 公式块：KaTeX 同步渲染 LaTeX ----------
-    // 内容当场就渲好(不用等挂载)；块高要等挂到文档上才量得准，所以先记下来，
-    // 由 render() 末尾的 finalizeDisplayMath() 回填。
-    if (mb) {
-      const box = el("div", "mathbox");
-      box.dataset.latex = mb.latex;
-      box.style.fontSize = mathSizePx(formulaBaseSize(linesData, pi, t.lines) * S) + "px";
-      if (katexReady() && katexRender(box, mb.latex)) {
-        // 正常路径
-      } else {
-        // KaTeX 没加载 / 这条 LaTeX 有问题 → 显示 LaTeX 源码兜底。
-        // **不再回退显示 PDF 原字形**：那些字形本身就是碎片与错字，比源码更难读，
-        // 而且"有的公式遮住了、有的露出字形"正是这条回退造成的。
-        box.textContent = mb.latex;
-        box.classList.add("failed");
-      }
-      box._blk = blk;
-      box._contentH = contentH;
-      box._origW = formulaBodyWidth(t) * S;    // 主体宽度(不含公式编号)，适配用
-      if (box._hasTag) box.style.width = "100%";   // 编号贴到原框右边缘(与 PDF 一致)
-      blk.appendChild(box);
-      _katexBoxes.add(box);
-    }
-    blk.style.height = contentH + "px";
-
-    // canonical：行文本原样拼接，行间一个 '\n'（与前端渲染的字符一一对应）
-    let g = 0;
-    for (const ld of linesData) {
-      ld.gs = g;
-      for (const r of ld.runs) { r.g = g; g += r.t.length; }
-      g += 1; // '\n'
-      // 公式空位：解析侧下发的精确区间与**原宽**（见 lineGaps）；行宽适配
-      // 按那个原宽单独把空位撑开，让公式后面的正文落回原 x。
-      // ⚠️ 用 `ld.ln`（建行时存下的原始行数据）—— `ln` 只是上面那个 for...of 的循环变量，
-      // 出了那个循环就没了。
-      ld.gaps = lineGaps(ld.ln, ld.text);
-    }
-    const item = {
-      kind: "blk", id: t.id, pi, el: blk, text: t.text,
-      x: bx, y: by, w: t.w * S, h: t.h * S, contentH,
-      latex: (mb && mb.latex) || "",          // 公式源码：复制时给这个，不给字形文本
-      linesData, canonical: "", sents: [],
-      markerRanges: [], selRanges: [], shift: 0, expH: 0,
-      ord: ordSeq++,
-    };
-    item.canonical = linesData.map(ld => ld.text + "\n").join("");
-    item.bodyRun = bodyRunOf(linesData);       // 块内主样式（修正跨公式 run 的尾部正文）
-    // 行内公式：现在是**旧数据的兼容路径** —— 旧版解析器会把匹配到的 LaTeX 内联进
-    // 文本(`\(…\)` / `$$…$$`)，由 `rebuildItem` 末尾的 `renderInlineMath` 就地换
-    // KaTeX。新数据（detection-service-group）没有内联：公式是**页面级公式框**，由
-    // `buildFormulaBoxes` 按 bbox_norm 叠覆盖层。
-    // 更旧的 Surya 路径靠块 HTML 里的 `<math>` + 覆盖层，新数据没有 `t.html`，
-    // `inlineMathOf` 直接返回 null（变成空转，保留只为兼容旧 doc.json）。
-    // 行内公式对齐：公式块不走这条（它的 html 就是 `<math display="block">…` 一整块数学，
-    // 已经由行外覆盖层渲染了；再当行内渲染一遍会叠成**重影**）。
-    item.inlineMath = mb ? null : inlineMathOf(t, item.canonical);
-    // 公式块没有可读文本 → 没有句子可切/可翻译/可标注，整段跳过。
-    item.sents = mb ? [] : splitSentences(item.canonical).map((sg, si) =>
-      ({ si, s: sg.s, e: sg.e, key: item.id + "#" + si,
-        text: item.canonical.slice(sg.s, sg.e).replace(/\n+/g, " ").trim() }));
-
-    // 译文 + 内嵌笔记展开区(都在句子下方，同一套“顶开版式”)：
-    // 译文卡片在上、笔记卡片在下，多句笔记按句序依次排列
-    const exp = el("div", "exp");
-    exp.style.top = contentH + "px";
-    const tsec = el("div", "card-in tsec");
-    tsec.hidden = true;
-    exp.appendChild(tsec);
-    // 多选句子时的“只翻译所选句”卡片列表：与整段译文卡互斥，但彼此可以同时存在
-    const stbox = el("div", "stbox");
-    stbox.hidden = true;
-    exp.appendChild(stbox);
-    const nbox = el("div", "nbox");
-    nbox.hidden = true;
-    // 卡片内的点击(编辑/删除/选中文字)不应被当成“点了正文”
-    nbox.addEventListener("click", e => e.stopPropagation());
-    stbox.addEventListener("click", e => e.stopPropagation());
-    exp.appendChild(nbox);
-    blk.appendChild(exp);
-    item.exp = exp; item.tsec = tsec; item.stbox = stbox; item.nbox = nbox;
-
-    pageEl.appendChild(blk);
-    itemById[t.id] = item;
-    return item;
-  }
-
-  /* ============ Surya 2 的块级渲染（与 PyMuPDF 的“逐行绝对定位”是两套） ============
-     surya 后端下发的版面数据是**块级**的：每块只有 label / bbox / html（块内没有行几何）。
-     所以这里不做逐行还原，而是：
-       · `.blk` 仍按 bbox 绝对定位（阅读顺序与版面关系不变）；
-       · 块内文字**正常流式排版**：字号/行高由解析侧估算（`t.size` / `t.line_h`，单位 pt），
-         标题加粗放大、图注/脚注小一号（CSS `.sy-*`），长段落自动换行；
-       · 行内公式：解析侧给了精确的字符区间（`t.math`，含 LaTeX 源码）—— 原字形
-         就地换成 KaTeX（suryaInlineMath），正文围绕公式自然重排；
-       · 独立公式（kind="formula" + latex）：KaTeX 块渲染（与 PyMuPDF 公式块同一套收尾）；
-       · 表格（kind="table"）：白名单渲染 Surya 的 `<table>` HTML，不参与句子选中。
-     文本块的内容仍由通用 `rebuildItem` 生成 —— 选中/高亮/笔记重建后样式与公式都不丢。 */
-  function buildSuryaItem(t, S, pageEl, pi) {
-    const bx = t.x * S, by = t.y * S;
-    const blk = el("div", "blk sy");
-    if (t.kind) blk.classList.add("sy-" + t.kind);
-    if (t.kind === "heading") blk.classList.add("sy-l" + (t.level || 2));
-    Object.assign(blk.style, { left: bx + "px", top: by + "px", width: t.w * S + "px" });
-    blk.dataset.id = t.id;
-    if (t.label) blk.dataset.label = t.label;
-    // 对齐方式：解析侧下发 t.align（新数据）；旧数据缺字段时按同一规则本地兜底 ——
-    // 正文类（text/list/caption/footnote）两端对齐（CSS `[data-align="justify"]`），
-    // 让行右缘像原 PDF（LaTeX justified 排版）一样齐平到栏边界；标题/页眉页脚等
-    // 保持左对齐（单行，两端对齐无意义）。末行不拉伸，与原 PDF 一致。
-    blk.dataset.align = (t.align === "justify" || t.align === "left"
-                         || t.align === "center" || t.align === "right")
-      ? t.align
-      : ((t.kind === "text" || t.kind === "list" ||
-          t.kind === "caption" || t.kind === "footnote") ? "justify" : "left");
-
-    const size = t.size > 0 ? t.size : 10;        // 解析侧估的字号（pt）
-    blk.style.fontSize = size * S + "px";
-    // 竖排文本（旋转 90° 的页眉/水印，如 arXiv 侧边戳）：Surya 不给旋转信息，用
-    // “又高又窄 + 短文本”判 —— 内容整体旋转、沿条带自下而上排（见 CSS .sy-vertical）
-    if (t.h > t.w * 3 && (t.text || "").length >= 2 && (t.text || "").length <= 80) {
-      blk.classList.add("sy-vertical");
-    }
-
-    const mb = mathBlockOf(t);                     // kind="formula" + latex → KaTeX 块
-    const linesData = [];
-    let contentH = t.h * S;        // 初值=bbox 高；挂到文档后由 finalizeSuryaBlocks 回填实测高
-    if (mb) {
-      const box = el("div", "mathbox");
-      box.dataset.latex = mb.latex;
-      box.style.fontSize = mathSizePx(size * S) + "px";
-      if (katexReady() && katexRender(box, mb.latex)) {
-        // 正常路径
-      } else {
-        box.textContent = mb.latex;                // KaTeX 未就绪/LaTeX 有问题 → 源码兜底
-        box.classList.add("failed");
-      }
-      box._blk = blk;
-      box._contentH = contentH;
-      box._origW = t.w * S;                        // 公式主体宽 = Surya 给的外框宽
-      if (box._hasTag) box.style.width = "100%";
-      blk.appendChild(box);
-      _katexBoxes.add(box);
-    } else if (t.kind === "table") {
-      const tb = suryaTableEl(t.html, size * S);
-      const title = suryaTableTitle(t);
-      if (title) blk.appendChild(title);
-      blk.appendChild(tb || el("div", "ln syln", t.text || ""));
-    } else {
-      // 文本块：唯一一条“流式行”。类名要含 ln（行内公式的让位机制按 .ln 找行），
-      // `ld.free` 让 fitLineEl 跳过（这里的宽度是排版自然宽，不是 PDF 行框）。
-      const lineEl = el("div", "ln syln");
-      const lh = t.line_h > 0 ? t.line_h : size * 1.42;
-      lineEl.style.lineHeight = lh * S + "px";
-      blk.appendChild(lineEl);
-      const ln = (t.lines && t.lines[0]) || { runs: [] };
-      const ld = {
-        ln, dy: 0, free: true, gaps: [],
-        // 补上 run 级的字号/字体（后端 run 只有 t/b/i/up；styleRun 与公式基准字号都按 r.s 算）
-        runs: (ln.runs || []).map(r => Object.assign({ s: size, fam: "serif" }, r, { S, g: 0 })),
-        el: lineEl, text: "", gs: 0,
-      };
-      ld.text = ld.runs.map(r => r.t).join("");
-      linesData.push(ld);
-    }
-    blk.style.height = contentH + "px";
-
-    // canonical：行文本原样拼接，行末一个 '\n'（与 PyMuPDF 路径同口径）
-    let g = 0;
-    for (const ld of linesData) {
-      ld.gs = g;
-      for (const r of ld.runs) { r.g = g; g += r.t.length; }
-      g += 1; // '\n'
-    }
-    const item = {
-      kind: "blk", id: t.id, pi, el: blk, text: t.text || "",
-      x: bx, y: by, w: t.w * S, h: t.h * S, contentH,
-      latex: (mb && mb.latex) || "",
-      linesData, canonical: "", sents: [],
-      markerRanges: [], selRanges: [], shift: 0, expH: 0,
-      ord: ordSeq++, surya: true,
-      syHeading: t.kind === "heading",      // 标题：finalizeSuryaBlocks 里按需放宽不折行
-    };
-    item.canonical = linesData.map(ld => ld.text + "\n").join("");
-    item.bodyRun = bodyRunOf(linesData)
-      || { s: size, fam: "serif", i: false, b: false, up: false };
-    // 行内公式：解析侧给的是 text 里的**精确字符区间**（比旧路径的“HTML 对齐”稳）。
-    // 渲染交给 suryaInlineMath：`.mspan` 原字形就地换成 KaTeX（见 rebuildItem 末尾）；
-    // 公式块不重复渲染（会叠重影）。
-    item.inlineMath = (!mb && linesData.length && t.math && t.math.length)
-      ? suryaMathRanges(t, item.canonical) : null;
-    item.sents = mb ? [] : splitSentences(item.canonical).map((sg, si) =>
-      ({ si, s: sg.s, e: sg.e, key: item.id + "#" + si,
-        text: item.canonical.slice(sg.s, sg.e).replace(/\n+/g, " ").trim() }));
-    // 表格没有可切句的 .rn 结构：点它不该弹“翻译/标注”工具条（点击分支按这个清选中）
-    if (t.kind === "table") item.noSelect = true;
-
-    // 译文 + 内嵌笔记展开区（与 buildTextItem 同一套约定）
-    const exp = el("div", "exp");
-    exp.style.top = contentH + "px";
-    const tsec = el("div", "card-in tsec");
-    tsec.hidden = true;
-    exp.appendChild(tsec);
-    const stbox = el("div", "stbox");
-    stbox.hidden = true;
-    exp.appendChild(stbox);
-    const nbox = el("div", "nbox");
-    nbox.hidden = true;
-    nbox.addEventListener("click", e => e.stopPropagation());
-    stbox.addEventListener("click", e => e.stopPropagation());
-    exp.appendChild(nbox);
-    blk.appendChild(exp);
-    item.exp = exp; item.tsec = tsec; item.stbox = stbox; item.nbox = nbox;
-
-    pageEl.appendChild(blk);
-    itemById[t.id] = item;
-    return item;
-  }
-
-  /* Surya 块的行内数学区间（解析侧给的 text 偏移）→ 覆盖层用的 {a,b,latex}。
-     越界/空的丢掉；区间相对 `t.text`，canonical 只在行末多一个 '\n'，不影响行内区间。 */
-  function suryaMathRanges(t, canonical) {
-    const out = [];
-    for (const m of (t.math || [])) {
-      const a = m && m.a | 0, b = m && m.b | 0;
-      const latex = String((m && m.latex) || "").trim();
-      if (!latex || !(b > a) || a < 0 || b > canonical.length) continue;
-      out.push({ a, b, latex });
-    }
-    return out.length ? out : null;
-  }
-
-  /* Surya 块的行内公式：把 `.mspan` 原字形**就地换成 KaTeX**。
-     不走 .mathbox.inline 覆盖层 —— 那套是给“逐行绝对定位、行宽固定”的 PyMuPDF 版面
-     设计的（覆盖层 + mspacer 让位）；流式排版里行会重排，覆盖层定位不稳（实测公式会
-     压到隔壁词上）。就地渲染后正文围绕真公式自然重排，宽度与基线都交给浏览器。
-     渲染失败（KaTeX 未就绪 / LaTeX 有错）就保持原字形 —— 至少可读，不会整段空白。
-     `rebuildItem` 每次重建都会重新走一遍（幂等）。 */
-  function suryaInlineMath(item) {
-    const list = item.inlineMath;
-    if (!list || !item.el) return;
-    const byMi = new Map();
-    for (const sp of item.el.querySelectorAll(".mspan[data-mi]")) {
-      const mi = sp.dataset.mi;
-      if (!byMi.has(mi)) byMi.set(mi, []);
-      byMi.get(mi).push(sp);
-    }
-    if (!byMi.size) return;
-    const S = (item.linesData[0] && item.linesData[0].runs[0] &&
-               item.linesData[0].runs[0].S) || 1;
-    const sizePt = (item.bodyRun && item.bodyRun.s) || 10;
-    for (const [miKey, spans] of byMi) {
-      const f = list[parseInt(miKey, 10)];
-      if (!f) continue;
-      const host = document.createElement("span");
-      host.className = "katex-inline";
-      host.dataset.mi = miKey;
-      host.dataset.latex = f.latex;
-      host.style.fontSize = mathSizePx(sizePt * S) + "px";
-      let ok = false;
-      try { ok = katexReady() && katexRender(host, f.latex, false); }
-      catch (e) { ok = false; }
-      if (!ok) continue;                       // 保底：原字形仍在（没被删）
-      const first = spans[0];
-      // 高亮/选中/笔记下划线是加在 span 上的：跟着公式一起搬到 KaTeX 宿主上
-      for (const cls of ["hl", "hasnote", "sel"])
-        if (first.classList.contains(cls)) host.classList.add(cls);
-      if (first.dataset.hl) host.dataset.hl = first.dataset.hl;
-      for (const st of ["background", "color", "textShadow"])
-        if (first.style[st]) host.style[st] = first.style[st];
-      first.parentNode.insertBefore(host, first);
-      for (const sp of spans) sp.remove();     // 原字形不再占位（宽度由 KaTeX 决定）
-    }
-  }
-
-  /* Surya 块的块内换行：canonical 里的 '\n'（`</li>`、`<br>` 等）在 HTML 流里会被
-     折叠成空格，列表项/表格行会连成一行。把 `\n` 拆成 <br> —— 只动文本节点，
-     span 上的 data-g / 高亮 class 都保持原样（选句/高亮仍按字符区间走）。
-     KaTeX 子树跳过（MathML 文本节点里的换行不动它）。 */
-  function suryaLineBreaks(item) {
-    const line = item.el && item.el.querySelector(".syln");
-    if (!line) return;
-    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT, null);
-    const jobs = [];
-    let node;
-    while ((node = walker.nextNode()))
-      if (node.nodeValue.indexOf("\n") >= 0) jobs.push(node);
-    for (const tn of jobs) {
-      if (tn.parentNode && tn.parentNode.closest &&
-          tn.parentNode.closest(".katex-inline, .katex")) continue;
-      const parts = tn.nodeValue.split("\n");
-      const frag = document.createDocumentFragment();
-      parts.forEach((p, i) => {
-        if (i) frag.appendChild(document.createElement("br"));
-        if (p) frag.appendChild(document.createTextNode(p));
-      });
-      tn.parentNode.replaceChild(frag, tn);
-    }
-  }
-
-  /* Surya 的表格 HTML → 安全 DOM（白名单）。
-     HTML 来自外部推理服务，绝不直接 innerHTML：只放行表格结构与基础行内标签，
-     属性只留 colspan/rowspan（表格布局必需）。拿不到 <table> 时返回 null。 */
-  const SY_TABLE_TAGS = { TABLE: 1, THEAD: 1, TBODY: 1, TFOOT: 1, TR: 1, TD: 1, TH: 1,
-                          CAPTION: 1, B: 1, I: 1, EM: 1, STRONG: 1, SUP: 1, SUB: 1,
-                          BR: 1, SPAN: 1 };
-  function suryaTableTitle(t) {
-    const html = String(t && t.html || "");
-    const label = String(t && (t.label || t.raw_label) || "").trim();
-    if (!label || /<caption\b/i.test(html)) return null;
-    return el("div", "sytable-title", label);
-  }
-  function suryaTableEl(html, sizePx) {
-    const s = String(html || "");
-    if (!s || s.indexOf("<table") < 0) return null;
-    let doc = null;
-    try { doc = new DOMParser().parseFromString(s, "text/html"); }
-    catch (e) { return null; }
-    const src = doc && doc.body && doc.body.querySelector("table");
-    if (!src) return null;
-    const wrap = el("div", "sytable");
-    wrap.appendChild(syCleanNode(src));
-    suryaTableMath(wrap, sizePx || 0);   // 单元格里的公式（纯文本 LaTeX）→ KaTeX
-    renderInlineMath(wrap);              // 单元格/caption 里 $…$ / \(…\) 包裹的片段
-    return wrap;
-  }
-  function syCleanNode(node) {
-    if (node.nodeType === 3) return document.createTextNode(node.nodeValue);
-    if (node.nodeType !== 1) return document.createTextNode("");
-    const tag = node.tagName.toUpperCase();
-    if (!SY_TABLE_TAGS[tag]) {          // 不认识的标签：剥壳、保留里面的内容
-      const frag = document.createDocumentFragment();
-      for (const c of node.childNodes) frag.appendChild(syCleanNode(c));
-      return frag;
-    }
-    const out = document.createElement(tag.toLowerCase());
-    if (tag === "TD" || tag === "TH") {
-      for (const name of ["colspan", "rowspan"]) {
-        const v = parseInt(node.getAttribute(name), 10);
-        if (v > 1 && v <= 100) out.setAttribute(name, String(v));
-      }
-    }
-    for (const c of node.childNodes) out.appendChild(syCleanNode(c));
-    return out;
-  }
-
-  /* Surya 表格单元格里的公式 → KaTeX。Surya 的表格 HTML 里公式是**纯文本 LaTeX**
-     （`O(n^2 \cdot d)`、`1.4 \cdot 10^{20}`），没有 `<math>` 标签；不渲染的话看到
-     的就是一串反斜杠源码。识别放在 suryaCellLatex（保守：拿不准就不动，渲染失败
-     也保留原文）。只处理「整格都是公式」的单元格 —— 混合自然语言的格子不动
-     （那些格里的 `$…$` / `\(…\)` 片段由 renderInlineMath 那一路处理）。
-     KaTeX 未就绪时整体跳过：加载完成后 render() 会重跑，这里会再走一遍。 */
-  function suryaTableMath(wrap, sizePx) {
-    if (!katexReady()) return;
-    for (const cell of wrap.querySelectorAll("td, th, caption")) {
-      if (cell.querySelector(".katex")) continue;            // 已渲染过（幂等）
-      const tns = [];
-      const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT, null);
-      let n;
-      while ((n = walker.nextNode())) tns.push(n);
-      if (!tns.length) continue;
-      const latex = suryaCellLatex(tns.map(t => t.nodeValue).join(""));
-      if (!latex) continue;
-      const host = document.createElement("span");
-      host.className = "katex-inline";
-      host.dataset.latex = latex;
-      if (sizePx > 0) host.style.fontSize = mathSizePx(sizePx) + "px";
-      let ok = false;
-      try { ok = katexRender(host, latex, false); } catch (e) { ok = false; }
-      if (!ok) continue;                       // 渲染失败：原文照旧保留
-      cell.textContent = "";
-      cell.appendChild(host);
-    }
-  }
-
-  /* 单元格文本 → LaTeX 源码（识别不出返回空串）。规则：
-       ① 整格被 `$…$` / `\(…\)` / `\[…\]` 包裹 → 取内部；
-       ② 整格含 LaTeX 命令（`\cdot`、`\log`、`\frac`…）→ 整格按 LaTeX 渲染；
-       ③ 整格无空格、含 `^` / `_` 的纯 ASCII 上下标（`n^2`、`d_{model}`）→ 按 LaTeX 渲染。
-     带空格的自然语言、超长文本都不能命中（保持原样）。 */
-  function suryaCellLatex(s) {
-    const t = String(s || "").trim();
-    if (!t || t.length > 200) return "";
-    const m = /^\$([^$]+)\$$/.exec(t)
-           || /^\\\(([\s\S]+)\\\)$/.exec(t)
-           || /^\\\[([\s\S]+)\\\]$/.exec(t);
-    if (m) return m[1].trim();
-    if (/\\[a-zA-Z]{2,}/.test(t)) return t;                 // \cdot / \log / \frac …
-    if (!/\s/.test(t) && /[\^_]/.test(t) && /^[\x20-\x7E]+$/.test(t)) return t;
-    return "";
-  }
-
-  /* Surya 块（流式排版）收尾：内容高度要等挂到文档上才量得准 —— 回填
-     item.contentH / `.blk` 高度 / 译文卡位置（relayout 的避让都按 contentH 算）。
-     **只放大不缩小**：文本量比原框多时按实际高度长出去（解析侧已按块框做过
-     缩字适配，溢出很小）。公式块的高度由 finalizeDisplayMath 收尾（这里跳过）；
-     表格（及 HTML 解析失败时的纯文本兜底）按**实际渲染高度**回填 —— Surya 的
-     检测框高常小于表格真实高度（字体/内距差异），不回填的话下面的文字会按
-     变矮的框算避让、压到表格上（见 settleSuryaVertical）。 */
-  function finalizeSuryaBlocks() {
-    for (const id in itemById) {
-      const it = itemById[id];
-      if (!it.surya || it.kind !== "blk") continue;
-      if (it.syHeading && it.linesData.length) {
-        // 标题不折行：量内容自然宽度，需要时把块放宽（最多到原框的 2.4 倍，长标题
-        // 顶多折一行）。⚠️ CSS 的 `min(max-content, X)` 不合法（关键词不能进 min()），
-        // 只能挂载后量。窄框标题（居中的 "Abstract" 之类）折行会压到下面正文上。
-        const lineEl = it.linesData[0].el;
-        const prevW = lineEl.style.width;
-        lineEl.style.width = "max-content";     // 量单行自然宽（块级盒 max-content 有效）
-        const natural = lineEl.offsetWidth;
-        lineEl.style.width = prevW;
-        if (natural > it.w + 1) {
-          // +4px 余量：自然宽是整数，差零点几个像素就会在词中间折行（"Abstract" 实测）
-          it.el.style.width = Math.min(natural + 4, it.w * 2.4).toFixed(1) + "px";
-        }
-      }
-      let h = 0;
-      for (const ld of it.linesData) h = Math.max(h, ld.el.offsetHeight + (ld.dy || 0));
-      if (!it.linesData.length) {
-        // 没有流式行的块 = 表格（含 HTML 解析失败的纯文本兜底）或公式 —— 按块内
-        // **流内容**（`.sytable-title` + `.sytable`，含外边距）的实际总高量取；
-        // 公式盒是绝对定位、卡片容器（.exp）也不占流，全被跳过 → 量不到就跳过
-        // 整块（公式高度归 finalizeDisplayMath 管，别覆盖它算好的高度）。
-        let found = false;
-        for (const ch of it.el.children) {
-          if (ch.classList.contains("exp")) continue;      // 卡片容器（绝对定位）
-          const cs = getComputedStyle(ch);
-          if (cs.position === "absolute") continue;        // 公式盒等不占流
-          h += (parseFloat(cs.marginTop) || 0) + ch.offsetHeight
-             + (parseFloat(cs.marginBottom) || 0);
-          found = true;
-        }
-        if (!found) continue;
-      }
-      h = Math.max(h, it.h);
-      it.contentH = h;
-      it.el.style.height = h + "px";
-      if (it.exp) it.exp.style.top = h + "px";
-    }
-  }
-
-  /* Surya 块与图片的**纵向避让**：检测框纵向膨胀 + 行内 KaTeX 撑高行盒 + 表格按真实
-     内容渲染（高度常超检测框），实测内容经常比块框高 —— “文本满框”时上一块的文字
-     会与下一块（尤其是表格）叠在一起。这里在 finalizeSuryaBlocks 量完真实高度后，
-     按「同栏、y 升序」逐块算一个**只下移**的位移量 `it.syShift`：本块顶不得高于同栏
-     任一已排元素的内容底 + SY_VGAP（表格与图片也参与：图片压到文字/表格上的情况同样
-     要躲开）。同栏 = x 区间重叠 ≥ 两者较窄宽的一半（双栏左右栏互不影响；跨栏块是
-     下方两栏共同的前邻）；级联自然收敛 —— 按 y 序处理，前块用的都是避让后的底。
-     ⚠️ 位移量每轮都**基于原始 it.y 重算**（且不写回数据）：缩放/窗口变化会
-     整页重建，每次都以原始几何为基准，不会累积漂移；应用交给 relayoutPage
-     的位移链（syShift 是它的起点，与“卡片顶开”量叠加，transform / 页面高度 /
-     笔记卡位置因此都自动跟随）。 */
-  const SY_VGAP = 2;      // px：避让后相邻块内容之间至少保留的空隙
-  function settleSuryaVertical() {
-    for (const page of pages) {
-      const list = page.items.filter(it =>
-        it.surya && !(it.kind === "blk" && it.el.classList.contains("sy-vertical")));
-      list.sort((a, b) => (a.y - b.y) || (a.x - b.x));
-      const settled = [];           // [{x, w, bottom}]：已排元素（bottom 含避让量）
-      for (const it of list) {
-        let need = -Infinity;
-        const width = it.kind === "blk" ? Math.max(it.w, it.el.offsetWidth) : it.w;
-        for (const s of settled) {
-          const ov = Math.min(s.x + s.w, it.x + width) - Math.max(s.x, it.x);
-          if (ov < Math.min(s.w, width) * 0.5) continue;       // 不同栏
-          need = Math.max(need, s.bottom + SY_VGAP);
-        }
-        it.syShift = Math.max(0, need - it.y);      // 只下移，绝不上移
-        const height = it.kind === "blk" ? Math.max(it.contentH || 0, it.el.offsetHeight)
-                                         : it.h;
-        settled.push({ x: it.x, w: width,
-                       bottom: it.y + it.syShift + height });
-      }
-    }
-  }
-
-  /* ============ Unlimited-OCR 的块级渲染（独立实现，与 Surya 那套各自维护） ============
-     unlimited_ocr 后端（backend/pdf_parser/backend_unlimited_ocr.py）下发的版面数据也是
-     **块级**的（每块只有 bbox / kind / 文本，块内没有行几何）。思路与 Surya 那套相同
-     （绝对定位的 .blk + 块内流式排版），但代码**刻意独立成一整套**（buildUnlimitedItem /
-     ulInlineMath / ulTableEl / finalizeUnlimitedBlocks / settleUnlimitedVertical，
-     DOM 类名 ul-*），两边互不引用、可各自演化：
-       · `.blk.ul` 按 bbox 绝对定位；块内文字正常流式排版，字号/行高由解析侧估算
-         （t.size / t.line_h，单位 pt），标题加粗放大、图注/脚注/页眉页脚小一号
-         （CSS .ul-*），长段落自动换行；
-       · 行内公式：解析侧给了精确的字符区间（t.math，含 LaTeX 源码）—— 原字形
-         就地换成 KaTeX（ulInlineMath），正文围绕公式自然重排；
-       · 独立公式（kind="formula" + latex）：KaTeX 块渲染（与其它公式块同一套收尾）；
-       · 表格（kind="table" + html）：白名单渲染 <table>，不参与句子选中。
-     文本块内容仍由通用 rebuildItem 生成 —— 选中/高亮/笔记重建后样式与公式都不丢。 */
-  function buildUnlimitedItem(t, S, pageEl, pi) {
-    const bx = t.x * S, by = t.y * S;
-    const blk = el("div", "blk ul");
-    if (t.kind) blk.classList.add("ul-" + t.kind);
-    if (t.kind === "heading") blk.classList.add("ul-l" + (t.level || 2));
-    Object.assign(blk.style, { left: bx + "px", top: by + "px", width: t.w * S + "px" });
-    blk.dataset.id = t.id;
-    // 对齐方式：解析侧下发 t.align；旧/缺字段时按同一规则本地兜底 ——
-    // 正文类（text/reference/caption/footnote）两端对齐（CSS [data-align="justify"]），
-    // 行右缘像原 PDF（LaTeX justified 排版）一样齐平到栏边界；标题/页眉页脚保持左对齐。
-    blk.dataset.align = (t.align === "justify" || t.align === "left"
-                         || t.align === "center" || t.align === "right")
-      ? t.align
-      : ((t.kind === "text" || t.kind === "reference" ||
-          t.kind === "caption" || t.kind === "footnote") ? "justify" : "left");
-
-    const size = t.size > 0 ? t.size : 10;        // 解析侧估的字号（pt）
-    blk.style.fontSize = size * S + "px";
-    // 竖排文本（旋转 90° 的页眉/水印）：模型不给旋转信息，用“又高又窄 + 短文本”判
-    // —— 内容整体旋转、沿条带自下而上排（见 CSS .ul-vertical）
-    if (t.h > t.w * 3 && (t.text || "").length >= 2 && (t.text || "").length <= 80) {
-      blk.classList.add("ul-vertical");
-    }
-
-    const mb = mathBlockOf(t);                     // kind="formula" + latex → KaTeX 块
-    const linesData = [];
-    let contentH = t.h * S;        // 初值=bbox 高；挂到文档后由 finalizeUnlimitedBlocks 回填实测高
-    if (mb) {
-      const box = el("div", "mathbox");
-      box.dataset.latex = mb.latex;
-      box.style.fontSize = mathSizePx(size * S) + "px";
-      if (katexReady() && katexRender(box, mb.latex)) {
-        // 正常路径
-      } else {
-        box.textContent = mb.latex;                // KaTeX 未就绪/LaTeX 有问题 → 源码兜底
-        box.classList.add("failed");
-      }
-      box._blk = blk;
-      box._contentH = contentH;
-      box._origW = t.w * S;                        // 公式主体宽 = OCR 给的外框宽
-      if (box._hasTag) box.style.width = "100%";
-      blk.appendChild(box);
-      _katexBoxes.add(box);
-    } else if (t.kind === "table") {
-      const tb = ulTableEl(t.html);
-      blk.appendChild(tb || el("div", "ln ulln", t.text || ""));
-    } else {
-      // 文本块：唯一一条“流式行”。类名要含 ln（行内公式的让位机制按 .ln 找行），
-      // `ld.free` 让 fitLineEl 跳过（这里的宽度是排版自然宽，不是 PDF 行框）。
-      const lineEl = el("div", "ln ulln");
-      const lh = t.line_h > 0 ? t.line_h : size * 1.42;
-      lineEl.style.lineHeight = lh * S + "px";
-      blk.appendChild(lineEl);
-      const ln = (t.lines && t.lines[0]) || { runs: [] };
-      const ld = {
-        ln, dy: 0, free: true, gaps: [],
-        // 补上 run 级的字号/字体（后端 run 只有 t/b/i/up；styleRun 与公式基准字号都按 r.s 算）
-        runs: (ln.runs || []).map(r => Object.assign({ s: size, fam: "serif" }, r, { S, g: 0 })),
-        el: lineEl, text: "", gs: 0,
-      };
-      ld.text = ld.runs.map(r => r.t).join("");
-      linesData.push(ld);
-    }
-    blk.style.height = contentH + "px";
-
-    // canonical：行文本原样拼接，行末一个 '\n'（与 PyMuPDF 路径同口径）
-    let g = 0;
-    for (const ld of linesData) {
-      ld.gs = g;
-      for (const r of ld.runs) { r.g = g; g += r.t.length; }
-      g += 1; // '\n'
-    }
-    const item = {
-      kind: "blk", id: t.id, pi, el: blk, text: t.text || "",
-      x: bx, y: by, w: t.w * S, h: t.h * S, contentH,
-      latex: (mb && mb.latex) || "",
-      linesData, canonical: "", sents: [],
-      markerRanges: [], selRanges: [], shift: 0, expH: 0,
-      ord: ordSeq++, unlimited: true,
-      ulHeading: t.kind === "heading",   // 标题：finalizeUnlimitedBlocks 里按需放宽不折行
-    };
-    item.canonical = linesData.map(ld => ld.text + "\n").join("");
-    item.bodyRun = bodyRunOf(linesData)
-      || { s: size, fam: "serif", i: false, b: false, up: false };
-    // 行内公式：解析侧给的是 text 里的**精确字符区间**（比按文本定界符猜稳）。
-    // 渲染交给 ulInlineMath：`.mspan` 原字形就地换成 KaTeX（见 rebuildItem 末尾）；
-    // 公式块不重复渲染（会叠重影）。
-    item.inlineMath = (!mb && linesData.length && t.math && t.math.length)
-      ? ulMathRanges(t, item.canonical) : null;
-    item.sents = mb ? [] : splitSentences(item.canonical).map((sg, si) =>
-      ({ si, s: sg.s, e: sg.e, key: item.id + "#" + si,
-        text: item.canonical.slice(sg.s, sg.e).replace(/\n+/g, " ").trim() }));
-    // 表格没有可切句的 .rn 结构：点它不该弹“翻译/标注”工具条（点击分支按这个清选中）
-    if (t.kind === "table") item.noSelect = true;
-
-    // 译文 + 内嵌笔记展开区（与其它渲染分支同一套约定）
-    const exp = el("div", "exp");
-    exp.style.top = contentH + "px";
-    const tsec = el("div", "card-in tsec");
-    tsec.hidden = true;
-    exp.appendChild(tsec);
-    const stbox = el("div", "stbox");
-    stbox.hidden = true;
-    exp.appendChild(stbox);
-    const nbox = el("div", "nbox");
-    nbox.hidden = true;
-    nbox.addEventListener("click", e => e.stopPropagation());
-    stbox.addEventListener("click", e => e.stopPropagation());
-    exp.appendChild(nbox);
-    blk.appendChild(exp);
-    item.exp = exp; item.tsec = tsec; item.stbox = stbox; item.nbox = nbox;
-
-    pageEl.appendChild(blk);
-    itemById[t.id] = item;
-    return item;
-  }
-
-  /* Unlimited-OCR 块的行内数学区间（解析侧给的 text 偏移）→ 覆盖层用的 {a,b,latex}。
-     越界/空的丢掉；区间相对 `t.text`，canonical 只在行末多一个 '\n'，不影响行内区间。 */
-  function ulMathRanges(t, canonical) {
-    const out = [];
-    for (const m of (t.math || [])) {
-      const a = m && m.a | 0, b = m && m.b | 0;
-      const latex = String((m && m.latex) || "").trim();
-      if (!latex || !(b > a) || a < 0 || b > canonical.length) continue;
-      out.push({ a, b, latex });
-    }
-    return out.length ? out : null;
-  }
-
-  /* Unlimited-OCR 块的行内公式：把 `.mspan` 原字形**就地换成 KaTeX**。
-     不走 .mathbox.inline 覆盖层（那套是给“逐行绝对定位、行宽固定”的 PyMuPDF 版面
-     设计的）；流式排版里行会重排，就地渲染后正文围绕真公式自然重排，宽度与基线
-     都交给浏览器。渲染失败（KaTeX 未就绪 / LaTeX 有错）就保持原字形 —— 至少可读，
-     不会整段空白。`rebuildItem` 每次重建都会重新走一遍（幂等）。 */
-  function ulInlineMath(item) {
-    const list = item.inlineMath;
-    if (!list || !item.el) return;
-    const byMi = new Map();
-    for (const sp of item.el.querySelectorAll(".mspan[data-mi]")) {
-      const mi = sp.dataset.mi;
-      if (!byMi.has(mi)) byMi.set(mi, []);
-      byMi.get(mi).push(sp);
-    }
-    if (!byMi.size) return;
-    const S = (item.linesData[0] && item.linesData[0].runs[0] &&
-               item.linesData[0].runs[0].S) || 1;
-    const sizePt = (item.bodyRun && item.bodyRun.s) || 10;
-    for (const [miKey, spans] of byMi) {
-      const f = list[parseInt(miKey, 10)];
-      if (!f) continue;
-      const host = document.createElement("span");
-      host.className = "katex-inline";
-      host.dataset.mi = miKey;
-      host.dataset.latex = f.latex;
-      host.style.fontSize = mathSizePx(sizePt * S) + "px";
-      let ok = false;
-      try { ok = katexReady() && katexRender(host, f.latex, false); }
-      catch (e) { ok = false; }
-      if (!ok) continue;                       // 保底：原字形仍在（没被删）
-      const first = spans[0];
-      // 高亮/选中/笔记下划线是加在 span 上的：跟着公式一起搬到 KaTeX 宿主上
-      for (const cls of ["hl", "hasnote", "sel"])
-        if (first.classList.contains(cls)) host.classList.add(cls);
-      if (first.dataset.hl) host.dataset.hl = first.dataset.hl;
-      for (const st of ["background", "color", "textShadow"])
-        if (first.style[st]) host.style[st] = first.style[st];
-      first.parentNode.insertBefore(host, first);
-      for (const sp of spans) sp.remove();     // 原字形不再占位（宽度由 KaTeX 决定）
-    }
-  }
-
-  /* Unlimited-OCR 块的块内换行：canonical 里的 '\n'（作者信息换行、列表项等）在
-     HTML 流里会被折叠成空格，不还原就连成一行。把 `\n` 拆成 <br> —— 只动文本节点，
-     span 上的 data-g / 高亮 class 都保持原样（选句/高亮仍按字符区间走）。
-     KaTeX 子树跳过（MathML 文本节点里的换行不动它）。 */
-  function ulLineBreaks(item) {
-    const line = item.el && item.el.querySelector(".ulln");
-    if (!line) return;
-    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT, null);
-    const jobs = [];
-    let node;
-    while ((node = walker.nextNode()))
-      if (node.nodeValue.indexOf("\n") >= 0) jobs.push(node);
-    for (const tn of jobs) {
-      if (tn.parentNode && tn.parentNode.closest &&
-          tn.parentNode.closest(".katex-inline, .katex")) continue;
-      const parts = tn.nodeValue.split("\n");
-      const frag = document.createDocumentFragment();
-      parts.forEach((p, i) => {
-        if (i) frag.appendChild(document.createElement("br"));
-        if (p) frag.appendChild(document.createTextNode(p));
-      });
-      tn.parentNode.replaceChild(frag, tn);
-    }
-  }
-
-  /* Unlimited-OCR 的表格 HTML → 安全 DOM（白名单）。
-     HTML 来自外部推理服务，绝不直接 innerHTML：只放行表格结构与基础行内标签，
-     属性只留 colspan/rowspan（表格布局必需）。拿不到 <table> 时返回 null。 */
-  const UL_TABLE_TAGS = { TABLE: 1, THEAD: 1, TBODY: 1, TFOOT: 1, TR: 1, TD: 1, TH: 1,
-                          CAPTION: 1, B: 1, I: 1, EM: 1, STRONG: 1, SUP: 1, SUB: 1,
-                          BR: 1, SPAN: 1 };
-  function ulTableEl(html) {
-    const s = String(html || "");
-    if (!s || s.indexOf("<table") < 0) return null;
-    let doc = null;
-    try { doc = new DOMParser().parseFromString(s, "text/html"); }
-    catch (e) { return null; }
-    const src = doc && doc.body && doc.body.querySelector("table");
-    if (!src) return null;
-    const wrap = el("div", "ultable");
-    wrap.appendChild(ulCleanNode(src));
-    return wrap;
-  }
-  function ulCleanNode(node) {
-    if (node.nodeType === 3) return document.createTextNode(node.nodeValue);
-    if (node.nodeType !== 1) return document.createTextNode("");
-    const tag = node.tagName.toUpperCase();
-    if (!UL_TABLE_TAGS[tag]) {          // 不认识的标签：剥壳、保留里面的内容
-      const frag = document.createDocumentFragment();
-      for (const c of node.childNodes) frag.appendChild(ulCleanNode(c));
-      return frag;
-    }
-    const out = document.createElement(tag.toLowerCase());
-    if (tag === "TD" || tag === "TH") {
-      for (const name of ["colspan", "rowspan"]) {
-        const v = parseInt(node.getAttribute(name), 10);
-        if (v > 1 && v <= 100) out.setAttribute(name, String(v));
-      }
-    }
-    for (const c of node.childNodes) out.appendChild(ulCleanNode(c));
-    return out;
-  }
-
-  /* Unlimited-OCR 块（流式排版）收尾：内容高度要等挂到文档上才量得准 —— 回填
-     item.contentH / `.blk` 高度 / 译文卡位置（relayout 的避让都按 contentH 算）。
-     **只放大不缩小**：文本量比原框多时按实际高度长出去（解析侧已按块框做过
-     缩字适配，溢出很小）。表格和公式按实际渲染高度量取，避免内容溢出 OCR 框后
-     与后续块重叠。 */
-  function finalizeUnlimitedBlocks() {
-    for (const id in itemById) {
-      const it = itemById[id];
-      if (!it.unlimited || it.kind !== "blk") continue;
-      if (it.ulHeading) {
-        // 标题优先保持单行并适度扩宽，但不能越过页面右边缘；超长时由块内文本自动换行。
-        const lineEl = it.linesData[0].el;
-        const prevW = lineEl.style.width;
-        lineEl.style.width = "max-content";     // 量单行自然宽（块级盒 max-content 有效）
-        const natural = lineEl.offsetWidth;
-        lineEl.style.width = prevW;
-        const pageWidth = it.el.parentElement.clientWidth;
-        const maxWidth = Math.max(1, pageWidth - it.x);
-        const preferredWidth = natural > it.w + 1
-          ? Math.min(natural + 4, it.w * 2.4)  // +4px 避免宽度取整导致意外折行
-          : it.w;
-        it.el.style.width = Math.min(preferredWidth, maxWidth).toFixed(1) + "px";
-      }
-      let h = 0;
-      for (const ld of it.linesData) h = Math.max(h, ld.el.offsetHeight + (ld.dy || 0));
-      if (!it.linesData.length) {
-        const content = it.el.querySelector(".ultable, .mathbox, .ulln");
-        if (content) h = content.offsetHeight;
-      }
-      h = Math.max(h, it.h);
-      it.contentH = h;
-      it.el.style.height = h + "px";
-      if (it.exp) it.exp.style.top = h + "px";
-    }
-  }
-
-  /* Unlimited-OCR 块与图片的**碰撞避让**：按页统一检查实际内容高度和横向范围，
-     将发生纵向碰撞的后续元素下移到前项底部之后。双栏左右栏互不影响，跨栏内容
-     会同时避开两栏；图片和表格也参与排版，位移级联自然收敛。
-     ⚠️ 位移量每轮都**基于原始 it.y 重算**（且不写回数据）：缩放/窗口变化会
-     整页重建，每次都以原始几何为基准，不会累积漂移；应用交给 relayoutPage 的
-     位移链（ulShift 是它的起点，与“卡片顶开”量叠加）。与 Surya 的 syShift 各自
-     独立（字段、类名都不共用），互不干涉。 */
-  const UL_VGAP = 2;      // px：避让后相邻块内容之间至少保留的空隙
-  function settleUnlimitedVertical() {
-    for (const page of pages) {
-      const list = page.items.filter(it =>
-        it.unlimited && !(it.kind === "blk" && it.el.classList.contains("ul-vertical")));
-      list.sort((a, b) => (a.y - b.y) || (a.x - b.x));
-      const settled = [];           // [{x, w, bottom}]：已排元素（bottom 含避让量）
-      for (const it of list) {
-        let need = -Infinity;
-        const width = it.kind === "blk" ? Math.max(it.w, it.el.offsetWidth) : it.w;
-        for (const s of settled) {
-          const ov = Math.min(s.x + s.w, it.x + width) - Math.max(s.x, it.x);
-          if (ov < Math.min(s.w, width) * 0.5) continue;      // 不同栏
-          need = Math.max(need, s.bottom + UL_VGAP);
-        }
-        it.ulShift = Math.max(0, need - it.y);      // 只下移，绝不上移
-        const height = it.kind === "blk" ? Math.max(it.contentH || 0, it.el.offsetHeight)
-                                         : it.h;
-        settled.push({ x: it.x, w: width,
-                       bottom: it.y + it.ulShift + height });
-      }
-    }
-  }
-
-  /* ============ 高亮调色盘：3 个默认色 + 3 个自定义色 ============
-     自定义色**随账号存在服务端**（/api/prefs）—— 换账号会重新加载，不会互相串；
-     文档里存的是色位（c1/c2/c3），颜色本身只是当前账号的偏好。 */
-  const HL_STORE_OLD = "paperReader.hlColors";   // 旧版本的浏览器本地存储（升级后不再使用）
-  const hlPalette = [
-    { key: "yellow", color: "#ffd64a", alpha: 0.55, custom: false },
-    { key: "green",  color: "#60c994", alpha: 0.50, custom: false },
-    { key: "pink",   color: "#ff8a9e", alpha: 0.55, custom: false },
-    { key: "c1", color: "#7ec8f2", alpha: 0.50, custom: true },
-    { key: "c2", color: "#c4a3f0", alpha: 0.50, custom: true },
-    { key: "c3", color: "#ffb26b", alpha: 0.50, custom: true },
-  ];
-  const HL_CUSTOM_AT = 3;                       // 从第几个开始是自定义色
-  function hlColor(key) {                       // 色键 -> 调色盘项(未知键回退黄色)
-    return hlPalette.find(c => c.key === key) || hlPalette[0];
-  }
-  function hexToRgba(hex, a) {
-    let s = String(hex || "").replace("#", "");
-    if (s.length === 3) s = s.split("").map(ch => ch + ch).join("");
-    const n = parseInt(s, 16);
-    if (s.length !== 6 || isNaN(n)) return "rgba(255,214,74," + a + ")";
-    return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
-  }
-  function applyHlColors(list) {
-    if (!Array.isArray(list)) return;
-    list.slice(0, 3).forEach((hex, i) => {
-      if (/^#[0-9a-f]{6}$/i.test(hex || "")) hlPalette[HL_CUSTOM_AT + i].color = hex;
-    });
-  }
-  // 偏好（自定义高亮色 / 显示译文开关）随账号存在服务端：进页时拉一次
   async function loadPrefs() {
     try {
       const p = await api("/api/prefs");
@@ -1466,41 +433,6 @@
   function savePrefs(patch) {
     api("/api/prefs", { method: "POST", json: patch })
       .catch(err => showNotice("偏好设置没能保存到服务端：" + err.message, true));
-  }
-
-  let hlSaveTimer = null;
-  function saveHlColors() {
-    // 存到服务端（跟着账号走）。取色器拖动会连续触发 input，这里防抖一下。
-    clearTimeout(hlSaveTimer);
-    hlSaveTimer = setTimeout(() => {
-      savePrefs({ hl_colors: hlPalette.slice(HL_CUSTOM_AT).map(c => c.color) });
-    }, 400);
-  }
-  // 渲染色块 + 同步 3 个取色器（自定义色改完立即生效并记住）
-  function renderHmenuSwatches() {
-    const wrap = $("hmenu").querySelector(".swatches");
-    wrap.textContent = "";
-    for (const c of hlPalette) {
-      const s = el("span", "sw" + (c.custom ? " custom" : ""));
-      s.dataset.c = c.key;
-      s.style.background = c.color;
-      if (isDark()) s.style.boxShadow = "0 0 9px " + c.color;   // 暗夜下色块也发点荧光，方便选
-      s.title = c.custom ? "自定义高亮色（用下方颜色块修改）" : c.key;
-      wrap.appendChild(s);
-    }
-    document.querySelectorAll("#hmenu .swedit input").forEach((inp, i) => {
-      inp.value = hlPalette[HL_CUSTOM_AT + i].color;
-    });
-    markCurSwatch();
-  }
-  function bindHlColorInputs() {
-    document.querySelectorAll("#hmenu .swedit input").forEach((inp, i) => {
-      inp.addEventListener("input", () => {
-        hlPalette[HL_CUSTOM_AT + i].color = inp.value;
-        saveHlColors();
-        renderHmenuSwatches();
-      });
-    });
   }
 
   /* ============ 标注标记(高亮/下划线/选中) ============ */
@@ -1568,11 +500,6 @@
           const a = Math.max(gs, im.a), b = Math.min(ge, im.b);
           if (a < b) { cuts.add(a); cuts.add(b); }
         }
-        // 公式空位（连续空格）也切出来：fitLineEl 要单独给这些 span 补宽度
-        for (const g of (ld.gaps || [])) {
-          const a = Math.max(gs, ld.gs + g[0]), b = Math.min(ge, ld.gs + g[1]);
-          if (a < b) { cuts.add(a); cuts.add(b); }
-        }
         const pts = [...cuts].sort((x, y) => x - y);
         for (let k = 0; k < pts.length - 1; k++) {
           const x = pts[k], y = pts[k + 1];
@@ -1584,22 +511,26 @@
           }
           const sp = el("span", "rn" + (cls.size ? " " + [...cls].join(" ") : ""));
           sp.dataset.g = x;
-          const gp = gapAt(ld, x, y);
-          if (gp) {                                          // 空位：行宽适配时按原宽单独补宽
-            sp.classList.add("rngap");
-            if (gp[2] > 0) sp.dataset.gw = gp[2];
-          }
           styleRun(sp, run, bodyS);
-          // 公式之后的正文被 PyMuPDF 误标成上标（0.7 倍）→ 按块内主样式重绘。
-          // 只改“写着像单词”的片段，真正的上标（`2`、`(i)`、`*`）不动。
-          // 注：解析侧现在会先校验基线再落 up（见 pdf_parser._is_super），这里主要
-          // 兼容**重解析前**的旧页面数据。
-          const piece = run.t.slice(x - gs, y - gs);
-          const smallish = run.up || (bodyS > 0 && run.s < bodyS * 0.85);
-          if (item.bodyRun && smallish && (/[A-Za-z]{2,}/.test(piece) || /^[.,;:]+$/.test(piece)) &&
-              _rightAfterMath(item.inlineMath, gs, ge, x))
-            styleRun(sp, Object.assign({}, run, item.bodyRun), bodyS);
           if (hl) { hlPaint(sp, hl); sp.dataset.hl = hl; }   // 公式框高亮按 data-hl 取同一色
+          const piece = run.t.slice(x - gs, y - gs);
+          if (hl) { hlPaint(sp, hl); sp.dataset.hl = hl; }   // 公式框高亮按 data-hl 取同一色
+          // 公式占位：解析侧给的是“一个空格 + gw(pt)”，这里撑成原公式的宽度；
+          // 字符透明化（KaTeX 覆盖层由 .fbox 绘制），但 span 仍参与选句。
+          if (run.gap != null) {
+            sp.classList.add("rngap");
+            sp.dataset.box = String(run.gap);      // 公式框 id：item-local.js 的 _anchorFormulaX 按它找占位
+            sp.style.display = "inline-block";
+            sp.style.width = Math.max(1, (run.gw || 0) * (run.S || 1)) + "px";
+            sp.style.color = "transparent";
+          } else if (run.sp != null) {
+            // 解析侧合并视觉行后补的“空隙”：按 PDF x 差撑宽，保证后面的公式/文字
+            // 落在原位置（替代字体字宽不同，靠自然排版会逐步漂移）。
+            sp.classList.add("rnsp");
+            sp.style.display = "inline-block";
+            sp.style.width = Math.max(0.5, (run.sp || 0) * (run.S || 1)) + "px";
+            sp.style.color = "transparent";
+          }
           const mi = _mathIdxAt(item.inlineMath, x, y);
           if (mi >= 0) {
             sp.classList.add("mspan");
@@ -1621,355 +552,9 @@
       ulInlineMath(item);               // Unlimited-OCR 块：.mspan 原字形 → 就地 KaTeX
       ulLineBreaks(item);               // Unlimited-OCR 块：canonical 里的 '\n' → <br>
     }
-    // 重建会把 .ln 里的内容（连同上一轮插的 spacer）清掉 → 让位要重算，
-    // 否则被推开的正文会“缩”回公式底下。没渲染过公式的块里没有 .mathbox.inline，是空转。
-    _inlineMathRoom(item);
-    // 行宽适配放最后：此时行内已经是 KaTeX 成品（不是 `\(…\)` 源码），量出来的才准。
-    // 公式覆盖层是绝对定位的，不占行宽，所以这一步之后行宽不会再变。
-    fitItemLines(item);
     refsUi.markItem(item);     // 引用跳转：按块 id + 字符区间重打 .cite 标记（幂等）
   }
 
-  /* ================= 选中句子 ================= */
-  function caretInfo() {
-    const s = window.getSelection();
-    if (!s || !s.anchorNode) return null;
-    const node = s.anchorNode.nodeType === 3 ? s.anchorNode.parentElement : s.anchorNode;
-    const gEl = node && node.closest ? node.closest("[data-g]") : null;
-    if (!gEl) return null;
-    const blkEl = gEl.closest(".blk");
-    const item = blkEl && findItem(blkEl.dataset.id);
-    if (!item) return null;
-    let off = 0;
-    if (s.anchorNode.nodeType === 3) off = s.anchorOffset || 0;
-    return { item, idx: (parseInt(gEl.dataset.g, 10) || 0) + off };
-  }
-
-  function fallbackSentence(item, y) {
-    // 依据点击的纵向位置，估算句子
-    if (!item.sents.length) return 0;
-    let best = 0, bestD = 1e9;
-    for (let si = 0; si < item.sents.length; si++) {
-      const r = approxSentenceRect(item, si);
-      const d = y < r.top ? r.top - y : (y > r.bottom ? y - r.bottom : 0);
-      if (d < bestD) { bestD = d; best = si; }
-    }
-    return best;
-  }
-  function approxSentenceRect(item, si) {
-    const rg = sentRange(item, si);
-    const l0 = item.linesData[lineOfChar(item, rg.a)].el;
-    const l1 = item.linesData[lineOfChar(item, Math.max(rg.a, rg.b - 1))].el;
-    const r0 = l0.getBoundingClientRect(), r1 = l1.getBoundingClientRect();
-    return { top: r0.top, bottom: r1.bottom };
-  }
-  function lineOfChar(item, idx) {
-    let li = 0;
-    for (let i = 0; i < item.linesData.length; i++) {
-      const ld = item.linesData[i];
-      if (idx >= ld.gs) li = i;
-      else break;
-    }
-    return li;
-  }
-
-  /* 点在「行与行之间的空隙 / 行尾空白 / 块框里没画字的地方」时 e.target 是 .page
-     ——`.blk` 容器不吃指针事件（见 style.css 的说明），所以这里按几何位置找回最近的一行。
-     入参是**布局坐标**（页内 px）；返回 { item, y }，离得太远(超出 HIT_SLOP)则 null。 */
-  const HIT_SLOP = 12;                 // 容差：约一行内距（正文 12pt），超过就算点了空白
-  function nearestLineAt(x, y) {
-    let best = null, bestD = Infinity;
-    for (const id in itemById) {
-      const it = itemById[id];
-      if (it.kind !== "blk" || !it.linesData || !it.linesData.length) continue;
-      for (const ld of it.linesData) {
-        const r = ld.el.getBoundingClientRect();
-        if (!r.width) continue;
-        // ⚠️ 两个方向都要在容差内。只给纵向容差的话，「横向恰好落在远处那一行上」
-        // （比如页脚那块只有一两个字的块）会被当成最近的一行选中。
-        if (x < r.left - HIT_SLOP || x > r.right + HIT_SLOP ||
-            y < r.top - HIT_SLOP || y > r.bottom + HIT_SLOP) continue;
-        const dx = Math.max(r.left - x, 0, x - r.right);       // 框内算 0
-        const dy = Math.max(r.top - y, 0, y - r.bottom);
-        const d = dx + dy * 2;                                 // 纵向更敏感：宁可换行也别换块
-        if (d < bestD) { bestD = d; best = { item: it, y }; }
-      }
-    }
-    return best;
-  }
-
-  function attachFormulaBoxes(page, pageEl) {
-    for (const box of pageEl.querySelectorAll(".fbox")) {
-      const rect = box.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
-      let bestGap = null, bestOverlap = 0;
-      if (box.dataset.cls === "InlineFormula") {
-        for (const item of page.items) {
-          if (item.kind !== "blk" || !item.linesData.length) continue;
-          for (const line of item.linesData) {
-            for (const gap of line.el.querySelectorAll(".rngap")) {
-              const r = gap.getBoundingClientRect();
-              const overlapX = Math.max(0, Math.min(rect.right, r.right) - Math.max(rect.left, r.left));
-              const overlapY = Math.max(0, Math.min(rect.bottom, r.bottom) - Math.max(rect.top, r.top));
-              const overlap = overlapX * overlapY;
-              if (overlap > bestOverlap) {
-                const start = parseInt(gap.dataset.g, 10);
-                bestOverlap = overlap;
-                bestGap = { item, start, end: start + gap.textContent.length };
-              }
-            }
-          }
-        }
-      }
-      let item, si;
-      if (bestGap && Number.isFinite(bestGap.start) && bestGap.item.sents.length) {
-        item = bestGap.item;
-        si = sentOf(item, bestGap.start);
-        box._copyRange = bestGap;
-      } else {
-        let nearest = null, nearestD = Infinity;
-        for (const candidate of page.items) {
-          if (candidate.kind !== "blk" || !candidate.sents.length) continue;
-          for (let lineIndex = 0; lineIndex < candidate.linesData.length; lineIndex++) {
-            const r = candidate.linesData[lineIndex].el.getBoundingClientRect();
-            const dx = Math.max(r.left - cx, 0, cx - r.right);
-            const dy = Math.max(r.top - cy, 0, cy - r.bottom);
-            const d = dx + dy * 2;
-            if (d < nearestD) {
-              nearestD = d;
-              nearest = { item: candidate, si: sentOf(candidate, candidate.linesData[lineIndex].gs) };
-            }
-          }
-        }
-        if (!nearest) continue;
-        item = nearest.item;
-        si = nearest.si;
-        if (box.dataset.cls === "InlineFormula") {
-          let closest = null, closestD = Infinity;
-          for (const line of item.linesData) {
-            for (const gap of line.el.querySelectorAll(".rngap")) {
-              const r = gap.getBoundingClientRect();
-              const dx = Math.max(r.left - cx, 0, cx - r.right);
-              const dy = Math.max(r.top - cy, 0, cy - r.bottom);
-              const d = dx + dy * 2;
-              if (d < closestD) {
-                closestD = d;
-                closest = { item, start: parseInt(gap.dataset.g, 10),
-                  end: parseInt(gap.dataset.g, 10) + gap.textContent.length };
-              }
-            }
-          }
-          if (closest && closestD <= 120 && Number.isFinite(closest.start)) {
-            box._copyRange = closest;
-            si = sentOf(item, closest.start);
-          }
-        }
-      }
-      box._selectRef = { item, si };
-      if (!item.formulaBoxes) item.formulaBoxes = [];
-      item.formulaBoxes.push(box);
-    }
-  }
-
-  function formulaSelectionTarget(target) {
-    if (!target) return null;
-    if (target._selectRef) return { host: target, ref: target._selectRef };
-    const blk = target.closest(".blk");
-    const item = blk && findItem(blk.dataset.id);
-    if (!item) return null;
-    if (target.matches(".mathbox.inline")) {
-      const formula = item.inlineMath && item.inlineMath[parseInt(target.dataset.mi, 10)];
-      if (formula && item.sents.length)
-        return { host: target, ref: { item, si: sentOf(item, formula.a) }, inline: true };
-    }
-    if (item.sents.length)
-      return { host: target, ref: { item, si: fallbackSentence(item, item.y + item.h / 2) } };
-    const page = pages[item.pi];
-    if (!page) return null;
-    const r = target.getBoundingClientRect();
-    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-    let nearest = null, nearestD = Infinity;
-    for (const candidate of page.items) {
-      if (candidate.kind !== "blk" || !candidate.sents.length) continue;
-      for (const line of candidate.linesData) {
-        const lr = line.el.getBoundingClientRect();
-        const dx = Math.max(lr.left - cx, 0, cx - lr.right);
-        const dy = Math.max(lr.top - cy, 0, cy - lr.bottom);
-        const d = dx + dy * 2;
-        if (d < nearestD) {
-          nearestD = d;
-          nearest = { item: candidate, si: sentOf(candidate, line.gs) };
-        }
-      }
-    }
-    return nearest ? { host: target, ref: nearest } : null;
-  }
-
-  /* ---- 应用/清除选中高亮（可多句、跨块跨页） ---- */
-  function applySelRanges() {
-    document.querySelectorAll(".fbox.formula-sel").forEach(box => box.classList.remove("formula-sel"));
-    for (const id in itemById) {
-      const it = itemById[id];
-      if (it.selRanges && it.selRanges.length) { it.selRanges = []; rebuildItem(it); }
-    }
-    if (!sel) return;
-    const byItem = new Map();
-    if (!sel.formulaOnly) {
-      for (const r of sel.sents) {
-        if (!byItem.has(r.item)) byItem.set(r.item, []);
-        byItem.get(r.item).push(sentRange(r.item, r.si));
-      }
-    }
-    for (const [it, ranges] of byItem) { it.selRanges = ranges; rebuildItem(it); }
-    if (sel && !sel.formulaOnly) {
-      for (const ref of sel.sents) {
-        const range = sentRange(ref.item, ref.si);
-        for (const box of ref.item.formulaBoxes || []) {
-          const inSentence = box._copyRange &&
-            box._copyRange.start < range.b && box._copyRange.end > range.a;
-          if (inSentence || box === sel.formulaBox) box.classList.add("formula-sel");
-        }
-      }
-    }
-    if (sel.formulaBox && sel.formulaBox.classList.contains("fbox"))
-      sel.formulaBox.classList.add("formula-sel");
-  }
-  function setSelection(refs, silent, formulaBox) {
-    if (!refs || !refs.length) { clearSelection(); return; }
-    const formulaOnly = !!formulaBox && !formulaBox.matches(".mathbox.inline") &&
-      formulaBox.dataset.cls !== "InlineFormula";
-    sel = { sents: refs.slice(), formulaBox: formulaBox || null, formulaOnly };
-    applySelRanges();
-    if (!silent) { updateBar(); placeBar(); }
-  }
-  function clearSelection() {
-    sel = null;
-    applySelRanges();
-    hideBar();
-  }
-  // 重新套用标注(高亮/笔记下划线)并保留选中高亮
-  function refreshSelectionVisual() {
-    for (const it of selItems()) { setAnnoRanges(it); rebuildItem(it); }
-    paintFormulaMarks();        // 高亮刚改过：公式框也要跟着变（新高亮/取消高亮）
-  }
-  function selectSentence(item, si) {
-    if (!item) return;
-    setSelection([{ item, si }]);
-  }
-
-  /* ---- 鼠标拖拽多选：拖过连续句子 → 整段（句子级）选中 ---- */
-  function refFromNode(node, offset, isEnd) {
-    if (!node) return null;
-    const el = node.nodeType === 3 ? node.parentElement : node;
-    if (!el || !el.closest) return null;
-    const blk = el.closest(".blk");
-    if (!blk || !pagesEl.contains(blk)) return null;
-    const item = findItem(blk.dataset.id);
-    const span = el.closest(".rn");
-    if (!item || !span || span.dataset.g == null) return null;
-    const g = parseInt(span.dataset.g, 10) + (offset || 0);
-    return { item, si: sentOf(item, isEnd ? Math.max(0, g - 1) : g) };
-  }
-  function refsFromNativeSelection() {
-    const s = window.getSelection();
-    if (!s || s.isCollapsed || !s.rangeCount) return null;
-    const r = s.getRangeAt(0);
-    const a = refFromNode(r.startContainer, r.startOffset, false);
-    const b = refFromNode(r.endContainer, r.endOffset, true);
-    if (!a || !b) return null;
-    return refsBetween(a, b);
-  }
-  /* 按点取字符位置：浏览器自带的「坐标 → 最近的字符」。一次只看一个点，
-     不受拖拽路径影响（原生选区会被途中的空白重置，见 mouseup 的说明）。
-     入参是**视觉坐标**(clientX/clientY)，与 elementFromPoint 同口径。 */
-  function caretAtPoint(cx, cy) {
-    if (document.caretRangeFromPoint) {
-      const r = document.caretRangeFromPoint(cx, cy);
-      return r ? { node: r.startContainer, off: r.startOffset } : null;
-    }
-    if (document.caretPositionFromPoint) {          // Firefox
-      const p = document.caretPositionFromPoint(cx, cy);
-      return p ? { node: p.offsetNode, off: p.offset } : null;
-    }
-    return null;
-  }
-  function refAtPoint(cx, cy, isEnd) {
-    const c = caretAtPoint(cx, cy);
-    const r = c && refFromNode(c.node, c.off, isEnd);
-    if (r) return r;
-    // 没命中到字符（点在空白/行尾外）→ 按几何位置找最近的一行
-    const near = nearestLineAt(cx / GZ(), cy / GZ());
-    return near ? { item: near.item, si: fallbackSentence(near.item, near.y) } : null;
-  }
-  let dragging = false, formulaSelecting = false, dragFrom = null, dragAppliedAt = 0;
-  pagesEl.addEventListener("mousedown", e => {
-    if (e.button !== 0) return;
-    if (e.target.closest(".fbox, .mathbox.inline, .blk.has-math .mathbox")) {
-      formulaSelecting = true;
-      dragging = false;
-      dragFrom = null;
-      return;
-    }
-    formulaSelecting = false;
-    dragging = true;
-    // 拖拽起点：mouseup 时按几何位置自己算范围（不信任原生选区，见下）
-    dragFrom = e.target.closest(".img, .pagenum") ? null : { x: e.clientX, y: e.clientY };
-  });
-  document.addEventListener("mouseup", e => {
-    if (formulaSelecting) {
-      formulaSelecting = false;
-      return;
-    }
-    if (!dragging) return;
-    dragging = false;
-    const from = dragFrom; dragFrom = null;
-    const moved = !!from && Math.abs(e.clientX - from.x) + Math.abs(e.clientY - from.y) > 3;
-    // ⚠️ 不能只信原生选区：拖拽途中一旦指针扫过「没有文字的空白」（行间空隙、公式空位、
-    // 相邻块的空白框），浏览器会把原生选区的锚点重置到那一块 —— 起点所在的块就丢了
-    // （复现：从 p1b45 拖到 p1b47，最后只选中 p1b47）。所以拖动过就按两端的**坐标**
-    // 各取一句，再取阅读顺序里两者之间的整句区间。
-    let refs = null;
-    if (moved && !(e.target && e.target.closest && e.target.closest(".img, .pagenum"))) {
-      const a = refAtPoint(from.x, from.y, false);
-      const b = refAtPoint(e.clientX, e.clientY, true);
-      if (a && b) refs = refsBetween(a, b);
-    }
-    if (!refs) refs = refsFromNativeSelection();   // 没拖动 / 取不到端点 → 退回原生选区
-    if (!refs) return;                             // 没拖出句子范围 → 交给 click 当单句选中
-    setSelection(refs);                            // 首尾 → 吸附到整句
-    dragAppliedAt = Date.now();
-    const s = window.getSelection(); if (s && s.removeAllRanges) s.removeAllRanges();
-  });
-
-  pagesEl.addEventListener("click", e => {
-    if (Date.now() - dragAppliedAt < 350) return;   // 刚用拖拽选完，别被 click 收成单句
-    const formula = e.target.closest(".fbox, .mathbox.inline, .blk.has-math .mathbox");
-    if (formula) {
-      const target = formulaSelectionTarget(formula);
-      if (target) setSelection([target.ref], false, target.host);
-      else clearSelection();
-      return;
-    }
-    // 图 / 页码不是文字：点它们照旧清掉选中
-    if (e.target.closest(".img, .pagenum")) { clearSelection(); return; }
-    const blk = e.target.closest(".blk");
-    let item = null, hitY = e.clientY / GZ();       // hitY 是布局坐标(见文件顶部坐标说明)
-    if (blk) {
-      item = findItem(blk.dataset.id);
-    } else {
-      // 块框里没画字的地方（行间空隙、行尾空白、公式空位）target 是 .page：
-      // 按几何位置找回最近的一行继续选，别平白把已有的选中清掉。
-      const near = nearestLineAt(e.clientX / GZ(), hitY);
-      if (near) { item = near.item; hitY = near.y; }
-    }
-    if (!item || item.noSelect) { clearSelection(); return; }   // noSelect：表格等无句子块
-    const ci = caretInfo();
-    const si = (ci && ci.item === item) ? sentOf(item, ci.idx) : fallbackSentence(item, hitY);
-    // Shift+点击：从当前选区首句扩展到点中的这句
-    if (e.shiftKey && selCount()) setSelection(refsBetween(selAnchor(), { item, si }));
-    else selectSentence(item, si);
-    const s = window.getSelection(); if (s && s.removeAllRanges) s.removeAllRanges();
-  });
   let relayoutTimer = null;
   window.addEventListener("resize", () => {
     if (sel) placeBar(true);
@@ -1977,610 +562,49 @@
     clearTimeout(relayoutTimer);
     relayoutTimer = setTimeout(relayoutAll, 150);
   });
-  window.addEventListener("scroll", () => { if (sel) placeBar(true); updatePageInd(); scheduleSave(); }, { passive: true });
+  window.addEventListener("scroll", () => {
+    posRestored = true;      // 位置已经落定（用户自己滚 / 我们刚还原过），后续重排按当前视口量锚点
+    if (sel) placeBar(true); updatePageInd(); scheduleSave();
+  }, { passive: true });
 
-  /* ================= 浮动工具条 ================= */
-  const fbar = $("fbar");
-  function hideBar() { if (fbar) fbar.hidden = true; hideHmenu(); }
-  // keepMenu=true 时只挪位置、不动调色盘(调色盘就挂在工具条里，会跟着走)；
-  // 换选中句子时用默认的 false，顺手收起调色盘。
-  function placeBar(keepMenu) {
-    if (!sel) return;
-    const anchor = selAnchor();
-    if (!anchor) return;
-    fbar.hidden = false;
-    if (!keepMenu) hideHmenu();
-    const formula = sel.formulaBox && sel.formulaBox.isConnected ? sel.formulaBox : null;
-    const r = formula ? formula.getBoundingClientRect() : anchor.item.el.getBoundingClientRect();
-    let top = r.top - 48;
-    if (top < 60) top = r.bottom + 8;
-    fbar.style.top = Math.max(60, top) + "px";
-    fbar.style.left = clamp(r.left, 8, Math.max(8, vpW() - fbar.offsetWidth - 8)) + "px";
-  }
-  // 工具条只放操作按钮（翻译/标注/笔记/复制/关闭）——
-  // 原来最左侧那个显示选中内容的预览（#fbT）已去掉，不再回填。
-  function updateBar() {
-    const bt = $("fbTrans");
-    if (!sel) return;
-    const anchor = selAnchor();
-    const n = selCount();
-    const blocks = selItems();
-    if (n > 1) {
-      bt.textContent = selTransList.some(t => t.key === selFragKey())
-        ? "收起所选句译文" : "翻译所选句子";
-    } else {
-      const id = blocks[0].id;
-      if (noZh.has(id)) bt.textContent = "本段无译文";
-      else if (zh[id]) bt.textContent = isTransOpen(id) ? "收起本段译文" : "显示本段译文";
-      else bt.textContent = "译本段";
-    }
-    const nb = $("fbNote");
-    if (nb) nb.textContent = noteOf(sentKey(anchor.item, anchor.si)) ? "改笔记" : "笔记";
-  }
-  function isTransOpen(id) {
-    const it = findItem(id);
-    return !!(it && !it.tsec.hidden);
-  }
-
-  fbar.addEventListener("click", e => {
-    const sw = e.target.closest(".sw");
-    if (sw) { if (sel) setHighlight(sw.dataset.c); hideHmenu(); return; }
-    const a = e.target.closest("[data-a]") && e.target.closest("[data-a]").dataset.a;
-    if (!a || !sel) return;
-    if (a === "close") clearSelection();
-    else if (a === "copy") {
-      const n = selCount();
-      const formula = sel.formulaBox;
-      const formulaOnly = formula && !formula.matches(".mathbox.inline") &&
-        formula.dataset.cls !== "InlineFormula";
-      const mathItem = formulaOnly && formula.closest(".blk")
-        ? findItem(formula.closest(".blk").dataset.id) : null;
-      const s = formulaOnly
-        ? (formula.dataset.latex || mathTexOf(mathItem))
-        : sel.sents.map(r => mathTexOf(r.item) || copySentenceText(r.item, r.si)).join(" ");
-      navigator.clipboard.writeText(s).then(() => toast(n > 1 ? "已复制 " + n + " 句" : "已复制该句"));
-    } else if (a === "trans") {
-      if (selCount() > 1) translateSelected();
-      else onTranslateClick(selItems()[0].id);
-    }
-    else if (a === "hl") toggleHmenu();
-    else if (a === "note") openNoteEditor(true);
-    else if (a === "hlclear") { setHighlight(null); hideHmenu(); }
+  /* ================= 翻译(段落级) + 译文卡：已拆到 js/select/translate.js =================
+     `showZhOn` / `selTransList` 会被整体替换 → getter + setter；`zh` / `noZh` 是同一份容器
+     （只增删，不替换）。`busy` / `cancelAll`（“翻译全文”进行中/取消）只在本模块用，已随
+     模块内部持有。 */
+  const { onTranslateClick, toggleTransOpen, translateItems, fillTrans, itemMathLatex,
+          selTransMathLatex, openTrans, openAllTrans, closeAllTrans, syncExp,
+          runAllTrans } = R2Trans({
+    $, docId, itemById, pages, findItem, itemCopyText, normTrans,
+    renderInlineMath, renderKnownLatex, loadSelTrans, savePrefs,
+    updateBar, placeBar, renderSelTrans, enterParaTransMode, currentPageIndex: (...a) => currentPageIndex(...a),
+    relayoutAll: (...a) => relayoutAll(...a),
+    zh, noZh,
+    get showZhOn() { return showZhOn; }, set showZhOn(v) { showZhOn = v; },
+    get selTransList() { return selTransList; }, set selTransList(v) { selTransList = v; },
+    get sel() { return sel; },
   });
 
-  /* ---- 多选句子 → 只翻译所选句 ----
-     把选区按文字块切成若干“连续句片段”，各自送翻译(后端按文本哈希缓存，和整段译文互不干扰)，
-     结果只显示所选句的译文，不影响原来的整段翻译功能。 */
-  function selGroups() {
-    const groups = [];
-    if (!sel) return groups;
-    for (const r of sel.sents) {
-      const last = groups[groups.length - 1];
-      if (last && last.item === r.item) last.siTo = r.si;
-      else groups.push({ item: r.item, siFrom: r.si, siTo: r.si });
-    }
-    return groups;
-  }
-  function selFragId(g) { return g.item.id + "#" + g.siFrom + "-" + g.siTo; }
-  function selFragKey() { return selGroups().map(selFragId).join("|"); }
-  function selFragText(g) {
-    const a = sentRange(g.item, g.siFrom).a;
-    const b = sentRange(g.item, g.siTo).b;
-    return g.item.canonical.slice(a, b).replace(/\s*\n\s*/g, " ").replace(/\s{2,}/g, " ").trim();
-  }
-
-  async function translateSelected() {
-    const groups = selGroups();
-    const frags = groups.map(g => ({ id: selFragId(g), text: selFragText(g), item: g.item, si: g.siFrom }))
-                       .filter(f => f.text.length > 1);
-    if (!frags.length) { toast("所选句子没有可翻译的内容"); return; }
-    const key = frags.map(f => f.id).join("|");
-    const idx = selTransList.findIndex(t => t.key === key);
-    if (idx >= 0) {                              // 同一选区再点一次 = 收起这张
-      selTransList.splice(idx, 1);
-      renderSelTrans(); relayoutAll(); updateBar();
-      return;
-    }
-    try {
-      const res = await api("/api/translate", {
-        method: "POST",
-        json: { doc_id: docId, blocks: frags.map(f => ({ id: f.id, text: f.text })) },
-      });
-      const parts = frags.map(f => (res.results || {})[f.id]).filter(z => z);
-      if (!parts.length) {
-        const skipped = new Set(res.skipped || []);
-        toast(skipped.size === frags.length
-          ? "所选句子无需翻译(中文/公式/符号)"
-          : "没有拿到译文：翻译服务没有返回结果，请再点一次重试");
-        return;
-      }
-      // 与整段译文互斥：切换成“所选句译文”模式，收起所有整段译文卡（译文仍在缓存里，可随时再开）
-      closeAllTrans(false);
-      // 卡片挂到**最后一个被选句子**的块下（不是第一句）：连选多句时若挂第一句，
-      // 卡片会插在所选句中间，后面的正文看起来像被错了位。
-      const last = frags[frags.length - 1];
-      const card = { key, itemId: last.item.id, siFrom: last.si,
-                     text: parts.join("\n\n") };
-      selTransList.push(card);
-      renderSelTrans();
-      relayoutAll();
-      updateBar(); placeBar(true);
-      toast("已翻译所选 " + selCount() + " 句");
-      // 存到服务端，重登/刷新后这张卡还在（失败只提示，不影响阅读）
-      api("/api/doc/" + docId + "/seltrans", {
-        method: "POST",
-        json: { key, item_id: card.itemId, si_from: card.siFrom, text: card.text },
-      }).catch(err => showNotice("所选句译文未能保存到服务端：" + err.message, true));
-    } catch (err) { showNotice("翻译失败：" + err.message, true); }
-  }
-
-  /* 所选句译文卡：可以同时留多张（不同选区）；与“整段译文”互斥，二者只保留一种 */
-  function clearSelTrans() {
-    if (!selTransList.length) return;
-    selTransList = [];
-    renderSelTrans();
-    updateBar();          // 卡片没了，工具条上“收起所选句译文”要跟着变回“翻译所选句子”
-    api("/api/doc/" + docId + "/seltrans", { method: "DELETE" }).catch(() => {});
-  }
-  // 切回“整段译文”模式：把所选句译文卡全部收掉（它们在缓存里，可随时重新翻译出来）
-  function enterParaTransMode() {
-    if (!selTransList.length) return;
-    clearSelTrans();
-    relayoutAll();
-  }
-  function renderSelTrans() {
-    for (const id in itemById) {
-      const it = itemById[id];
-      if (!it.stbox.hidden || it.stbox.childElementCount) {
-        it.stbox.textContent = "";
-        it.stbox.hidden = true;
-        syncExp(it);
-      }
-    }
-    const byItem = new Map();
-    for (const t of selTransList) {
-      const it = selTransHost(t);
-      if (!it) continue;
-      if (!byItem.has(it)) byItem.set(it, []);
-      byItem.get(it).push(t);
-    }
-    for (const [it, list] of byItem) {
-      list.sort((a, b) => (a.siFrom || 0) - (b.siFrom || 0));
-      for (const t of list) it.stbox.appendChild(selTransCard(it, t));
-      it.stbox.hidden = false;
-      syncExp(it);
-    }
-  }
-  function selTransHost(t) {
-    /* 卡片挂在哪个块下：**最后一个被选句子**的块。
-       `key` 里记着全部片段（`<块id>#<起>-<止>` 用 `|` 相连），所以连早期存的
-       卡片（item_id 还是第一句的块）也能落到正确位置；解析不出来再退回 item_id。 */
-    const frag = String(t.key || "").split("|").pop() || "";
-    const id = frag.split("#")[0];
-    return (id && findItem(id)) || findItem(t.itemId);
-  }
-  function selTransCard(item, t) {
-    const card = el("div", "card-in stsec");
-    const head = el("div", "sthead");
-    head.appendChild(el("span", "", "所选句译文"));
-    const bDel = el("button", "stclear", "清除");
-    bDel.addEventListener("click", () => {
-      selTransList = selTransList.filter(x => x.key !== t.key);
-      renderSelTrans(); relayoutAll(); updateBar();
-      api("/api/doc/" + docId + "/seltrans?key=" + encodeURIComponent(t.key),
-          { method: "DELETE" }).catch(() => {});
-    });
-    head.appendChild(bDel);
-    card.appendChild(head);
-    card.appendChild(el("div", "stbody", t.text));
-    return card;
-  }
-  function hideHmenu() { const m = $("hmenu"); if (m) m.classList.remove("show"); }
-  function toggleHmenu() {
-    const m = $("hmenu");
-    m.classList.toggle("show");
-    // 先定位(keepMenu=true，否则刚展开又被 hideHmenu 收掉)，再标出当前高亮色
-    placeBar(true);
-    if (m.classList.contains("show")) markCurSwatch();
-  }
-  function curHighlightColor() {
-    if (!sel) return null;
-    // 选中的句子全部同色才把该色块标出来
-    const cur = anno.highlights || {};
-    const colors = selKeys().map(k => (cur[k] && cur[k].color) || null);
-    return colors.length && colors.every(c => c && c === colors[0]) ? colors[0] : null;
-  }
-  function markCurSwatch() {
-    const cur = curHighlightColor();
-    document.querySelectorAll("#hmenu .sw").forEach(s =>
-      s.classList.toggle("cur", s.dataset.c === cur));
-  }
-  async function setHighlight(color) {
-    if (!sel) return;
-    if (!needWrite()) return;
-    const keys = selKeys();
-    try {
-      const cur = anno.highlights || {};
-      // 选中的句子全是这个颜色 → 再点一次 = 整段取消
-      if (color && keys.every(k => cur[k] && cur[k].color === color)) color = null;
-      for (const k of keys) {
-        await api(`/api/doc/${docId}/anno`, {
-          method: "POST",
-          json: color
-            ? { action: "add_highlight", block_id: k, color }
-            : { action: "remove_highlight", block_id: k },
-        });
-      }
-      anno = await api(`/api/doc/${docId}/anno`);   // 批量写入后取一次权威状态
-      refreshSelectionVisual();
-      const n = keys.length;
-      toast(color ? (n > 1 ? `已标注 ${n} 句` : "已标注该句")
-                  : (n > 1 ? `已清除 ${n} 句标注` : "已清除标注"));
-    } catch (err) { toast(err.message); }
-  }
-
-  /* ================= 翻译(段落级) ================= */
-  async function onTranslateClick(id) {
-    const it = findItem(id); if (!it) return;
-    enterParaTransMode();                       // 与“所选句译文”互斥
-    if (noZh.has(id)) { toast("该段无需翻译(中文/公式/符号)"); return; }
-    if (zh[id]) { toggleTransOpen(id); return; }
-    try {
-      const { done, failed } = await translateItems([it], { open: true });
-      if (done) { updateBar(); placeBar(); }
-      else if (failed) showNotice("这一段的译文没有拿到：翻译服务没有返回结果，可以再点一次重试。", true);
-      else if (noZh.has(id)) toast("该段无需翻译(中文/公式/符号)");
-    } catch (err) { showNotice("翻译失败：" + err.message, true); }
-  }
-  function toggleTransOpen(id) {
-    const it = findItem(id); if (!it) return;
-    enterParaTransMode();                       // 与“所选句译文”互斥
-    it.tsec.hidden = !it.tsec.hidden;
-    // “翻译全文”在“显示译文”未勾选时只把译文存进 zh、不渲染卡片，
-    // 这里展开必须补写内容，否则弹出来的是**空卡片**（踩过）
-    if (!it.tsec.hidden) fillTrans(it);
-    syncExp(it);
-    relayoutAll();
-    updateBar(); if (sel) placeBar();
-  }
-  async function translateItems(items, opt) {
-    const pend = items.filter(it => it.kind === "blk" && !zh[it.id] && !noZh.has(it.id) && it.text.trim().length > 1);
-    if (!pend.length) {
-      if (opt && opt.open) for (const it of items) if (it.kind === "blk" && zh[it.id]) openTrans(it);
-      return { done: 0, failed: 0 };
-    }
-    const res = await api("/api/translate", {
-      method: "POST",
-      json: { doc_id: docId, blocks: pend.map(it => ({ id: it.id, text: it.text })) },
-    });
-    // 服务端把“无需翻译(skipped)”和“这次没拿到(failed)”分开返回：
-    // 只有 skipped 才能记进 noZh 永久跳过，failed 必须留着让用户重试。
-    const skipped = new Set(res.skipped || []);
-    let done = 0, failed = 0;
-    for (const it of pend) {
-      const z = (res.results || {})[it.id];
-      if (z) { zh[it.id] = z; done++; if (opt && opt.open) openTrans(it); }
-      else if (skipped.has(it.id)) noZh.add(it.id);
-      else failed++;
-    }
-    relayoutAll();
-    return { done, failed };
-  }
-  // 把译文写进卡片（幂等）。译文统一从 zh[] 取，避免出现“zh 里有、卡片是空的”
-  function fillTrans(item) {
-    if (!item || item.kind !== "blk") return;
-    const z = zh[item.id] || "";
-    if (item.tsec.textContent !== z) item.tsec.textContent = z;
-  }
-  function openTrans(item) {
-    fillTrans(item);
-    item.tsec.hidden = false;
-    syncExp(item);
-  }
-  function openAllTrans() {
-    let c = 0;
-    for (const id in zh) { const it = findItem(id); if (it) { openTrans(it); c++; } }
-    relayoutAll();
-    return c;
-  }
-  function closeAllTrans(doLayout) {
-    for (const id in itemById) { const it = itemById[id]; it.tsec.hidden = true; syncExp(it); }
-    if (doLayout !== false) relayoutAll();
-  }
-  // 展开区(译文/笔记)的显隐：任一卡片可见就展开 .exp
-  function syncExp(item) {
-    if (!item || !item.exp) return;
-    item.exp.classList.toggle("open",
-      !item.tsec.hidden || !item.stbox.hidden || !item.nbox.hidden);
-  }
-  $("chkShowZh").addEventListener("change", e => {
-    showZhOn = e.target.checked;
-    savePrefs({ show_zh: showZhOn });      // 这个开关也跟账号走
-    if (showZhOn) { enterParaTransMode(); openAllTrans(); }
-    else closeAllTrans();
+  /* ================= 布局：已拆到 js/layout.js =================
+     本模块是“枢纽”（笔记 / 目录 / AI 都会反向调用 relayoutAll、relayoutPage），所以
+     放在最后装配：页面宽度、批注栏、卡片顶开、页面高度都由它算。
+     · curPageW / noteSide / noteW / noteLeft 本段既读又写 → getter + setter；
+     · notesCount / notesOfBlock / tocPanelOpen 来自更后面的 r2-notes、r2-nav 装配 →
+       包一层转发；TOC_W 是常量，用 getter 延后取值。 */
+  const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage } = R2Layout({
+    $, CSS_W, ZOOM, ZOOM_OK, vpW, NOTE_GAP, pages,
+    keyParts, lineOfChar, sentRange, render, paintFormulaMarks,
+    get DOC() { return DOC; },
+    get curPageW() { return curPageW; }, set curPageW(v) { curPageW = v; },
+    get noteSide() { return noteSide; }, set noteSide(v) { noteSide = v; },
+    get noteW() { return noteW; }, set noteW(v) { noteW = v; },
+    get noteLeft() { return noteLeft; }, set noteLeft(v) { noteLeft = v; },
+    get editingKey() { return editingKey; },
+    get showNotesOn() { return showNotesOn; },
+    notesCount: (...a) => notesCount(...a),
+    notesOfBlock: (...a) => notesOfBlock(...a),
+    tocPanelOpen: (...a) => tocPanelOpen(...a),
+    get TOC_W() { return TOC_W; },
   });
-  /* 设置里换了“翻译目标语言”：服务端的译文缓存与“所选句译文”卡都按语言分开存，
-     这里把上一个语言的译文清掉、按新语言重新拉一次，页面上不留旧语言的译文 */
-  document.addEventListener("paper-target-lang", async (e) => {
-    for (const id in zh) delete zh[id];
-    noZh.clear();
-    for (const id in itemById) { const it = itemById[id]; if (it && it.tsec) it.tsec.textContent = ""; }
-    try {
-      Object.assign(zh, await api("/api/doc/" + docId + "/zh_all").catch(() => ({})));
-      selTransList = await loadSelTrans();
-    } catch (err) { /* 拉不到就当还没翻译，不影响阅读 */ }
-    renderSelTrans();
-    if (showZhOn) openAllTrans(); else closeAllTrans();
-    relayoutAll();
-    updateBar();
-    const name = (e.detail && e.detail.name) || "";
-    toast(name ? ("翻译目标语言已改为 " + name + "，本页译文已按新语言刷新")
-               : "翻译目标语言已切换，本页译文已刷新");
-  });
-  $("btnPageTrans").addEventListener("click", async () => {
-    const pi = currentPageIndex();
-    const items = pages[pi] ? pages[pi].items.filter(i => i.kind === "blk") : [];
-    enterParaTransMode();                       // 与“所选句译文”互斥
-    try {
-      const { done, failed } = await translateItems(items, { open: true });
-      if (done && failed) toast(`本页翻译完成 ${done} 段，另有 ${failed} 段没有拿到译文（可再点一次重试）`);
-      else if (done) toast(`本页翻译完成 ${done} 段`);
-      else if (failed) showNotice(`本页有 ${failed} 段没有拿到译文：翻译服务没有返回结果，可稍后再点「翻译本页」重试（这些段落仍然可以单独翻译）。`, true);
-      else toast("本页没有需要翻译的英文段落");
-    } catch (err) { showNotice("翻译失败：" + err.message, true); }
-  });
-  $("btnAllTrans").addEventListener("click", runAllTrans);
-  async function runAllTrans() {
-    if (busy) return;
-    busy = true; cancelAll = false;
-    enterParaTransMode();                       // 与“所选句译文”互斥
-    const btn = $("btnAllTrans");
-    btn.disabled = true;
-    const prog = $("transProgress"), bar = $("tpBar"), txt = $("tpText");
-    prog.hidden = false;
-    const all = [];
-    pages.forEach(p => p.items.forEach(it => { if (it.kind === "blk" && !zh[it.id] && !noZh.has(it.id)) all.push(it); }));
-    if (!all.length) { toast("全部段落均已翻译"); prog.hidden = true; btn.disabled = false; busy = false; return; }
-    const total = all.length;
-    let doneN = 0, failedN = 0;
-    try {
-      for (let k = 0; k < all.length && !cancelAll; k += 20) {
-        const chunk = all.slice(k, k + 20);
-        const res = await api("/api/translate", {
-          method: "POST", json: { doc_id: docId, blocks: chunk.map(i => ({ id: i.id, text: i.text })) },
-        });
-        const skipped = new Set(res.skipped || []);
-        chunk.forEach(i => {
-          const z = (res.results || {})[i.id];
-          if (z) { zh[i.id] = z; if (showZhOn) openTrans(i); }
-          else if (skipped.has(i.id)) noZh.add(i.id);   // 真·无需翻译才跳过
-          else failedN++;                               // 没拿到 → 留着可重试
-          doneN++;
-        });
-        bar.style.width = Math.round(doneN / total * 100) + "%";
-        txt.textContent = doneN + " / " + total;
-      }
-      relayoutAll();
-      if (failedN && !cancelAll) {
-        showNotice(`全文翻译完成，但有 ${failedN} 段没有拿到译文（翻译服务没返回结果）。再点一次「翻译全文」即可只重试这些段落。`, true);
-      } else if (cancelAll) {
-        toast("已暂停翻译");
-      } else if (!showZhOn) {
-        // 没勾“显示译文”时卡片都是收着的，提示一下怎么看，别让人以为没翻译
-        showNotice("全文翻译完成。勾选顶部的「显示译文」可展开全篇译文，或点任意句子后选「显示本段译文」逐段查看。", false);
-      } else {
-        toast("全文翻译完成 🎉");
-      }
-    } catch (err) {
-      showNotice("翻译失败：" + err.message + "（可能未配置翻译服务或余额不足）", true);
-    } finally {
-      prog.hidden = true; btn.disabled = false; busy = false;
-    }
-  }
-  $("tpCancel").addEventListener("click", () => { cancelAll = true; });
-
-  /* ================= 布局 =================
-     两种展开形式：
-       1) 译文卡：留在句子下方，把后续版式内容顶开(“顶开版式”)；
-       2) 笔记卡：绝对定位在**页面右侧的批注栏**里，纵向对齐笔记对应句子所在行
-          —— 与正文同高、不占版面；同页多张卡自上而下依次避让。
-     有笔记时会给页面右侧“预留”批注栏宽度(见 --note-reserve)：
-       窗口够宽 → 页面保持原尺寸并整体左移，右边让出批注栏；
-       窗口不够宽 → 页面按可用宽度等比缩小(fit)，保证能并排；
-       实在放不下(可用宽度 < 520px，或右侧面板展开中) → 笔记回到句子下方内嵌。 */
-  function xOverlap(a, b, aw) {
-    const w = aw || a.w;
-    return Math.max(0, Math.min(a.x + w, b.x + b.w) - Math.max(a.x, b.x)) > 1;
-  }
-  // 页面尺寸与批注栏宽度只跟窗口/缩放/有无笔记有关，不依赖已渲染的 DOM
-  function computePageTarget() {
-    // 整体缩放时视口在布局坐标里只有 clientWidth/ZOOM 这么宽；页面宽度保持 CSS_W，
-    // 由 <html> 的 zoom 把它放大(不支持 zoom 的浏览器才退回“直接算宽页面”的老算法)
-    const clientW = vpW();
-    const want = ZOOM_OK ? CSS_W : CSS_W * ZOOM();
-    const drawerOpen = !!($("side") && $("side").classList.contains("open"));
-    // 左侧目录展开时也要给它让出宽度，否则页面会被盖住
-    const tocW = tocPanelOpen() ? TOC_W : 0;
-    const need = notesCount() > 0 || !!editingKey;      // 有笔记(或正在写)才预留
-    const reserve = clamp(Math.round(clientW * 0.25), 210, 330);
-    const room = clientW - reserve - tocW - 36;         // 让出批注栏/目录后页面能用多宽
-    const side = !drawerOpen && showNotesOn && need && room >= 520;
-    return {
-      side, reserve, tocW,
-      noteW: Math.max(190, reserve - 28),
-      pageW: side ? Math.min(want, room)
-                  : (tocW ? Math.min(want, Math.max(320, clientW - tocW - 36)) : want),
-    };
-  }
-  function applyNoteChrome(t) {
-    document.body.classList.toggle("notes-side", t.side);
-    document.body.style.setProperty("--note-reserve", t.reserve + "px");
-    // 卡片(译文/笔记)字号跟着页面的实际渲染比例走，和正文一起缩放
-    // (夹紧到 0.78~1.2，避免页面很小时字小到看不清)
-    document.body.style.setProperty(
-      "--page-scale", clamp(t.pageW / CSS_W, 0.78, 1.2).toFixed(3));
-    noteSide = t.side;
-    noteW = t.noteW;
-    noteLeft = t.pageW + 14;                            // 页面坐标：贴着页面右边线外侧
-  }
-  function relayoutAll() {
-    if (!DOC || !pages.length) return;      // 论文还没加载好（或加载失败）：别去碰 DOM
-    const t = computePageTarget();
-    if (Math.abs(t.pageW - curPageW) > 0.5) { render(); return; }   // 页面尺寸变了 → 整体重排
-    applyNoteChrome(t);
-    layoutAi();
-    pages.forEach((pg, pi) => relayoutPage(pi));
-    // 版式（含公式框位移）刚定下来：高亮公式框的“命中”是按几何算的，要重新对一遍
-    paintFormulaMarks();
-  }
-
-  /* 文末面板：宽度不够时从“左右”变“上下”（.ai-stacked），上下结构下两块等宽。
-     判断方式是先把类去掉、量一下两块是否真的落在同一行 —— 比猜一个阈值可靠
-     （换行临界是两块 flex-basis 之和，改 CSS 后这里不用跟着改）。
-     量完立刻恢复，整个过程在同一个任务里完成，不会闪。 */
-  function layoutAi() {
-    const box = $("aiBody"), chat = $("aiChat"), sum = $("aiSum");
-    if (!box || !chat || !sum) return;
-    box.classList.remove("ai-stacked");
-    const wrapped = Math.abs(chat.offsetTop - sum.offsetTop) > 2;
-    if (wrapped) box.classList.add("ai-stacked");
-  }
-  // 右侧模式：把笔记容器绝对定位到页面右侧；否则清掉定位、回到句子下方内嵌
-  function applyNoteSide(it) {
-    const box = it.nbox;
-    if (!box) return;
-    const side = noteSide && !box.hidden;
-    box.style.position = side ? "absolute" : "";
-    box.style.minWidth = side ? "0" : "";
-    box.style.width = side ? noteW + "px" : "";
-    box.style.left = side ? (noteLeft - it.x) + "px" : "";
-    if (!side) box.style.top = "";
-  }
-  // 右侧笔记卡：先按“句子首行”定高，再自上而下依次避让；返回最底部(页面坐标)
-  function layoutSideNotes(items) {
-    const boxes = items.filter(it => it.kind === "blk" && it.nbox && !it.nbox.hidden);
-    for (const it of boxes) {
-      const first = notesOfBlock(it)[0];
-      const si = first ? keyParts(first.block_id).si : 0;
-      const ld = it.linesData[lineOfChar(it, sentRange(it, si).a)] || it.linesData[0];
-      it.noteDy = ld ? ld.dy : 0;                    // 句子首行相对块顶的偏移
-      it.noteY = it.y + it.noteDy + (it.syShift || 0) + (it.ulShift || 0) + (it.shift || 0);  // 目标页面 y（含内容避让 + 译文顶开）
-    }
-    boxes.sort((a, b) => a.noteY - b.noteY);
-    let cursor = -Infinity;
-    for (const it of boxes) {
-      const h = it.nbox.offsetHeight;
-      const y = Math.max(it.noteY, cursor + NOTE_GAP);
-      it.nbox.style.top = (y - it.y - it.contentH) + "px";   // 相对 .exp(块顶+contentH)
-      cursor = y + h;
-    }
-    return boxes.length ? cursor : 0;
-  }
-  function relayoutPage(pi) {
-    const pg = pages[pi];
-    if (!pg) return;
-    const items = pg.items;
-
-    for (const it of items) if (it.kind === "blk") applyNoteSide(it);
-
-    for (const it of items) {
-      it.expH = 0; it.expW = 0;
-      if (it.kind !== "blk" || !it.exp.classList.contains("open")) continue;
-      const inlineNotes = !noteSide && !it.nbox.hidden;   // 右侧模式下笔记不占版面
-      if (it.tsec.hidden && it.stbox.hidden && !inlineNotes) continue;
-      it.expH = it.exp.offsetHeight;
-      it.expW = Math.max(it.w, inlineNotes ? it.nbox.offsetWidth : 0);
-    }
-    // ⓪ Surya 内容和图片的避让（settleSuryaVertical 精确计算）：直接改 style.top，
-    //    与卡片顶开（transform）互不干扰，幂等（同一布局内 syShift 不变）。
-    //    ⚠️ 不走 ①/② 的位移链：那条链是给卡片设计的近似“同化”传播，会把
-    //    精确的避让量再放大，反而让下方块被多推、造成新的重叠（第 2 页实测）。
-    for (const it of items) {
-      if (!it.surya || it.syShift === undefined) continue;
-      it.el.style.top = (it.y + it.syShift).toFixed(1) + "px";
-    }
-    // ⓪-b Unlimited-OCR 内容和图片的避让（settleUnlimitedVertical 精确计算）：
-    //    避让量存在 ulShift，与 Surya 的 syShift 各自独立。
-    for (const it of items) {
-      if (!it.unlimited || it.ulShift === undefined) continue;
-      it.el.style.top = (it.y + it.ulShift).toFixed(1) + "px";
-    }
-    // ① 直接位移：每张展开卡把**同栏**（x 重叠）、位于其下方的内容顶开
-    for (const it of items) {
-      let shift = 0;
-      const bottom = it.kind === "blk" ? it.y + it.contentH : it.y + it.h;
-      for (const o of items) {
-        if (o === it || !o.expH || o.kind !== "blk") continue;
-        const ob = o.y + o.contentH;
-        if (ob <= bottom + 0.5 && xOverlap(o, it, o.expW)) shift += o.expH;
-      }
-      it.shift = shift;
-    }
-    // ② 传递位移：被顶开的**宽元素**（典型是跨栏插图）会把压在它正下方的内容也带下去。
-    //    例：右栏的卡片把下面的插图顶下去 154px，插图下方那半栏的标题/页码 x 不与
-    //    卡片栏重叠，①不会动它们 —— 结果就被下移的插图盖住。这里让「某个已位移元素
-    //    下方 + 横向相交」的元素至少取那个位移；取 max（①里已计入的卡片高度不重复
-    //    叠加），迭代到收敛（位移只增不减且有上界，必然收敛）。
-    let grew = true;
-    while (grew) {
-      grew = false;
-      for (const it of items) {
-        const bottom = it.kind === "blk" ? it.y + it.contentH : it.y + it.h;
-        for (const m of items) {
-          if (m === it || m.shift <= it.shift) continue;
-          const mb = m.kind === "blk" ? m.y + m.contentH : m.y + m.h;
-          if (mb <= bottom + 0.5 && xOverlap(m, it)) { it.shift = m.shift; grew = true; }
-        }
-      }
-    }
-    for (const it of items) {
-      it.el.style.transform = it.shift ? "translateY(" + it.shift + "px)" : "";
-    }
-
-    /* 页面级公式框覆盖层（`.fbox`，见 r2-math.js）不在 `items` 里，但也得跟着
-       “顶开版式”走：否则译文/笔记卡把正文顶下去之后，公式还钉在原坐标 ——
-       表现就是公式叠在卡片上、和下面的文字错位。判据与块一致，只是拿**公式中心**
-       比展开块底边（块末行的行内公式常常比行框高，底边会探到块底下面一点点，
-       用底边会把锚点块自己的公式也算进去）。
-       ⚠️ **没有展开卡时不能整个跳过**：必须把上一次的位移清掉 —— 否则卡片收起/
-       删除后正文弹回原位、公式却留在下方。`anyExp` 只用来省掉“本来就没有位移”
-       时的量测。 */
-    const anyExp = items.some(o => o.expH);
-    for (const fb of pg.el.querySelectorAll(".fbox")) {
-      if (!anyExp && !fb.style.transform) continue;
-      const top = parseFloat(fb.style.top) || 0;
-      const fh = parseFloat(fb.style.height) || 0;
-      const cy = top + fh / 2;
-      const fx = parseFloat(fb.style.left) || 0;
-      const fw = parseFloat(fb.style.width) || 0;
-      let shift = 0;
-      for (const o of items) {
-        if (!o.expH || o.kind !== "blk") continue;
-        if (o.y + o.contentH <= cy + 0.5 && xOverlap(o, { x: fx, w: fw }, o.expW))
-          shift += o.expH;
-      }
-      for (const m of items) {                    // ② 传递位移（与 items 同一套规则）
-        if (m.shift <= shift) continue;
-        const mb = m.kind === "blk" ? m.y + m.contentH : m.y + m.h;
-        if (mb <= cy + 0.5 && xOverlap(m, { x: fx, w: fw })) shift = m.shift;
-      }
-      fb.style.transform = shift ? "translateY(" + shift + "px)" : "";
-    }
-
-    const noteBottom = noteSide ? layoutSideNotes(items) : 0;
-
-    let maxB = pg.h;
-    for (const it of items) {
-      const base = it.kind === "blk" ? it.y + it.contentH : it.y + it.h;
-      const sy = it.syShift || 0;         // Surya 内容避让量（走 style.top，不在 shift 里）
-      const ul = it.ulShift || 0;         // Unlimited-OCR 内容避让量（同口径，独立字段）
-      let b = base + sy + ul + (it.shift || 0);
-      if (it.expH) b = Math.max(b, it.y + it.contentH + sy + ul + (it.shift || 0) + it.expH);
-      if (b > maxB) maxB = b;
-    }
-    if (noteBottom > maxB) maxB = noteBottom;   // 右侧笔记卡也不能压到下一页
-    pg.el.style.height = Math.max(pg.h, maxB + 22) + "px";
-  }
 
   /* ================= 句子笔记 / 全部笔记抽屉：已拆到 r2-notes.js =================
      这里只做装配。$ / itemById / inkCache / docId 等 const、以及 26 个函数声明
@@ -2681,6 +705,7 @@
     }
     const btn = $("btnShare");
     if (btn) btn.hidden = perm !== "owner";
+    markTitleEditable();        // 只读共享时标题也不可点改
     syncAiButtons();            // 只读时把 AI 那边的按钮也置灰
   }
 
@@ -2688,6 +713,71 @@
     if (canWrite()) return true;
     toast(tip || "这是只读共享的论文，不能修改（可让作者把权限改成「可写」）", 3600);
     return false;
+  }
+
+  /* ================= 论文标题（点一下就能改） =================
+     标题在服务端存了两份（记录 + 版式文档），改名接口一次写全，所以首页列表
+     刷新后就是新名字。这里只做「就地编辑」：Enter 保存 / Esc 取消 / 失焦保存。 */
+  function setupDocTitle() {
+    const h = $("docTitle");
+    if (!h || h._titleEdit) return;
+    h._titleEdit = true;
+    h.addEventListener("click", () => editDocTitle());
+    h.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); editDocTitle(); }
+    });
+  }
+  /* 有写权限才把标题标成“可点”的样子（只读者连光标/提示都不给） */
+  function markTitleEditable() {
+    const h = $("docTitle");
+    if (!h) return;
+    const ok = canWrite();
+    h.classList.toggle("editable", ok);
+    h.title = ok ? "点击重命名（Enter 保存 / Esc 取消）" : "";
+    h.tabIndex = ok ? 0 : -1;
+  }
+  function editDocTitle() {
+    const h = $("docTitle");
+    if (!h || h._editing) return;
+    if (!needWrite("这是只读共享的论文，不能改名（可让作者把权限改成「可写」）")) return;
+    const cur = (DOC && DOC.title) || h.textContent || "";
+    h._editing = true;
+    h.textContent = "";
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.className = "doc-title-edit";
+    inp.value = cur;
+    inp.maxLength = 200;
+    h.appendChild(inp);
+    inp.focus();
+    inp.select();
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      h._editing = false;
+      const val = String(inp.value || "").replace(/\s+/g, " ").trim();
+      h.textContent = cur;                       // 先恢复原名，失败时不用再回滚
+      if (!save || !val || val === cur) { markTitleEditable(); return; }
+      h.textContent = val;                       // 乐观更新，失败再退回
+      try {
+        await api("/api/doc/" + docId + "/title", { method: "POST", json: { title: val } });
+        if (DOC) DOC.title = val;
+        document.title = val;
+        toast("已重命名");
+      } catch (err) {
+        h.textContent = cur;
+        showNotice("重命名失败：" + err.message, true);
+      }
+      markTitleEditable();
+    };
+    inp.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); finish(true); }
+      else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+      e.stopPropagation();                       // 别让页面级快捷键（缩放手感）抢键
+    });
+    inp.addEventListener("click", (e) => e.stopPropagation());
+    inp.addEventListener("blur", () => finish(true));
   }
 
   async function openShare() {
@@ -2724,8 +814,8 @@
         const r = await api("/api/doc/" + docId + "/reparse", { method: "POST", body: fd });
         const info = r.parser_info || {};
         const lb = r.latex_blocks || [0, 0];
-        toast("版式已重新解析（" + (r.parser || "?") + "）");
-        showNotice("重解析完成：后端 " + (r.parser || "?") + "，页数 " + r.pages[0]
+        toast("版式已重新解析（" + parserLabel(r.parser) + "）");
+        showNotice("重解析完成：后端 " + parserLabel(r.parser) + "，页数 " + r.pages[0]
           + "→" + r.pages[1] + "，文字块改动 " + r.changed + " 处"
           // 公式：本流程把公式字形擦成等长空格（页面上那段地方就是空白）。
           // `formula_chars` = 被擦掉的字形数，`formula_spans` = 擦除的 run 段数。
@@ -2781,6 +871,7 @@
       if (selTransList.length) { $("chkShowZh").checked = false; showZhOn = false; }
       $("docTitle").textContent = DOC.title;
       document.title = DOC.title;
+      setupDocTitle();              // 顶栏标题：点一下就地改名（同步回首页列表）
       updateFinishBtn();
       $("notesCount").textContent = (anno.notes || []).length;
       const cfg = await appConfig();
@@ -2790,24 +881,21 @@
       if (!cfg.ready) {
         tips.push("⚠️ 未配置翻译服务：译文功能不可用。点右上角「⚙ 设置 → LLM 服务」填写服务地址与 API Key（也可在 config.json 里配），或安装 deep-translator 用免费兜底。");
       }
-      // 图片/公式检测（detection-service-group）与所选后端不匹配时提示一声。
+      // 解析后端就绪状态：本地解析方案/两条整页 OCR 链都是“全有或全无”，
+      // 不满足条件时上传与重解析会失败，这里提前提示。
       const pr = cfg && cfg.parser;
+      const localBackends = ["pymupdf", "auto", "detection_service_group"];
       if (pr && pr.backend === "surya" && pr.surya_ready !== true) {
-        // surya 后端是“全有或全无”：服务/客户端任一没就绪，上传与重解析都会失败
         tips.push("⚠️ 解析后端现为 surya，但 Surya 2 还未就绪：" + (pr.surya_message || "") +
           "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
       } else if (pr && pr.backend === "unlimited_ocr" && pr.unlimited_ocr_ready !== true) {
-        // unlimited_ocr 后端同样是“全有或全无”：服务没起，上传与重解析都会失败
         tips.push("⚠️ 解析后端现为 unlimited_ocr，但 Unlimited-OCR 服务还未就绪：" +
           (pr.unlimited_ocr_message || "") +
           "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
-      } else if (pr && pr.backend === "pymupdf" && pr.detection_service_group_ready) {
-        tips.push("⚠️ detection-service-group 已就绪，但解析后端选的是 pymupdf（不跑图片/公式检测）——" +
-          "要显示 Figure 图片和公式，请在「⚙ 设置 → 存储 / OCR」里选 auto 或 detection_service_group。");
-      } else if (pr && (pr.backend === "auto" || pr.backend === "detection_service_group") &&
-                 pr.detection_service_group_ready === false) {
-        tips.push("⚠️ detection-service-group 不可用：解析时会跳过 Figure 图片和公式框/LaTeX 增强。" +
-          (pr.message || "") + "（点右上角「⚙ 设置 → 存储 / OCR」查看）");
+      } else if (pr && localBackends.indexOf(pr.backend) >= 0 && pr.local_ready !== true) {
+        tips.push("⚠️ 解析后端现为「本地解析方案」，但本机还不具备条件：" +
+          (pr.local_message || "缺少本地模型或依赖") +
+          "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
       }
       // 旧解析数据没有链接注释时，编号引用已尝试回退匹配；仍无映射才提示可重解析。
       if (refsData && refsData.scan === "no-links-data"
@@ -2829,9 +917,12 @@
       // 文末的 AI 面板：先拿回上次的整理/对话；若之前已读到 95% 且还没整理，这里补一次
       await loadAi();
       maybeAutoSummarize();
-      // 已经读完的文章：进来直接停在文末的 AI 面板（整理与对话都在那儿），
-      // 不必先落在最后一页再自己往下滚。点「已完成 ✓」改成在读可取消这个行为。
-      if (META.status === "done") jumpToAi(true);
+      // 回到上次离开时的位置：`META.last_pos` 记的是精确位置（页内比例 / 距文末多远），
+      // 所以“读完的文章”不再一律甩到文末 AI 面板 —— 你停在哪儿就回哪儿。
+      // 文末面板的高度只有 loadAi() 之后才定型，故这里只补处理“停在 AI 面板”那种；
+      // 没有 last_pos 的老论文按 render() 里还原的“最远一页”即可，
+      // 只有在既没位置数据、也从没滑过页面时，读完的才落到文末面板。
+      if (!restoreLastPos(true) && !META.last_page && META.status === "done") jumpToAi(true);
     } catch (err) {
       showNotice("加载失败：" + err.message, true);
     }

@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- 背景 -->
+  <rect width="200" height="200" fill="#0a0a0a"/>
+
+  <!-- 字母C - 蟑螂身体（开口在右上方） -->
+  <path d="M 145 55
+           A 55 55 0 1 0 145 145
+           L 130 130
+           A 35 35 0 1 1 130 70
+           Z" 
+        fill="#ffd700"/>
+
+  <!-- 蟑螂头部 - 在C开口处 -->
+  <circle cx="142" cy="62" r="16" fill="#ffd700"/>
+
+  <!-- 眼睛 -->
+  <circle cx="147" cy="65" r="5" fill="#0a0a0a"/>
+  <circle cx="148.5" cy="63.5" r="1.5" fill="#ffffff"/>
+
+  <!-- 触角 - 不对称 -->
+  <path d="M 135 48 Q 122 30 102 38" 
+        fill="none" 
+        stroke="#ffd700" 
+        stroke-width="4" 
+        stroke-linecap="round"/>
+  <path d="M 149 46 Q 162 25 182 33" 
+        fill="none" 
+        stroke="#ffd700" 
+        stroke-width="4" 
+        stroke-linecap="round"/>
+
+  <!-- 触角末端 -->
+  <circle cx="102" cy="38" r="3" fill="#ffd700"/>
+  <circle cx="182" cy="33" r="3" fill="#ffd700"/>
+
+  <!-- 左侧腿（三条，从C的外侧伸出） -->
+  <line x1="68" y1="95" x2="43" y2="85" stroke="#ffd700" stroke-width="6" stroke-linecap="round"/>
+  <line x1="61" y1="120" x2="33" y2="120" stroke="#ffd700" stroke-width="6" stroke-linecap="round"/>
+  <line x1="68" y1="145" x2="45" y2="158" stroke="#ffd700" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- 右侧腿（两条，不对称） -->
+  <line x1="148" y1="105" x2="170" y2="97" stroke="#ffd700" stroke-width="5" stroke-linecap="round"/>
+  <line x1="151" y1="132" x2="172" y2="140" stroke="#ffd700" stroke-width="5" stroke-linecap="round"/>
+</svg>

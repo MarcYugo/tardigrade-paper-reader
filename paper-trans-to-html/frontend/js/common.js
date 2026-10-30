@@ -21,6 +21,8 @@ async function api(path, opts = {}) {
   } else if (opts.body != null) {
     opt.body = opts.body;
   }
+  // 页面正在卸载（关标签页 / 切走）时补发的请求要 keepalive，否则随页面一起被掐掉
+  if (opts.keepalive) opt.keepalive = true;
   const r = await fetch(path, opt);
   if (!r.ok) {
     let msg = "请求失败(" + r.status + ")";
@@ -541,11 +543,11 @@ function createLangDropdown(o) {
    收起时是一张文字卡片（选项名 + 说明），展开是浮层列表；边框、圆角、悬浮 / 聚焦
    高亮与「服务类型」「目标语言」完全一致，只是没有左侧的图案。 */
 const OCR_BACKENDS = [
-  { value: "auto", name: "自动", sub: "PyMuPDF 文字版式 + 服务组图片/公式检测", badge: "默认" },
-  { value: "detection_service_group", name: "服务组图片/公式检测", sub: "detection-service-group" },
+  { value: "auto", name: "自动（本地解析方案）", sub: "默认：PyMuPDF 版式 + 本地公式/表格模型", badge: "默认" },
+  { value: "pymupdf", name: "本地解析方案", sub: "PyMuPDF + texify 公式 + OXR 版面/SLANet 表格" },
+  { value: "detection_service_group", name: "本地解析方案（不调用服务组）", sub: "历史取值，内部等价于本地解析方案" },
   { value: "surya", name: "Surya 2 推理服务", sub: "整页 OCR：文字 / 公式 / 插图" },
   { value: "unlimited_ocr", name: "Unlimited-OCR 推理服务", sub: "整页 OCR：文字 / 公式 / 表格 / 插图" },
-  { value: "pymupdf", name: "PyMuPDF 本地解析", sub: "不跑图片/公式检测" },
 ];
 function ocrBackendMeta(v) {
   return OCR_BACKENDS.find(b => b.value === v) || OCR_BACKENDS[0];
@@ -696,11 +698,11 @@ function openLlmModal(tab) {
                     aria-haspopup="listbox" aria-expanded="false"></button>
             <div class="drop-menu" id="ocrBackendMenu" role="listbox" hidden></div>
             <select id="ocrBackend" hidden>
-              <option value="auto">自动（PyMuPDF 文字版式 + 服务组图片/公式检测）</option>
-              <option value="detection_service_group">服务组图片/公式检测（detection-service-group）</option>
+              <option value="auto">自动（本地解析方案：PyMuPDF + 本地模型）</option>
+              <option value="pymupdf">本地解析方案</option>
+              <option value="detection_service_group">本地解析方案（不调用服务组）</option>
               <option value="surya">Surya 2 推理服务（整页 OCR：文字 / 公式 / 插图）</option>
               <option value="unlimited_ocr">Unlimited-OCR 推理服务（整页 OCR：文字 / 公式 / 表格 / 插图）</option>
-              <option value="pymupdf">PyMuPDF 本地解析（不跑图片/公式检测）</option>
             </select>
           </div>
           <div class="row-actions" style="margin-top:8px">
@@ -1065,21 +1067,20 @@ function openLlmModal(tab) {
   }
 
   /* PDF 解析后端：
-       · auto / detection_service_group：PyMuPDF 抽取文字版式，detection-service-group
-         提供 Figure 裁图与公式框 + LaTeX 覆盖层；
-       · surya：整页 OCR —— 文字 / 公式（<math>→LaTeX）/ 插图全用 Surya 的数据，
-         前端按 Surya 数据独立渲染（不回落 PyMuPDF）；
+       · auto / pymupdf / detection_service_group：**本地解析方案** —— PyMuPDF 版式
+         + texify 公式识别 + OXR 版面分析 + SLANet 表格识别，前端逐行绝对定位渲染；
+       · surya：整页 OCR —— 文字 / 公式（<math>→LaTeX）/ 插图全用 Surya 的数据；
        · unlimited_ocr：整页 OCR —— 文字 / 公式（LaTeX）/ 表格（HTML）/ 插图全用
-         Unlimited-OCR 的数据，前端按它的数据独立渲染（不回落 PyMuPDF）；
-       · pymupdf：纯本地，不连任何服务。
+         Unlimited-OCR 的数据。
      服务没起 / 依赖没装时这里如实显示状态。 */
   const OCR_TEXT = {
-    detection_service_group: "图片/公式检测服务组（detection-service-group）",
+    detection_service_group: "本地解析方案（不调用服务组）",
     surya: "Surya 2 推理服务（文字 / 公式 / 插图全用 Surya）",
     unlimited_ocr: "Unlimited-OCR 推理服务（文字 / 公式 / 表格 / 插图全用 OCR）",
-    pymupdf: "PyMuPDF 本地解析（不跑图片/公式检测）",
+    pymupdf: "本地解析方案（PyMuPDF + 本地公式/表格模型）",
+    unavailable: "不可用（本地解析方案的模型/依赖未就绪）",
   };
-  const OCR_NAME = { auto: "自动", detection_service_group: "detection-service-group", surya: "Surya 2", unlimited_ocr: "Unlimited-OCR", pymupdf: "PyMuPDF" };
+  const OCR_NAME = { auto: "自动（本地解析方案）", detection_service_group: "本地解析方案（不调用服务组）", surya: "Surya 2", unlimited_ocr: "Unlimited-OCR", pymupdf: "本地解析方案" };
 
   function renderParser(p) {
     const el2 = $("lmParser");
@@ -1088,13 +1089,15 @@ function openLlmModal(tab) {
       $("ocrBackend").value = p.backend;
       ocrDrop.render();               // 服务端配置可能变了：同步卡片上的文字
     }
-    const eff = p.effective || "pymupdf";
-    let html = `${eff === "pymupdf" ? "📄" : "✅"} 实际使用：` +
+    const eff = p.effective || "unavailable";
+    const effOk = eff === "pymupdf" || eff === "surya" || eff === "unlimited_ocr";
+    let html = `${effOk ? "✅" : "⛔"} 实际使用：` +
       `<b>${esc(OCR_TEXT[eff] || eff)}</b>（配置：<code>${esc(p.backend || "")}</code>）`;
-    // 各解析链的就绪状态：detection-service-group（PyMuPDF 路）、Surya 2、Unlimited-OCR
-    html += `<br>${p.detection_service_group_ready ? "✅" : "⛔"} detection-service-group ` +
-      `<code>${esc(p.detection_service_group_url || "")}</code>` +
-      (p.detection_service_group_enabled === false ? "（当前配置不跑图片/公式检测）" : "");
+    // 本地解析方案：PyMuPDF + texify / OXR 版面 / SLANet（模型与依赖都要就绪）
+    html += `<br>${p.local_ready ? "✅" : "⛔"} 本地解析方案 ` +
+      `<code>${esc(p.local_model_dir || "local_parse_pipeline/models")}</code>` +
+      (p.local_ready ? "（模型与依赖已就绪）"
+                     : `（${esc(p.local_message || "模型/依赖未就绪")}）`);
     html += `<br>${p.surya_ready ? "✅" : "⛔"} Surya 2 ` +
       `<code>${esc(p.surya_url || "")}</code>` +
       (p.surya_client_ready === false ? "（本机缺 surya-ocr 客户端依赖）" : "") +

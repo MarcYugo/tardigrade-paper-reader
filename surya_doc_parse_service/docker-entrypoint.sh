@@ -20,7 +20,7 @@ NGL="${LLAMA_NGL:-99}"
 if [ ! -f "$MODEL" ] || [ ! -f "$MMPROJ" ]; then
   echo "错误: 找不到模型文件。" >&2
   echo "请运行时挂载权重目录:" >&2
-  echo "  -v \"<宿主机 checkpoints目录>:/app/checkpoints:ro\"" >&2
+  echo "  -v \"./checkpoints:/app/checkpoints:ro\"" >&2
   echo "期望存在: $MODEL 与 $MMPROJ" >&2
   exit 1
 fi

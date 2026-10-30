@@ -15,10 +15,10 @@
 | `reply_chat()` | 带着正文、笔记与摘要聊一轮，返回助手正文（整段） |
 | `reply_chat_stream()` | 同上，但**逐段 yield**，给前端做流式显示 |
 
-对话的上下文（`chat_payload()`）**从一开始就带整篇正文**：解析时公式在正文里被擦成
-等长空格（见 `pdf_parser` 包文档），所以 `article_text()` 会把每页正文与**该页公式的
-LaTeX**（`pages[].formula_boxes`，以及旧数据挂在块上的公式）一起拼进去 —— 不然模型
-只看得见笔记，答不了「这篇论文讲了什么 / 这个公式是什么」。
+对话的上下文（`chat_payload()`）**从一开始就带整篇正文**：`article_text()` 会把
+每页正文与**该页公式的 LaTeX**（整页 OCR 路线的 `kind="formula"` 块；旧 doc.json 里
+还有 `pages[].formula_boxes`）一起拼进去 —— 不然模型只看得见笔记，答不了
+「这篇论文讲了什么 / 这个公式是什么」。
 
 
 `build_summary()` 除了笔记，还能带上**上一版整理**（`previous`，可能被用户手改过）与
@@ -259,10 +259,11 @@ def _formula_row(latex: str, class_name: str, pos) -> dict:
 def _page_formulas(page: dict) -> list[dict]:
     r"""页面里的公式（LaTeX + 位置），两个来源合并：
 
-      * `pages[].formula_boxes`（当前流程：服务组给的公式框，`bbox_norm = [cx, cy, w, h]`）
-        —— 识别失败（`error`）或没有 LaTeX 的条目跳过；
-      * `pages[].texts[]` 里 `kind="formula"` 且带 `latex` 的块（旧数据的兼容路径，
-        见前端 `r2-math.js` 的 `mathBlockOf`），位置由块框 x/y/w/h 折算。
+      * `pages[].texts[]` 里 `kind="formula"` 且带 `latex` 的块 —— **当前流程**
+        （Surya 2 / Unlimited-OCR 整页 OCR 下发的独立公式块），位置由块框 x/y/w/h 折算；
+      * `pages[].formula_boxes` —— 本地 PyMuPDF + detection-service-group 链路的历史
+        字段（该链路已移除），旧 doc.json 里仍可能存在；识别失败（`error`）或没有
+        LaTeX 的条目跳过。`bbox_norm = [cx, cy, w, h]`。
     """
     rows: list[dict] = []
     for fb in page.get("formula_boxes") or []:

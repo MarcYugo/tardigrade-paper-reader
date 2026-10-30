@@ -201,23 +201,39 @@ window.R2Nav = function (env) {
     const h = r.height || 1;
     return clamp((vpH() * 0.5 - r.top) / h, 0, 1);
   }
-  async function saveProgress() {
-    if (!env.META) return;
+  /* opts.keepalive：页面正在卸载时补存的那一次（fetch 要 keepalive，否则被掐掉） */
+  async function saveProgress(opts) {
+    if (!env.META || !pages.length) return;      // 还没渲染出正文，别把页码/进度写成 0
     const ratio = readRatio();
     const pi = currentPageIndex();
     let status = env.META.status === "unread" ? "reading" : env.META.status;
     if (ratio > 0.985) status = "done";
     env.META.progress = Math.max(env.META.progress || 0, ratio);
     env.META.last_page = Math.max(env.META.last_page || 0, pi + 1);
-    maybeAutoSummarize();          // 读到 ≥95% 且还没整理过 → 自动整理笔记
+    // 精确位置：与只增不减的 progress / last_page 相反，这个是**覆盖写**
+    // （用户往回翻就是往回翻，不能又被拽回读到过的最远处）。
+    // {pi, ratio} = 第几页 + 页内比例；{pi:-1, fromBottom} = 已经滚到文末 AI 面板。
+    // 量不到（还没页面）时保留原值，不要用 null 盖掉。
+    const pos = pageAnchor();
+    if (pos) env.META.last_pos = pos;
+    // 页面正在卸载时别再起“自动整理笔记”那种流式请求（必定被掐断，下次打开会重试）
+    if (!(opts && opts.keepalive)) maybeAutoSummarize();
     try {
       const r = await api(`/api/doc/${docId}/progress`, {
         method: "POST",
-        json: { last_page: env.META.last_page, progress: env.META.progress, status },
+        json: { last_page: env.META.last_page, progress: env.META.progress, status,
+                last_pos: env.META.last_pos || null },
+        keepalive: !!(opts && opts.keepalive),
       });
       if (r) { env.META.status = r.status; updateFinishBtn(); }
     } catch (e) { /* ignore */ }
   }
+  /* 离开阅读页时补存一次：滚动保存用的是 800ms 防抖，
+     “往下滑一屏就关掉”那种情况最后一次位置会丢（重进就回到上一次存下的地方）。 */
+  window.addEventListener("pagehide", () => { saveProgress({ keepalive: true }); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) saveProgress({ keepalive: true });
+  });
   function updateFinishBtn() {
     // META 还没到（首屏、或缺 ?id=）时按“未标记”显示，不抛错
     $("btnFinished").textContent = (env.META && env.META.status === "done") ? "已完成 ✓" : "标记读完";

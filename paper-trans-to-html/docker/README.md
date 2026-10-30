@@ -73,7 +73,7 @@ docker run --rm -v paper-app-data:/d -v $PWD:/b alpine tar czf /b/app-data.tgz -
 | `MONGO_URI` | 空 | 给了就用整串（云端 Atlas / 外部实例），优先级最高 |
 | `MONGO_APP_USER` / `_PASSWORD` / `_DB` | 从 `../mongo_configuration/.env` 继承 | 数据库账号，与 compose 里那份保持一致 |
 | `APP_STORAGE` | `auto` | `auto` 连不上库回退本地 JSON；`mongo` 连不上就启动失败；`json` 只用本地 |
-| `PDF_PARSER_BACKEND` | 空 | **留空 = 用网页「⚙ 设置」里保存的解析后端**（可随时切换）；填 `auto`/`detection_service_group`/`surya`/`unlimited_ocr`/`pymupdf` 则强制锁定，会覆盖面板值（页面会提示）；旧值 `ftgroup` 仍被接受 |
+| `PDF_PARSER_BACKEND` | 空 | **留空 = 用网页「⚙ 设置」里保存的解析后端**（可随时切换）；填 `pymupdf`/`auto`/`detection_service_group`（本地解析方案）或 `surya`/`unlimited_ocr` 则强制锁定，会覆盖面板值（页面会提示）。旧值 `ftgroup` 仍被接受 |
 | `DETECTION_SERVICE_GROUP_URL` | `http://host.docker.internal:9003/v1` | detection-service-group（formula_table_service_group 的 router_service）地址；Figure 裁图与公式框 + LaTeX 由它提供 |
 | `DETECTION_SERVICE_GROUP_TIMEOUT` | `300` | 一次预测（检测+识别）整体超时（秒） |
 | `DETECTION_SERVICE_GROUP_KEEP_CROPS` | `true` | 是否保留公式兜底裁图；Figure 显示所需裁图始终开启 |

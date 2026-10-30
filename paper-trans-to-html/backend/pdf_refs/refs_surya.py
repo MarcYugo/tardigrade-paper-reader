@@ -1,9 +1,10 @@
 """Surya-specific citation extraction.
 
 Surya can return a whole bibliography page as one text block. Unlike the
-PyMuPDF strategy, this strategy splits numbered entries — and author-year
-entries labelled `[Smith et al., 2020]` — within each block before mapping
-body citations.
+PyMuPDF strategy, this strategy splits numbered entries, author-year entries
+labelled `[Smith et al., 2020]`, and **unlabelled** author-year entries
+(`Manan Agarwal, … arXiv preprint arXiv:2606.24773, 2026.`, one per line) within
+each block before mapping body citations.
 """
 from __future__ import annotations
 
@@ -11,12 +12,17 @@ import re
 import math
 
 from .refs import (
+    _RE_AY_START,
     _RE_CITE_TOKEN,
+    _RE_YEAR,
     _attach_uris,
+    _author_words,
     _build_entries,
     _canonical,
+    _derive_labels,
     _expand_nums,
     _find_references_start,
+    _first_author_surname,
     _map_links,
     _merge_links,
     _region_blocks,
@@ -32,15 +38,64 @@ _RE_ENTRY_LINE = re.compile(
 _RE_ENTRY_LINE_AY = re.compile(
     r"(?m)^[ \t]*\[([A-Z][^\[\]\n]{1,120}?,\s*(?:19|20)\d{2}[a-z]?)\][ \t]*(?=\S)"
 )
+# 上一行“已经写完”的行尾特征：句点 / 右括号 / 右方括号（Surya 常把反向页码
+# 标记 `(page 6)` 留在条末，所以 `)` 也算写完了）。
+_RE_ENTRY_LINE_DONE = re.compile(r"(?:[.!?]|[)\]])[ \t]*$")
+# 以出版信息开头的行（折行条目的续行）：即使上一行“写完了”也不当条目首行，
+# 免得把一条文献劈成两条。
+_AY_LINE_HEAD_STOP = frozenset({
+    "in", "proceedings", "advances", "international", "journal", "transactions",
+    "conference", "workshop", "arxiv", "url", "volume", "vol", "pages", "pp",
+    "ieee", "acm", "springer", "elsevier", "mit", "oxford", "cambridge",
+    "nature", "science", "pmlr", "pmr", "technical", "report", "preprint",
+    "abstract", "also", "see", "and", "the", "of", "on", "for", "with",
+})
+
+
+def _looks_like_ay_entry_line(line: str) -> bool:
+    """这一行像不像“作者-年份制条目”的首行（行首是作者姓名）。"""
+    head = line.lstrip()
+    if not _RE_AY_START.match(head):
+        return False
+    word = re.match(r"[A-Za-z][A-Za-z'’\-]*", head)
+    return bool(word) and word.group(0).lower() not in _AY_LINE_HEAD_STOP
+
+
+def _plain_ay_starts(text: str) -> list[int]:
+    """无标签作者-年份条目的行首 offset（ACL/arXiv 风格：条目首行直接是作者名）。
+
+    Surya 会把整页参考文献并成一个 `list` 块、**一条一行**，行内没有几何信息，
+    只能按行判断。两个条件同时成立才算条目开头：
+
+      1. 行首像作者姓名（`_RE_AY_START`，且不是 `Machine Learning,` 这种出版信息）；
+      2. **上一行已经写完**（行尾是句点/右括号，或上一行里已出现年份）。
+
+    只按第 1 条会把折行条目劈开（`… Advances in Neural Information` +
+    `Processing Systems, 35:7796–7809, 2022.` 两行都以大写词开头）。
+    """
+    starts: list[int] = []
+    prev_done = True                 # 块首行总是候选
+    pos = 0
+    for raw in text.splitlines(keepends=True):
+        line = raw.rstrip("\r\n")
+        if line.strip():
+            if prev_done and _looks_like_ay_entry_line(line):
+                starts.append(pos)
+            prev_done = bool(_RE_ENTRY_LINE_DONE.search(line)
+                             or _RE_YEAR.search(line))
+        pos += len(raw)
+    return starts
 
 
 def _entry_segments(text: str):
     """Yield each reference's span in Surya's newline-preserving text.
 
     Spans are `(start, end, number)`; `number` is None for author-year entries
-    (`[Smith et al., 2020] Title…`), whose label takes the number's place.
+    (`[Smith et al., 2020] Title…`, or unlabelled `Manan Agarwal, …`), whose
+    label/author name takes the number's place.
     编号条目与作者-年份标签不混排：一段文本里认到编号开头就只按编号切
-    （编号列表里的正文引用行不该再把条目切碎）。
+    （编号列表里的正文引用行不该再把条目切碎）；没有标签时才按“作者姓名开头
+    的行”切。
     """
     starts = [(match.start(),
                int(next(group for group in match.groups() if group)))
@@ -49,8 +104,10 @@ def _entry_segments(text: str):
         starts = [(match.start(), None)
                   for match in _RE_ENTRY_LINE_AY.finditer(text)]
     if not starts:
+        starts = [(start, None) for start in _plain_ay_starts(text)]
+    if not starts:
         return []
-    starts.sort()
+    starts.sort(key=lambda item: item[0])
     return [
         (start, starts[i + 1][0] if i + 1 < len(starts) else len(text), number)
         for i, (start, number) in enumerate(starts)
@@ -77,8 +134,12 @@ def _estimated_reference_lines(text: str, width: float, size: float) -> int:
 
 
 def split_surya_reference_blocks(pages: list[dict]) -> dict[str, int]:
-    """Split bibliography OCR blocks (numbered or `[Author, year]`-labelled)
-    into individually positioned blocks."""
+    """Split bibliography OCR blocks into individually positioned blocks.
+
+    Three entry styles are recognised: numbered (`[1]` / `1.`), `[Author, year]`
+    labelled author-year, and unlabelled author-year (each entry starts a line
+    with the author names, see `_plain_ay_starts`).
+    """
     start = _find_references_start(pages)
     region_ids = {
         str(block.get("id") or "")
@@ -190,13 +251,17 @@ def _build_surya_entries(region):
         segments = _entry_segments(canonical)
 
         if not segments:
-            if entries:
+            # 认不出条目开头：解析期已按条目拆过块的（`ref_entry`）**整块就是一条**；
+            # 其余（跨页续写、碎片）并进上一条。以前一律并入上一条，未拆分的
+            # 作者-年份制块会整块丢掉。
+            if entries and not block.get("ref_entry"):
                 entry = entries[-1]
                 if bid not in entry["blocks"]:
                     entry["blocks"].append(bid)
                 append_text(entry, canonical)
                 block_entries.setdefault(bid, []).append(entry["i"])
-            continue
+                continue
+            segments = [(0, len(canonical), None)]
 
         prefix = canonical[:segments[0][0]]
         if prefix.strip() and entries:
@@ -217,10 +282,18 @@ def _build_surya_entries(region):
                 "blocks": [bid],
                 "text": text[:1500],
                 "uri": "",
+                # 与通用实现同口径（见 `refs._build_entries`）：`label` 给前端卡片徽标
+                # （`Agarwal 2026`），`author_words`/`first_author` 给作者-年份匹配
+                # 的“强匹配”档 —— 缺了它们只能走弱匹配，共同作者会把同年的其他文献
+                # 一起挂到引用上。
+                "label": "",
+                "author_words": _author_words(text),
+                "first_author": _first_author_surname(text),
             }
             entries.append(entry)
             block_entries.setdefault(bid, []).append(entry["i"])
 
+    _derive_labels(entries)      # 无标签条目补 `[Agarwal, 2026]`，前端才好显示
     return entries, block_entries, region_block_ids
 
 

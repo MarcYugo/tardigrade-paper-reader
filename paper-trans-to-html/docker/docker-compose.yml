@@ -97,10 +97,10 @@ services:
       #    以前这里硬编码成 `${PDF_PARSER_BACKEND:-auto}`，容器里永远存在这个变量，
       #    而环境变量的优先级高于 config.json —— 于是面板里怎么切都不生效（只是白写
       #    一份 config.json）。要强制锁定后端才填：
-      #    auto=PyMuPDF 版式 + detection-service-group 公式框增强（服务不可用就跳过）/
-      #    detection_service_group=同上（显式）/ surya=Surya 2 整页 OCR（文字/公式/插图
-      #    全用 Surya，不回落 PyMuPDF）/ unlimited_ocr=Unlimited-OCR 整页 OCR（文字/公式/
-      #    表格/插图全用它，不回落 PyMuPDF）/ pymupdf=纯本地、不连外部服务；
+      #    surya=Surya 2 整页 OCR（文字/公式/插图全用 Surya）/
+      #    unlimited_ocr=Unlimited-OCR 整页 OCR（文字/公式/表格/插图全用它）；
+      #    ⚠️ auto / detection_service_group / pymupdf 仍被识别，但本地 PyMuPDF
+      #    链路已移除（调用会报未实现）；
       #    （旧值 ftgroup 仍被接受，等同 detection_service_group）
       PDF_PARSER_BACKEND: ${PDF_PARSER_BACKEND:-}
 

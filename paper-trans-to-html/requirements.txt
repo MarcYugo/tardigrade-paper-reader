@@ -1,7 +1,7 @@
 # ---- 依赖源 ----
 # PyTorch 官方 CPU 索引：下面锁定的 torch/torchvision `+cpu` 版本要从这里取。
 # 注意：requirements 文件里的 index 选项是**全局**的，对本文件所有包生效。
---extra-index-url https://download.pytorch.org/whl/cpu
+# --extra-index-url https://download.pytorch.org/whl/cpu
 
 fastapi>=0.110
 uvicorn[standard]>=0.29
@@ -29,6 +29,20 @@ pymongo==4.18.0
 #  gpu 设备推理的话把cpu版本的torch和torchvision 注释掉
 # torch==2.14.0+cpu
 # torchvision==0.29.0+cpu
+# onnxruntime
 
-surya-ocr>=0.22
+surya-ocr==0.22
 Pillow>=10
+
+opencv-python-headless
+paddleocr
+paddlepaddle
+onnxruntime
+
+# ---- 可选：PDF 解析走「本地解析方案」（PyMuPDF + 本地小模型）----
+# 模型权重放在 backend/pdf_parser/local_parse_pipeline/models/（运行 download.sh 下载），
+# 依赖安装见 backend/pdf_parser/local_parse_pipeline/requirements.txt：
+#   pip install -r backend/pdf_parser/local_parse_pipeline/requirements.txt
+# 公式识别用 onnxruntime + tokenizers 跑量化 ONNX 权重
+# （models/texify-quantized-onnx），**不需要** texify / transformers。
+# 未安装时解析后端请保持 surya / unlimited_ocr。

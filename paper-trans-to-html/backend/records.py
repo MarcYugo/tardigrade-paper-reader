@@ -46,7 +46,10 @@ SHARE_PERMS = ("read", "write")        # 共享权限：只读 / 可写
 
 # 阅读状态跟着**人**走：论文所有者存在记录顶层（兼容老数据），
 # 被共享的人存在 `reading.<用户名>` 里，互不覆盖。
-READING_KEYS = ("last_page", "progress", "status", "last_read_at")
+# `last_pos` 是**精确的阅读位置**（`{pi, ratio}` = 第几页 + 页内比例，
+# `{pi:-1, fromBottom}` = 已经滚到文末 AI 面板），与 `last_page`（只记最远那一页）
+# 互补：老数据没有它时前端退回按页码定位。
+READING_KEYS = ("last_page", "progress", "status", "last_read_at", "last_pos")
 
 
 def owner_of(rec: dict) -> str:

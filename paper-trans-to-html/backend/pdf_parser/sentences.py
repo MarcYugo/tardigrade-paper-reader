@@ -3,9 +3,9 @@
 
 为什么需要（2026-09）
 --------------------
-`text_layer._merge_line_runs` 已经让「一行只有一个 run」，但**一行不是一句**；更要紧的是
-**块**本身被公式空位切碎了：同一段话横跨好几个块，而且两块的**行在同一视觉行上左右相接**。
-实测本样本第 2 页：
+`text_layer._merge_line_runs` 已经让「一行只剩几种颜色的正文 run」，但**一行不是一句**；
+更要紧的是**块**本身常被公式框/分栏切碎：同一段话横跨好几个块，而且两块的**行在
+同一视觉行上左右相接**。实测样本第 2 页：
 
     p1b45  In mathematics, the quadratic equation ▊ can be solved using the formula ▊
     p1b47  , where the discriminant ▊ determines the nature of the roots. …
@@ -16,9 +16,9 @@
 
 做法（五步，全是几何 + 字面，不猜语义）
 --------------------------------------
-1. **探针文本**（`_probe`）：把数学字形的字符换成**等长空格**。公式字形里也可能有
-   `.`/`!`/`?`，不换掉就会被当成句末；换成等长空格则**偏移与真实行文本一一对应**
-   （落到块里的还是真文本）。
+1. **探针文本**（`_probe`）：把数学字形的字符与**公式占位 run** 换成空格
+   （占位本来就是「一个空格 + 原宽」，所以偏移与真实行文本一一对应；落到块里的
+   还是真文本）。公式字形里也可能有 `.`/`!`/`?`，不换掉就会被当成句末。
 2. **行链**（`_cluster_rows` + `_corridors` + `_mark_groups`）：同一视觉行上横向相接
    （≤ `_CHAIN_TOL`）的片段属于同一段 —— 这就是被公式切碎的同一行。两栏之间那条
    **走廊**（同一个 x 带在 ≥ `_CORRIDOR_MIN_ROWS` 行上都是空的）不算相接，免得把
@@ -30,19 +30,17 @@
 4. **切句**（`split_sentences`）：在流文本上找句末标点，口径与前端
    `reader2.splitSentences` 对齐（另加「小数点 `1.1` 不切」与中文 `。！？`）。
 5. **落块**：每个句子一个块；端点落在行内部时按逐字符几何（`text_layer` 的 `_CHAR_X`）
-   把行**拆成两段** —— 拆点精确落在字符边界上，连 run 的 `x0/x1` 都跟着重算，所以
-   `math_font._line_gap_widths`（公式空位原宽）算出来还是原值。
+   把行**拆成两段** —— 拆点精确落在字符边界上，run 的几何也跟着重算。
 
 不变式（下游全都要靠）
 --------------------
-* **必须排在 `_blank_math_spans` 之前**（调用点见 `backend_pymupdf._local_page`）：
-  擦除与 `slots` 都按**当时的**块/行结构算字符偏移，而重切
-  只改「分组」不改「字符」 ⇒ 排在前面就不用做任何偏移重映射。
-* **一个字都不增删**：只重新分组、拆行；块文本由 `_join_lines` 重算（与原来逐字一致 ——
-  块文本本来就是「行文本 strip 后拼接」）。
-* **整行都是公式字形的行不参与切句**（`blank` 的片段）：
+* **必须在公式占位/补间距定稿之后、`_strip_font_keys` 之前跑**（调用点见
+  `backend_pymupdf._local_text_blocks`）：占位与补空格都会改变字符数，而重切只改
+  「分组」不改「字符」 ⇒ 排在后面就不用做任何偏移重映射。
+* **一个字都不增删**：只重新分组、拆行；块文本由 `_join_lines` 重算。
+* **整行都是公式占位的行不参与切句**（`blank` 的片段）：
   * 它所在的块**还有正文** → 这些行作为**乘客**挂到邻近的句子单元上（几何不能丢：
-    `_absorb_orphan_gaps` 要吸收它）；
+    前端要靠 `.rngap` 定位公式覆盖层）；
   * 它所在的块**整块都是这种行** → **原样保留**，不重切（免得凭空造出一个空壳块）。
 * **块 id**：没被拆、没被合的块**沿用原 id**（笔记/高亮按 `"<块 id>#<句号>"` 存），
   其余用 `p{页}s{序号}`。重切必然让「被切碎过的那几块」的笔记锚点失效（前端会显示
@@ -59,7 +57,7 @@ from .text_layer import _CHAR_X, _is_math_run, _join_lines, _union_line_rect
 
 
 # 同一视觉行的两段算不算「同一行的左右两半」：横向接边容差(pt)。
-# 实测同一行的两半只隔 1.2pt（公式被擦掉之后）；两栏之间最小的栏间距 ≈ 9.9pt ——
+# 实测同一行的两半只隔 1.2pt（公式占位之后）；两栏之间最小的栏间距 ≈ 9.9pt ——
 # 靠 `_corridors` 把栏间空档排除掉之后，这里可以放宽到「一个长词」。
 _CHAIN_TOL = 16.0
 # 「中间只夹着公式字形」的两段（`In mathematics, … ▊ can be solved …`）：那段公式可以很宽
@@ -105,7 +103,7 @@ def split_sentences(text: str) -> list[tuple[int, int]]:
       * **中文句末**：`。！？`（含全角句点 `．`）一律断句。
 
     ⚠️ 区间必须**铺满整段**（尾部空白归前一句）：不然那条尾巴既不属于上一句也不属于
-    下一句，拆出来的两段会各自少一截（同一个坑见前端函数注释）。
+    下一句，拆出来的两段会各自少一截。
     """
     n, ends, i = len(text), [], 0
     while i < n:
@@ -161,7 +159,10 @@ def _runs_text(ln: dict) -> str:
 
 
 def _probe(ln: dict, cm_on: bool, weak_on: bool) -> str:
-    """行文本的「句子判读版」：数学字形换成**等长空格**（长度不变 ⇒ 偏移一一对应）。"""
+    """行文本的「句子判读版」：数学字形换成**等长空格**（长度不变 ⇒ 偏移一一对应）。
+
+    公式占位 run(`run.gap`) 本身就是「一个空格 + 原宽」，正好落在这条口径里。
+    """
     out = []
     for r in ln.get("runs") or []:
         t = r.get("t") or ""
@@ -178,6 +179,10 @@ def _fragments(texts: list[dict], cm_on: bool, weak_on: bool) -> list[dict]:
         if blk.get("kind") == "formula" and blk.get("latex"):
             continue                       # 已带 LaTeX 的公式块：不重切（见模块文档）
         for li, ln in enumerate(blk.get("lines") or []):
+            if ln.get("rot"):
+                # 旋转（竖排/倒排）行：bbox 是「窄而高」的竖条，横向相接/分栏/纵向
+                # 续句那些判据全不成立，进流只会被切碎（见 `cut_blocks_by_sentence`）。
+                continue
             probe = _probe(ln, cm_on, weak_on)
             frags.append({
                 "bi": bi, "li": li, "ln": ln, "text": _runs_text(ln), "probe": probe,
@@ -218,7 +223,7 @@ def _cluster_rows(frags: list[dict]) -> list[list[dict]]:
 
 
 def _union_spans(row: list[dict]) -> list[tuple[float, float]]:
-    """一行里所有片段（含公式字形行）x 区间的**并**（相接/重叠的合并掉）。"""
+    """一行里所有片段（含公式占位行）x 区间的**并**（相接/重叠的合并掉）。"""
     spans: list[list[float]] = []
     for f in row:
         lo, hi = f["x"], f["x"] + f["w"]
@@ -237,8 +242,8 @@ def _corridors(rows: list[list[dict]]) -> list[tuple[float, float]]:
     一模一样（实测后者只隔 1.2~8.6pt）。区别在：栏间空档**每行都落在同一个 x 上**，
     而被公式切开的空档每行都在不同位置 —— 数「同一 x 带上出现了几行」就能分开。
 
-    ⚠️ 空档要按**所有**片段的并集算（公式字形行也算）：被公式切开的那一行，那段空档
-    其实被公式字形占着（只是它们马上就要被擦掉），不该当成栏间距。
+    ⚠️ 空档要按**所有**片段的并集算（公式占位行也算）：被公式切开的那一行，那段空档
+    其实被公式占着，不该当成栏间距。
     """
     bands: list[tuple[float, float, int]] = []
     for ri, row in enumerate(rows):
@@ -266,12 +271,27 @@ def _vetoed(corridors: list[tuple[float, float]], lo: float, hi: float) -> bool:
     return False
 
 
+def _same_column(f: dict, g: dict,
+                 corridors: list[tuple[float, float]]) -> bool:
+    """两段在不在**同一栏**：x 区间相交，或两者之间的横带没有跨过分栏走廊。
+
+    「整行公式占位」常与所属正文**首行/末行**同栏却 x 不重叠（缩进、短行、公式在
+    行尾），所以不能只要求 x 相交；但只要中间跨了 `_corridors()` 认出的栏间空档，
+    就一定是另一栏 —— 这条挡住「右栏的公式行被挂到左栏句子」。
+    """
+    f1, g1 = f["x"] + f["w"], g["x"] + g["w"]
+    if min(f1, g1) - max(f["x"], g["x"]) > 0:
+        return True
+    lo, hi = (f1, g["x"]) if f["x"] < g["x"] else (g1, f["x"])
+    return not _vetoed(corridors, lo, hi)
+
+
 def _mark_groups(texts: list[dict], rows: list[list[dict]],
                  corridors: list[tuple[float, float]]) -> dict[int, list[int]]:
     """行链：把块并成「组」，并写回每个片段的 `gid`（= 组的块下标，并查集根）。
 
-    返回 `{组: [块下标, …]}`（`_mark_groups` 只连「有正文」的片段，所以整块都是公式
-    字形的块不会跟别的块并到一起）。
+    返回 `{组: [块下标, …]}`（只连「有正文」的片段，所以整块都是公式占位的块不会
+    跟别的块并到一起）。
     """
     parent = list(range(len(texts or [])))
 
@@ -286,14 +306,14 @@ def _mark_groups(texts: list[dict], rows: list[list[dict]],
         blanks_between = False
         for b in row:
             if b["blank"]:
-                blanks_between = True          # 夹在中间的是公式字形（马上就要擦成空格）
+                blanks_between = True          # 夹在中间的是公式占位（一段空格）
                 continue
             if prev is None:
                 prev = b
                 continue
             lo, hi = prev["x"] + prev["w"], b["x"]
             gap = hi - lo
-            # 两种「同一行的左右两半」：紧挨着(≤ `_CHAIN_TOL`)，或中间只夹着公式字形
+            # 两种「同一行的左右两半」：紧挨着(≤ `_CHAIN_TOL`)，或中间只夹着公式占位
             ok = blanks_between and gap <= _BLANK_GAP_TOL or gap <= _CHAIN_TOL
             if (ok and prev["bi"] != b["bi"] and not _EQNUM.match(b["text"].strip())
                     and not _vetoed(corridors, lo, hi)):
@@ -354,9 +374,7 @@ def _flow_chains(groups: list[dict]) -> list[list[dict]]:
 
       * 下组的**首行**在上组**末行**之下，且纵向间距 ≤ `_VGAP_MAX`；
       * 两组的**左边距**差 ≤ `_XLEFT_TOL` —— 同一栏的正文都从同一条左边距起排；
-        双栏页里右栏的左边距差着 176pt（实测），这一条就把跨栏的路堵死了 ——
-        「末行/首行」这两行的 x 区间常常并不重叠（末行可能只剩一段公式空位、
-        首行可能只剩一个逗号），拿它们判「同不同栏」在双栏页上会误判；
+        双栏页里右栏的左边距差着 176pt（实测），这一条就把跨栏的路堵死了；
       * 两组的 x 区间有交集（粗判，两道保险都留着）；
       * 字面证据（`_continues`）：上面还没写完 + 下面接着写。
     """
@@ -415,7 +433,7 @@ def _flow_text(chain: list[dict]) -> tuple[str, list[dict]]:
     """把一条流拼成**探针文本**；返回 `(文本, [{fr, s, e}, …])`。
 
     * 行内相邻片段：横向**相接**（≤ `_FRAG_GAP`）就直接接上 —— 它们本来就是同一行的
-      左右两半（中间那段空白稍后由 `_absorb_orphan_gaps` 补）；隔得远则补一个虚拟分隔；
+      左右两半；隔得远则补一个虚拟分隔；
     * 换行：一律补一个虚拟分隔 —— 探针只需要「这里有个空白」这个事实。
 
     虚拟分隔只是探针里的一个空格，**不进任何行的文本**：下游按偏移取到的仍是真实文本。
@@ -441,7 +459,7 @@ def _flow_text(chain: list[dict]) -> tuple[str, list[dict]]:
 #  落块：按句子切、必要时拆行
 # =====================================================================
 def _slice_runs(runs: list[dict], a: int, b: int) -> list[dict]:
-    """按字符区间 `[a, b)` 切 runs（样式跟着走）。"""
+    """按字符区间 `[a, b)` 切 runs（样式与 `gap`/`gw` 占位属性跟着走）。"""
     out: list[dict] = []
     p = 0
     for r in runs:
@@ -456,9 +474,8 @@ def _slice_runs(runs: list[dict], a: int, b: int) -> list[dict]:
 def _retag_run_geo(piece: dict) -> None:
     """拆行之后把每个 run 的几何(`x0`/`x1`)按**字符边界**重算。
 
-    `math_font._line_gap_widths` 用「行框宽 − 保留正文宽」反推公式空位的原宽，保留宽
-    是逐 run 累加的 —— 不重算的话，拆出来的两段都会拿整行的宽度去算，空位宽就错了
-    （公式后面的正文会整体错位）。
+    公式占位 run 的 `gw`（下发给前端的原宽）不在这里改：占位是一个字符，
+    拆行只会把它整个分给某一句，宽度不变。
     """
     cx = piece.get(_CHAR_X)
     if not cx:
@@ -477,8 +494,9 @@ def _slice_line(ln: dict, a: int, b: int) -> dict:
     n = sum(len(r.get("t") or "") for r in ln.get("runs") or [])
     piece = {"y": ln.get("y"), "h": ln.get("h"),
              "runs": _slice_runs(ln.get("runs") or [], a, b)}
-    if ln.get("s") is not None:
-        piece["s"] = ln["s"]
+    for key in ("s", "base"):                  # `base` = 前端按基线定位要用的
+        if ln.get(key) is not None:
+            piece[key] = ln[key]
     cx = ln.get(_CHAR_X)
     if cx and len(cx) == n + 1:
         left = float(ln.get("x") or 0.0) if a == 0 else float(cx[a])
@@ -488,8 +506,8 @@ def _slice_line(ln: dict, a: int, b: int) -> dict:
         piece["w"] = max(1.0, right - left)
         piece[_CHAR_X] = [float(v) for v in cx[a:b + 1]]
     else:
-        # 没有逐字符几何（非 PyMuPDF 路径 / 抽不到 chars）→ 按字符数比例估：只有
-        # 「句子端点正好落在这一行内部」时才会差一点宽度。
+        # 没有逐字符几何 → 按字符数比例估：只有「句子端点正好落在这一行内部」时
+        # 才会差一点宽度。
         x0, w = float(ln.get("x") or 0.0), float(ln.get("w") or 0.0)
         piece["x"] = x0 + w * a / max(1, n)
         piece["w"] = max(1.0, w * (b - a) / max(1, n))
@@ -500,11 +518,20 @@ def _slice_line(ln: dict, a: int, b: int) -> dict:
 def cut_blocks_by_sentence(texts: list[dict]) -> tuple[list[dict], dict]:
     """一页的文字块 → 按句子重切成「一句话一块」；返回 `(新块列表, 统计)`。
 
-    调用点见 `backend_pymupdf._local_page`（**必须在 `_blank_math_spans` 之前**）。
+    调用点见 `backend_pymupdf._local_text_blocks`（**必须在公式占位/补间距定稿之后**）。
     不修改传入的块/行对象（只在「整块原样」时沿用原对象），返回新列表。
     """
     stats = {"sentence_units": 0, "sentence_merged": 0,
              "sentence_line_splits": 0, "sentence_tail_units": 0}
+    # 旋转行（竖排页边水印等）：**整行一块原样保留**，不进句子的流。
+    # 它们的 bbox 是「窄而高」的竖条（实测 arXiv 侧边章 26.68 × 358.86pt），横向
+    # 相接/分栏/纵向续句那些判据全不成立 —— 实测会被句号切成两块、宽度还被
+    # `_slice_line` 的 `max(1.0, …)` clamp 成 1pt。
+    vert: dict[int, list[dict]] = {}
+    for bi, blk in enumerate(texts or []):
+        for ln in blk.get("lines") or []:
+            if ln.get("rot"):
+                vert.setdefault(bi, []).append(ln)
     frags = _fragments(texts, *_math_font_flags(texts)) if texts else []
     if not frags or not any(not f["blank"] for f in frags):
         return texts, stats                   # 没有文字 / 整页没有正文行：原样返回
@@ -518,7 +545,7 @@ def cut_blocks_by_sentence(texts: list[dict]) -> tuple[list[dict], dict]:
         grows = _cluster_rows(gf)
         solid = [r for r in grows if _row_head(r)]
         if not solid:
-            continue                          # 整组都是公式字形行 → 整块原样保留
+            continue                          # 整组都是公式占位行 → 整块原样保留
         groups.append({"rows": grows, "frags": gf,
                        "head_row": solid[0], "tail_row": solid[-1]})
     groups.sort(key=lambda g: min(f["y"] for f in g["frags"]))
@@ -555,10 +582,17 @@ def cut_blocks_by_sentence(texts: list[dict]) -> tuple[list[dict], dict]:
             for sp in spans:
                 owner.setdefault(id(sp["fr"]), len(units) - 1)
 
-    # ---- 乘客：**有正文的块**里那些「整行都是公式字形」的行 ----
-    # 几何不能丢：`_absorb_orphan_gaps` 要吸收它。
+    # ---- 乘客：**有正文的块**里那些「整行都是公式占位」的行 ----
+    # 几何不能丢：前端要靠 `.rngap` 定位公式覆盖层。
     # 整块都是这种行的块不进 `blocks_used` → 下面按原样保留（不会被拆散）。
+    # 归属判据（2026-10 修「不同行/不同列的公式被算进一句」）：
+    #   ① **同原块**优先 —— PyMuPDF 把这些行和正文放在同一个 block 里，本来是一体的；
+    #   ② 否则必须**同栏**（`_same_column`：跨分栏走廊一律拒绝）；
+    #   ③ 再按纵向距离、横向重叠度取最近 —— `above` **不再**无条件压过 `below`
+    #      （旧逻辑让公式总和「上面最近的那句」粘在一起，跨段落也算）；
+    #   ④ 找不到同栏候选 → 进 `orphans` 单独成块，绝不跨栏硬挂（几何不丢）。
     solid_blocks = {b for u in units for b in u["src"]}
+    orphans: list[dict] = []
     for f in frags:
         if not f["blank"] or f["bi"] not in solid_blocks:
             continue
@@ -573,11 +607,17 @@ def cut_blocks_by_sentence(texts: list[dict]) -> tuple[list[dict], dict]:
             below = f["y"] + f["h"] <= g["y"] + 0.5 * g["h"]
             if not (above or below):
                 continue
+            same_bi = g["bi"] == f["bi"]
+            ov = min(f["x"] + f["w"], g["x"] + g["w"]) - max(f["x"], g["x"])
+            if not same_bi and not _same_column(f, g, corridors):
+                continue                               # 另一栏：不参与
             d = (f["y"] - (g["y"] + g["h"])) if above else (g["y"] - (f["y"] + f["h"]))
-            score = (0 if above else 1, abs(d))        # 优先挂到「上面最近的那句」
+            score = (0 if same_bi else 1, 0 if ov > 0 else 1, abs(d), -ov)
             if best is None or score < best[0]:
                 best = (score, ui)
-        if best is not None:
+        if best is None:
+            orphans.append(f)                          # 兜底：单独成块（几何不丢）
+        else:
             units[best[1]].setdefault("extra", []).append(f["ln"])
 
     # ---- 排版面：每个单元一块；「一块一单元、没拆没并」的沿用原 id ----
@@ -597,20 +637,42 @@ def cut_blocks_by_sentence(texts: list[dict]) -> tuple[list[dict], dict]:
         src = sorted(u["src"])
         blocks_used |= u["src"]
         bid = None
-        # ⚠️ 「原样」只看**正文行**（`body`）：乘客是马上要被擦成空壳的公式行，
-        # 挂在它下面不该让这个块丢掉原 id（笔记/高亮按 id 存）。
+        # ⚠️ 「原样」只看**正文行**（`body`）：乘客是公式占位行，挂在它下面不该让这个
+        # 块丢掉原 id（笔记/高亮按 id 存）。
         if len(src) == 1 and u["whole"]:
             old = texts[src[0]].get("lines") or []
             if (len(u["body"]) == len(old)
                     and all(a is b for a, b in zip(u["body"], old))):
                 bid = texts[src[0]].get("id")              # 原样：沿用旧 id
-        x0, y0, x1, y1 = _union_line_rect(u["lines"])
+        # 块框只按**正文行**量（`body`）：乘客行只是「几何锚点」，把它算进来会让
+        # 块矩形跨到另一栏/另一段（前端 `.blk.sel` 的 outline 就是这么跨栏的）。
+        x0, y0, x1, y1 = _union_line_rect(u["body"] or u["lines"])
         emitted.append(((src[0] if src else 0, u["seq"]),
                         {"id": bid, "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
                          "text": _join_lines(u["lines"]), "lines": u["lines"]}))
     for bi, blk in enumerate(texts):
         if bi not in blocks_used:
             emitted.append(((bi, -1), blk))                # 原样保留（见模块文档）
+    # 混排块（既有正文行又有旋转行）：旋转行已从句子的流里摘掉，这里补回来单独成块
+    # （整块都是旋转行的块不在这里处理 —— 上面「原样保留」已经带走了）。
+    for bi, lns in vert.items():
+        if bi not in blocks_used:
+            continue
+        for k, ln in enumerate(lns):
+            x0, y0, x1, y1 = _union_line_rect([ln])
+            emitted.append(((bi, 2_000_000 + k),
+                            {"id": None, "x": x0, "y": y0,
+                             "w": x1 - x0, "h": y1 - y0,
+                             "text": _join_lines([ln]), "lines": [ln],
+                             "vertical": True}))
+    # 没有同栏归属的整行公式占位：单独成块（否则这条行会从所有块里消失，
+    # 前端靠 `.rngap` 定位公式覆盖层就丢了）。
+    for oi, f in enumerate(orphans):
+        ln = f["ln"]
+        x0, y0, x1, y1 = _union_line_rect([ln])
+        emitted.append(((f["bi"], 1_000_000 + oi),
+                        {"id": None, "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
+                         "text": _join_lines([ln]), "lines": [ln]}))
     emitted.sort(key=lambda kv: kv[0])
     fresh = 0
     for _key, blk in emitted:

@@ -98,6 +98,47 @@ def cache_key(text: str, lang=None) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+# ---------------- 块文本 → 「复制 / 翻译」用的文本（带公式） ----------------
+_WS = re.compile(r"\s+")
+
+
+def page_formula_copies(page: dict) -> dict[str, list[tuple[int, int, str]]]:
+    """`page["formula_boxes"]` → `{块id: [(start, end, latex), ...]}`。
+
+    `formula_box["copy"]` 是解析侧记下的「这个公式占位落在哪个块的哪个字符区间」，
+    坐标按块 canonical（含行末 `\\n`）计字符数。
+    """
+    out: dict[str, list[tuple[int, int, str]]] = {}
+    for meta in page.get("formula_boxes") or []:
+        latex = str(meta.get("latex") or "").strip()
+        if not latex:
+            continue
+        for c in meta.get("copy") or []:
+            bid = c.get("id")
+            try:
+                a, b = int(c.get("start")), int(c.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if bid and b > a:
+                out.setdefault(str(bid), []).append((a, b, latex))
+    return out
+
+
+def block_copy_text(text: str, copies: list[tuple[int, int, str]] | None = None) -> str:
+    """块文本 → **「复制」和「送翻译」用的同一份文本**：公式占位换成 `$latex$`，
+    所有空白压成一个空格。
+
+    ⚠️ 与前端 `reader2.js` 的 `copyRangeText` / `itemCopyText` 必须**同口径**：
+    译文缓存的键就是这段文本的 sha1，两边算法不一致的话，每次进页面都会判定成
+    “这段没翻译过”，白白重复计费。
+    """
+    t = text or ""
+    for start, end, latex in sorted(copies or [], key=lambda c: -c[0]):
+        if 0 <= start < end <= len(t):
+            t = f"{t[:start]}${latex}${t[end:]}"
+    return _WS.sub(" ", t).strip()
+
+
 def _ratio(pat: re.Pattern, text: str) -> float:
     return len(pat.findall(text)) / max(len(text), 1)
 
@@ -157,9 +198,12 @@ def translation_prompt(lang=None) -> str:
         "原文是什么语言你自己识别，不用问用户。\n"
         "规则：\n"
         "1. 忠实原文、术语准确、语句通顺，保持原有段落结构。\n"
-        "2. 数字、公式、LaTeX、变量名、引用标记、URL 等原样保留。\n"
+        "2. 数字、公式、LaTeX、变量名、引用标记、URL 等原样保留。"
+        "输入里的公式是形如 $...$ 的 LaTeX，译文必须在**对应位置**原样带出同样的 "
+        "$...$ 公式（不要翻译、不要省略、不要改写成中文文字或纯符号）。\n"
         f"3. 段落若已经是{target}，原样返回，不要改写、也不要另作翻译。\n"
         "4. 只做翻译，不要添加解释或额外说明。\n"
+        "5. 每个输入段落输出**一个连续段落**：不要在句与句之间插入空行或换行。\n"
         "用户会发送一个 JSON 对象：{\"texts\": [\"段落1\", \"段落2\", ...]}。\n"
         "请返回一个 JSON 对象：{\"translations\": [\"译文1\", \"译文2\", ...]}，"
         "数量与顺序必须与输入一一对应。只输出 JSON。"

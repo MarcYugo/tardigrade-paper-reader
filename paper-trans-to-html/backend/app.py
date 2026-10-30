@@ -31,9 +31,10 @@ from .ai_read import (article_text, build_summary, clean_notes, clean_summary,
 from .db import StorageUnavailable, mongo
 from .storage import build as build_storage
 from .storage import rebuild as rebuild_storage
-from .translate import (TranslationUnavailable, Translator, cache_key,
-                        extract_outline, is_target_language, needs_translation,
-                        normalize_lang, probe_llm, resolve_lang)
+from .translate import (TranslationUnavailable, Translator, block_copy_text,
+                        cache_key, extract_outline, is_target_language,
+                        needs_translation, normalize_lang, page_formula_copies,
+                        probe_llm, resolve_lang)
 
 log = logging.getLogger("uvicorn.error")
 
@@ -147,6 +148,7 @@ _PUBLIC_EXACT = {           # 无需登录即可访问
     "/api/auth/register",      # 未登录白助注册（受 ALLOW_SIGNUP 控制）
 }
 _PUBLIC_PREFIX = ("/css/", "/js/", "/assets/", "/img/",
+                  "/logo/",       # 品牌图标(登录页/顶栏都要在未登录状态取到)
                   "/vendor/")     # 登录页要用的静态资源；vendor 是内置的 KaTeX(js/css/字体)
                                   # 放行可避免「未带 Cookie 取字体被 302 掉」这类隐性故障
 
@@ -703,6 +705,32 @@ def api_doc(request: Request, doc_id: str):
         raise HTTPException(404, "文档数据缺失") from exc
 
 
+@app.post("/api/doc/{doc_id}/title")
+def api_doc_title(request: Request, doc_id: str, payload: dict = Body(...)):
+    """重命名论文（阅读页顶栏的标题可以直接改）。
+
+    标题在库里存了**两份**，必须一起改，否则首页与阅读页会各显示一个名字：
+      · 记录（records）的 `title`：首页列表、共享信息、AI 整理的上下文都用它；
+      · 版式文档（doc.json）的 `title`：阅读页顶栏、分享弹窗的文案用它。
+    只动名字、不碰解析数据，所以不用走重解析流程；笔记/译文/进度都不受影响。
+    有「可写」权限就能改名（只读者不行），与原文件名的 `source` 字段无关。
+    """
+    _doc_access(request, doc_id, need="write")
+    title = " ".join(str(payload.get("title") or "").split())[:200].strip()
+    if not title:
+        raise HTTPException(400, "标题不能为空")
+    store.update_record(doc_id, title=title)
+    try:
+        doc = store.read_doc(doc_id)
+    except FileNotFoundError:
+        doc = None
+    if isinstance(doc, dict):
+        doc["title"] = title
+        store.save_doc(doc_id, doc)
+    log.info("论文改名：%s → %s", doc_id, title)
+    return {"ok": True, "title": title}
+
+
 @app.get("/api/doc/{doc_id}/refs")
 def api_doc_refs(request: Request, doc_id: str):
     """引用跳转：PDF 内部链接（正文引用标记 → 参考文献条目）算好的映射。
@@ -822,6 +850,8 @@ def api_get_progress(request: Request, doc_id: str):
     out["progress"] = float(out.get("progress") or 0)
     out["status"] = out.get("status") or "unread"
     out["last_page"] = int(out.get("last_page") or 0)
+    # 精确阅读位置（重进阅读器时还原到上次离开处）；老数据没有 → None，前端退回页码
+    out["last_pos"] = out.get("last_pos") if isinstance(out.get("last_pos"), dict) else None
     out["perm"] = perm
     out["owner"] = records.owner_of(rec)
     out["shared_count"] = len(records.shared_entries(rec))
@@ -841,6 +871,19 @@ def api_set_progress(request: Request, doc_id: str, payload: dict = Body(...)):
     st = payload.get("status")
     if st in ("unread", "reading", "done"):
         fields["status"] = st
+    # 精确阅读位置：`{pi, ratio}`（页下标 + 页内比例）或 `{pi:-1, fromBottom}`（文末 AI 面板）。
+    # 这是**覆盖写**（往回翻就记往回翻的位置），与只增不减的 progress / last_page 不同。
+    pos = payload.get("last_pos")
+    if isinstance(pos, dict):
+        clean: dict = {}
+        if isinstance(pos.get("pi"), (int, float)):
+            clean["pi"] = int(pos["pi"])
+        if isinstance(pos.get("ratio"), (int, float)):
+            clean["ratio"] = round(max(0.0, min(1.0, float(pos["ratio"]))), 5)
+        if isinstance(pos.get("fromBottom"), (int, float)):
+            clean["fromBottom"] = round(max(0.0, float(pos["fromBottom"])), 1)
+        if clean:
+            fields["last_pos"] = clean
     fields["last_read_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     updated = store.update_record(doc_id, **records.reading_patch(rec, user["username"], fields))
     return records.reading_of(updated or rec, user["username"])
@@ -1219,10 +1262,11 @@ def api_config(request: Request):
         "ready": tr.ready,
         "backend": tr.backend,
         "llm_owner": user["username"],
-        # PDF 解析后端：auto / detection_service_group（PyMuPDF 版式 + 图片/公式检测）
-        # / surya（整页 OCR：文字/公式/插图全用 Surya 数据）
-        # / unlimited_ocr（整页 OCR：文字/公式/表格/插图全用 Unlimited-OCR 数据）
-        # / pymupdf（纯本地）
+        # PDF 解析后端：
+        #   auto / pymupdf / detection_service_group → 本地解析方案
+        #     （PyMuPDF 版式 + texify 公式 + OXR 版面 / SLANet 表格，见 backend_pymupdf.py）
+        #   surya → 整页 OCR：文字/公式/插图全用 Surya 数据
+        #   unlimited_ocr → 整页 OCR：文字/公式/表格/插图全用 Unlimited-OCR 数据
         "parser": pdf_parser.status(CONFIG_FILE),
         # 数据存储后端：mongo(MongoDB) / json(本地文件回退)
         "storage": _storage_state(),
@@ -1332,8 +1376,12 @@ def api_zh_all(request: Request, doc_id: str):
     cache = store.get_translations(doc_id)
     result: dict[str, str] = {}
     for page in doc.get("pages", []):
+        copies = page_formula_copies(page)
         for blk in page.get("texts", []):
-            zh = cache.get(cache_key(blk.get("text", ""), lang))
+            # ⚠️ 必须用**带公式**的文本取键（前端送翻译的也是这份）：
+            # 用裸 `blk["text"]` 会对不上，每次进页面都当没翻译过。
+            text = block_copy_text(blk.get("text", ""), copies.get(str(blk.get("id"))))
+            zh = cache.get(cache_key(text, lang))
             if zh:
                 result[blk["id"]] = zh
     return result

@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+Pillow
+torch
+torchvision
+pymupdf
+opencv-python-headless
+# 公式识别（models/texify-quantized-onnx）：ONNX Runtime + tokenizers
+# 不再需要 texify / transformers 这两个第三方包
+onnxruntime
+tokenizers
+paddleocr
+paddlepaddle
+modelscope

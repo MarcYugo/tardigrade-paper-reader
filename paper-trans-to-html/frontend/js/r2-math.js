@@ -1,7 +1,7 @@
 /* ============ 公式渲染（KaTeX）：从 reader2.js 拆出来的独立模块 ============
    这块代码原来是 reader2.js 里的连续一段，**按原样搬过来**（缩进都没动，方便对照），
-   只有一处改动：原来直接读外层闭包的 `DOC`，现在改成 `env.DOC`
-   —— 换论文时 DOC 会整体替换，必须每次用的时候取最新值，不能在装配时抓一次快照。
+   只有一处改动：原来直接读外层闭包的 `DOC`，现在通过 `env` 取（旧渲染路径需要；
+   本地 PyMuPDF 路径移除后，实际只用到 `env.findItem`）。
 
    装配（reader2.js 底部）：
      const { renderInlineMath, … } = R2Math({ docId, findItem, itemById,
@@ -9,16 +9,21 @@
    入参只放**跨模块共享**的东西，其余（KATEX_* 常量、_katexP/_katexReady、
    KATEX_EM、各种缓存）都跟着本文件走，不再污染 reader2.js 的作用域。
 
-   对外接口在文件末尾的 return（原 17 项 + 页面公式框 2 项）——
-   其中 _katexReady 是 let（加载完会置 true），不能按值导出，故给的是 katexReady()；
-   `buildFormulaBoxes` / `finalizeFormulaBoxes` 是 **detection-service-group 公式框覆盖层**
-   （解析侧下发 `pages[].formula_boxes`，按 `bbox_norm × 页面显示宽高` 定位，
-   KaTeX 渲染失败时用框内裁图（base64）兜底，
-   见 `backend/pdf_parser/backend_detection_service_group.py`）。
+   对外接口在文件末尾的 return —— 其中 _katexReady 是 let（加载完会置 true），
+   不能按值导出，故给的是 katexReady()。
+
+   当前三套渲染共用本模块：
+     · 本地解析方案：`buildFormulaBoxes` + `finalizeFormulaBoxes` 按页面级
+       `pages[].formula_boxes` 渲染 `.fbox`（KaTeX，失败时用解析侧裁图兜底）；
+     · Surya / Unlimited-OCR：`mathBlockOf` + `finalizeDisplayMath` 渲染独立公式块，
+       块内行内公式由 reader2.js 的 suryaInlineMath / ulInlineMath 就地换 KaTeX；
+     · 通用：`renderInlineMath` 把文本里的 `\\(…\\)` / `$…$` 就地换 KaTeX。
+   `inlineMathOf` / `finalizeInlineMath` 是早期「行内公式覆盖层」的兼容接口，
+   本地方案不再使用（公式统一由页面级 `.fbox` 绘制）。
    ============================================================================ */
 window.R2Math = function (env) {
   "use strict";
-  const { docId, findItem, itemById, fitItemLines } = env;   // 这三个都是稳定引用，装配时取一次即可
+  const { findItem, docId } = env;   // 稳定引用，装配时取一次即可（DOC 要用 getter）
 
   const KATEX_JS = "vendor/katex/katex.min.js";
   const KATEX_CSS = "vendor/katex/katex.min.css";
@@ -66,11 +71,12 @@ window.R2Math = function (env) {
     }).filter(Boolean);
     return Promise.all(jobs).catch(() => {});
   }
-  /* 文档里有没有需要数学排版的东西：detection-service-group 公式框、独立公式(latex)、
-     Surya 块的行内数学区间/表格 <math>，或文本里的数学定界符。 */
+  /* 文档里有没有需要数学排版的东西：独立公式(latex)、Surya 块的行内数学区间/
+     表格 <math>，或文本里的数学定界符。 */
   function docNeedsMath(doc) {
     for (const pg of ((doc && doc.pages) || [])) {
-      if ((pg.formula_boxes || []).length) return true;   // 页面公式框覆盖层
+      // 本地解析方案：页面级公式框（LaTeX + 裁图）
+      if ((pg.formula_boxes || []).some(b => b && b.latex)) return true;
       for (const t of (pg.texts || [])) {
         if (t.latex) return true;                         // 公式块（含 Surya kind="formula"）
         if (t.math && t.math.length) return true;         // Surya 块：解析侧标好的行内区间
@@ -84,9 +90,13 @@ window.R2Math = function (env) {
     return false;
   }
   /* 行内数学：把文本里的 `\(…\)` / `$$…$$` 原地换成一个 KaTeX 元素。
-     KaTeX 是同步的，所以直接扫文本节点、就地替换即可，不用排队也不用重排。 */
-  function renderInlineMath(el) {
+     KaTeX 是同步的，所以直接扫文本节点、就地替换即可，不用排队也不用重排。
+     `opt.loose`：**译文卡专用** —— 那里的 `$…$` 是我们让模型按 `$latex$` 输出的，
+     不再走「必须像数学」那条防货币启发式，否则 `$O(n/k)$`、`$k=n$` 这种不含
+     `\ _ ^ { }` 的公式会原样留在卡片里（同一张卡里有的渲染、有的不渲染）。 */
+  function renderInlineMath(el, opt) {
     if (!_katexReady || !el) return;
+    const loose = !!(opt && opt.loose);
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
     const jobs = [];
     let node;
@@ -100,7 +110,7 @@ window.R2Math = function (env) {
       // 保持原样显示（普通正文里没有这两个类，行为不变）。
       if (tn.parentNode && tn.parentNode.closest
           && tn.parentNode.closest(".mathbox, .katex, .md code, .md pre")) continue;
-      const parts = _splitInlineMath(tn.nodeValue || "");
+      const parts = _splitInlineMath(tn.nodeValue || "", loose);
       // ⚠️ 不能只按长度判断：**整段就是一个公式**时 parts 只有一个元素(而且是个对象)，
       // 那也是要渲染的 —— 注入出来的 `\(…\)` 常常单独占一个 run(样式与前后文不同，
       // 合并不了)，按长度跳过就会把 `\(T^t\)` 原样显示成一串反斜杠。
@@ -124,14 +134,15 @@ window.R2Math = function (env) {
   }
   /* 按定界符切成 ['文字', {latex,raw}, '文字', …]。
      支持 `\(…\)`、`$$…$$`，以及 **单 `$…$`**（OCR 出来的文本里常见这种写法）。
-     单 `$` 容易和货币符号撞车，所以额外要求内容「像数学」：首尾不接空格、
-     且含 \ _ ^ { } 中的一个，否则不当公式处理（原样留作文字）。 */
-  function _splitInlineMath(s) {
+     单 `$` 容易和货币符号撞车，所以正文里额外要求内容「像数学」：首尾不接空格、
+     且含 \ _ ^ { } 中的一个，否则不当公式处理（原样留作文字）；
+     `loose`（译文卡）只保留「首尾不接空格」这一条。 */
+  function _splitInlineMath(s, loose) {
     const re = /\\\(([^]*?)\\\)|\$\$([^]*?)\$\$|\$([^$\n]{1,120}?)\$/g;
     const out = []; let last = 0, m;
     while ((m = re.exec(s))) {
       let latex = (m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3]));
-      if (m[3] != null && (/^\s|\s$/.test(latex) || !/[\\_^{}]/.test(latex))) continue;
+      if (m[3] != null && (/^\s|\s$/.test(latex) || (!loose && !/[\\_^{}]/.test(latex)))) continue;
       if (m.index > last) out.push(s.slice(last, m.index));
       out.push({ latex: latex.trim(), raw: m[0] });
       last = m.index + m[0].length;
@@ -141,185 +152,126 @@ window.R2Math = function (env) {
     return out;
   }
 
-  /* ============ 行内公式：用 Surya 的 <math> LaTeX 渲染 ============
-     正文里的行内数学在数据里是一堆碎片化的字形 run，而且常被切成**同一 y 的多段**
-     （PyMuPDF 把上下标当成独立行），渲染出来会互相压在一起。
-     Surya 的块 HTML 里本来就有正确的 LaTeX（`<math>close_{t,s}</math>`），
-     这里把它对齐回块内的**字符区间**（canonical 偏移），在那个位置覆盖一个 KaTeX，
-     原字形改成透明色（保留盒子与底色，选中/高亮仍可见）。
-     对齐不可靠就**整块放弃**，保持原字形 —— 宁可不变，不可切错。 */
-  const _LIG = { "\ufb02": "fl", "\ufb01": "fi", "\ufb00": "ff", "\ufb03": "ffi",
-                 "\ufb04": "ffl", "\ufb05": "st", "\ufb06": "st" };
-  const _DASH = { "\u2212": "-", "\u2013": "-", "\u2014": "-", "\u2010": "-", "\u2011": "-" };
-  const _QUOT = { "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u00a0": " " };
+  /* ---------- 译文卡里的“裸 LaTeX”兜底渲染 ----------
+     译文由模型生成，**不一定**按约定把公式包进 `$…$`（实测常见：直接写
+     `ax^2 + bx + c = 0`、`\Delta > 0`、`\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}`），
+     历史缓存里的译文更是如此。这类裸片段若不做处理，卡片里就是一串反斜杠源码。
+     这里**不做“猜哪里是公式”**（那会把正文词汇吃成公式），而是拿**已知公式**去匹配：
+     `list` 就是对应原文块解析侧下发的 `item.inlineMath[].latex`（与正文里渲染的完全同一串）。
+     空白差异（多/少/没有空格）容忍，其余字符逐个字面匹配；命中才换 KaTeX，
+     渲染失败保留原文 —— 宁可漏渲染，也不改错文字。 */
 
-  /* 文本规整：连字/破折号/引号归一、空白并成一个空格、断行连字符（连字符+换行）丢掉。
-     返回 {s, idx}，idx[i] 是规整串第 i 个字符在原串里的下标。 */
-  function _normText(str) {
-    const out = [], idx = [];
-    let i = 0;
-    while (i < str.length) {
-      const c = str[i];
-      if (c === "-" && i + 1 < str.length && /[ \t\r\n]/.test(str[i + 1])) {
-        i++;                                                  // 断行连字符：连字符+换行一起丢
-        while (i < str.length && /[ \t\r\n]/.test(str[i])) i++;
+  /* latex → 正则片段：空白折叠成 `\s*`，其余按字面转义 */
+  function _latexToRe(latex) {
+    let out = "";
+    for (const ch of String(latex)) {
+      if (/\s/.test(ch)) {
+        if (!out.endsWith("\\s*")) out += "\\s*";     // 连续空白的合并成一个
         continue;
       }
-      const exp = _LIG[c];
-      if (exp) { for (const e of exp) { out.push(e); idx.push(i); } i++; continue; }
-      const ch = _DASH[c] || _QUOT[c] || c;
-      if (/\s/.test(ch)) {
-        let j = i;
-        while (j < str.length && /\s/.test(str[j])) j++;
-        out.push(" "); idx.push(i); i = j; continue;
-      }
-      out.push(ch); idx.push(i); i++;
+      out += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");   // `^ _ { } \ + ( )` 等全部字面化
     }
-    return { s: out.join(""), idx };
+    return out;
   }
-  /* LaTeX 的“纯文本形态”，用于和切出来的原字形比对 */
+
+  function renderKnownLatex(el, list) {
+    if (!_katexReady || !el || !list || !list.length) return;
+    const pats = [];
+    const seen = new Set();
+    for (const raw of list) {
+      const latex = String(raw == null ? "" : raw).trim();
+      if (latex.length < 2 || seen.has(latex)) continue;   // 单个字符太容易误命中
+      seen.add(latex);
+      const body = _latexToRe(latex);
+      if (!body) continue;
+      pats.push({ latex, re: new RegExp(body, "g") });
+    }
+    if (!pats.length) return;
+    // 长公式优先：`\Delta > 0` 是 `\Delta > 0.5` 的前缀时，别让短的先把长的切碎
+    pats.sort((a, b) => b.latex.length - a.latex.length);
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    const jobs = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      const s = node.nodeValue || "";
+      if (s.length < 2) continue;
+      // KaTeX 子树（含 MathML 的 annotation，里面就是 `\textstyle <latex>` 原文）、
+      // 独立公式盒、Markdown 代码块：一律不动，否则会把已渲染的公式再啃一遍。
+      if (node.parentNode && node.parentNode.closest
+          && node.parentNode.closest(".katex, .mathbox, .md code, .md pre")) continue;
+      jobs.push(node);
+    }
+    for (const tn of jobs) _replaceKnownLatex(tn, pats);
+  }
+
+  function _replaceKnownLatex(tn, pats) {
+    const src = tn.nodeValue || "";
+    const hits = [];
+    for (const p of pats) {
+      p.re.lastIndex = 0;
+      let m;
+      while ((m = p.re.exec(src))) {
+        if (p.re.lastIndex <= m.index) p.re.lastIndex = m.index + 1;   // 空匹配防死循环
+        if (!m[0].trim()) continue;
+        hits.push({ s: m.index, e: m.index + m[0].length, latex: p.latex });
+      }
+    }
+    if (!hits.length) return;
+    // 起点升序、同起点时长的优先；再去掉互相重叠的那些（取先到的）
+    hits.sort((a, b) => a.s - b.s || (b.e - b.s) - (a.e - a.s));
+    const pick = [];
+    let end = -1;
+    for (const h of hits) { if (h.s >= end) { pick.push(h); end = h.e; } }
+    const frag = document.createDocumentFragment();
+    let cur = 0;
+    for (const h of pick) {
+      if (h.s > cur) frag.appendChild(document.createTextNode(src.slice(cur, h.s)));
+      const span = document.createElement("span");
+      let ok = false;
+      try { ok = katexRender(span, h.latex, false); } catch (e) { ok = false; }
+      if (ok) frag.appendChild(span);
+      else frag.appendChild(document.createTextNode(src.slice(h.s, h.e)));   // 失败保持原文
+      cur = h.e;
+    }
+    if (cur < src.length) frag.appendChild(document.createTextNode(src.slice(cur)));
+    tn.parentNode.replaceChild(frag, tn);
+  }
+
+  /* ============ 行内公式的旧“HTML 对齐”路径（已停用） ============
+     这条路径把块 HTML 里的 <math> 对齐回 canonical 字符区间，供本地 PyMuPDF
+     逐行渲染使用；随本地解析链路一起移除。Surya / Unlimited-OCR 用的是解析侧
+     下发的精确字符区间（`t.math`，见 reader2.js 的 suryaMathRanges / ulMathRanges）。
+     下面保留函数名 / 签名（空壳），方便之后替换。 */
+  function _normText(str) {
+    return { s: "", idx: [] };
+  }
   function _plainMath(latex) {
-    return String(latex || "")
-      .replace(/\\[a-zA-Z]+/g, " ").replace(/\\[ ,;:!]/g, " ")
-      .replace(/[{}_^]/g, "").replace(/[^0-9a-zA-Z]/g, "").toLowerCase();
+    return "";
   }
   function _countChars(s) {
-    const m = new Map();
-    for (const ch of s) m.set(ch, (m.get(ch) || 0) + 1);
-    return m;
+    return new Map();
   }
-  /* 乱序字符多重集相似度：LaTeX 里上下标的先后与 PDF 字形顺序不一致，顺序比对不可用 */
   function _bagRatio(latex, seg) {
-    const a = _countChars(_plainMath(latex));
-    const b = _countChars(String(seg).replace(/[^0-9a-zA-Z]/g, "").toLowerCase());
-    let na = 0, nb = 0, inter = 0;
-    a.forEach(v => { na += v; });
-    b.forEach(v => { nb += v; });
-    a.forEach((v, k) => { if (b.has(k)) inter += Math.min(v, b.get(k)); });
-    return (na && nb) ? 2 * inter / (na + nb) : 0;
+    return 0;
   }
-  /* 把块 HTML 拆成 [文字, {latex}, …]；结构复杂（表格/多块）时返回 null */
   function _htmlMathParts(html) {
-    if (!html || html.indexOf("<math") < 0) return null;
-    if (/<(table|div|ul|ol|figure|tr|td|h[1-6])\b/i.test(html)) return null;
-    const body = html.replace(/^\s*<p[^>]*>/i, "").replace(/<\/p>\s*$/i, "");
-    if (!body) return null;
-    const parts = [];
-    const re = /<math[^>]*>([\s\S]*?)<\/math>/gi;
-    let pos = 0, m;
-    const txt = s => _unesc(s.replace(/<[^>]+>/g, ""));
-    while ((m = re.exec(body))) {
-      if (m.index > pos) parts.push(txt(body.slice(pos, m.index)));
-      parts.push({ latex: txt(m[1]).trim() });
-      pos = m.index + m[0].length;
-    }
-    if (pos < body.length) parts.push(txt(body.slice(pos)));
-    return parts.some(p => typeof p !== "string") ? parts : null;
-  }
-  function _unesc(s) {
-    return String(s).replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
-      .replace(/&#0?39;/g, "'").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&");
-  }
-
-  /* 在规整串里找一个文字段：整段命中优先；找不到就退而用它的**最长前缀**命中
-     （PDF 的行切分会在词中间插进碎片，例如 `formulaic` 被切成 `formu-`+`t`+`laic`，
-     整段就永远匹配不上）。返回 {at, end, partial} 或 null。 */
-  function _findLit(cn, lit, from) {
-    if (!lit) return null;
-    const j = cn.indexOf(lit, from);
-    if (j >= 0) return { at: j, end: j + lit.length };
-    const minLen = Math.min(8, lit.length);
-    for (let n = lit.length - 1; n >= minLen; n--) {
-      const jh = cn.indexOf(lit.slice(0, n), from);
-      if (jh >= 0) return { at: jh, end: jh + n, partial: true };
-    }
     return null;
   }
-  /* 消费一个文字段，返回新游标。部分命中时再把**剩余部分的最长后缀**找回来，
-     否则游标会停在词中间、后面的公式区间就会多圈进一段正文。 */
+  function _unesc(s) {
+    return "";
+  }
+  function _findLit(cn, lit, from) {
+    return null;
+  }
   function _consumeLit(cn, lit, from) {
-    const f = _findLit(cn, lit, from);
-    if (!f) return -1;
-    if (!f.partial) return f.end;
-    const tail = lit.slice(f.end - f.at);
-    let cur = f.end;
-    for (let m = tail.length; m >= 3; m--) {
-      const k = cn.indexOf(tail.slice(-m), cur);
-      if (k >= 0) { cur = k + m; break; }
-    }
-    return cur;
+    return -1;
   }
-
-  /* 把 [文字,{latex},…] 对齐到 canonical 的字符区间。
-     做法：逐个文字段在 canonical（规整后）里顺序定位，公式区间 = 前一段结束 → 后一段开始；
-     后一段是 `.` 这类极短锚点时，会命中公式内部的点（如 `...`），
-     所以取多个候选终点，挑第一个“字形与 LaTeX 足够像”的组合。 */
   function _alignInlineMath(canon, parts) {
-    const cn = _normText(canon);
-    const out = [];
-    let cur = 0;
-    for (let k = 0; k < parts.length; k++) {
-      const p = parts[k];
-      if (typeof p === "string") {
-        const lit = _normText(p).s.trim();
-        if (lit) {
-          cur = _consumeLit(cn.s, lit, cur);
-          if (cur < 0) return null;               // 锚点断链 → 整块放弃
-        }
-        continue;
-      }
-      const nxt = (typeof parts[k + 1] === "string") ? _normText(parts[k + 1]).s.trim() : "";
-      const ends = [];
-      if (nxt) {
-        let from = cur;
-        for (let t = 0; t < 8; t++) {
-          const f = _findLit(cn.s, nxt, from);
-          if (!f) break;
-          ends.push(f.at);
-          from = f.at + 1;
-        }
-      } else if (k + 1 >= parts.length) {
-        ends.push(cn.s.length);
-      }
-      if (!ends.length) return null;
-      const ml = _plainMath(p.latex).length;
-      let best = null;
-      for (const bN of ends) {
-        if (bN <= cur) continue;
-        const a = cn.idx[cur] !== undefined ? cn.idx[cur] : canon.length;
-        const b = cn.idx[bN] !== undefined ? cn.idx[bN] : canon.length;
-        const seg = canon.slice(a, b).trim();
-        const ls = (seg.match(/[0-9a-zA-Z]/g) || []).length;
-        if (!ls || ls > Math.max(6, ml * 2.5)) continue;
-        const r = _bagRatio(p.latex, seg);
-        if (r >= 0.85) {
-          // 去掉首尾空白：区间含空格的话，覆盖层会按“含空格的矩形”定位，
-          // 整条公式会左移一个空格宽、右边多出一截 → 与前后文字的间隔就不对了
-          const raw = canon.slice(a, b);
-          const lead = raw.length - raw.replace(/^\s+/, "").length;
-          const trail = raw.length - raw.replace(/\s+$/, "").length;
-          best = { a: a + lead, b: Math.max(a + lead + 1, b - trail), latex: p.latex, endNorm: bN, ratio: r };
-          break;
-        }
-      }
-      if (!best) return null;
-      out.push(best);
-      cur = best.endNorm;
-    }
-    return out.length ? out : null;
+    return null;
   }
-  /* 该块的行内公式区间（带缓存，同一块只算一次） */
-  const _inlineCache = new Map();
+  /* 该块的行内公式区间（旧数据兼容）—— 已停用，恒为 null。 */
   function inlineMathOf(t, canon) {
-    const key = docId + "#" + t.id;
-    if (_inlineCache.has(key)) return _inlineCache.get(key);
-    let res = null;
-    try {
-      const parts = _htmlMathParts(t.html);
-      if (parts) res = _alignInlineMath(canon, parts);
-    } catch (e) { res = null; }
-    _inlineCache.set(key, res);
-    return res;
+    return null;
   }
   /* x..y 这个子区间落在哪条行内公式里？返回序号，不在任何公式里返回 -1 */
   function _mathIdxAt(list, x, y) {
@@ -330,234 +282,42 @@ window.R2Math = function (env) {
     }
     return -1;
   }
-  /* 这个片段是不是“紧跟在某条行内公式之后”？两种形态：
-     ① 跨公式 run 的尾部（公式在 run 中间结束）；
-     ② 紧邻公式之后的另一个 run（中间最多隔 1 个空格）。
-     用途：PyMuPDF 会把上标/小字号的标记**泄漏**到公式后面的正文 run 上
-     （例：`…^{(i)}, r_t^{(h)})` 后面的 “ is the value vector of…” 被标成 up=true + 7pt，
-     渲染成 0.7 倍，看着就是“公式偏大”）。 */
+  /* 行内公式覆盖层（旧“行内公式让位”实现）已随本地 PyMuPDF 渲染链路移除。
+     下面这些函数只保留名字 / 签名（空壳），方便之后替换。
+     Surya / Unlimited-OCR 的行内公式走 `suryaInlineMath` / `ulInlineMath`
+     （就地替换成 KaTeX，不需要覆盖层与让位）。 */
   function _rightAfterMath(list, gs, ge, x) {
-    if (!list) return false;
-    for (const m of list) {
-      if (gs < m.b && m.b <= x && ge > m.b) return true;      // 跨公式 run 的尾部
-      if (m.b <= x && x - m.b <= 2) return true;              // 紧跟在公式之后
-    }
     return false;
   }
-  /* 公式区间的基准字号：取区间内 run 的最大字号，再用**块内主字号**夹一道。
-     不夹不行：区间恰好只盖住下标 run 时（全是 7pt），最大字号就是 7pt，
-     公式会明显偏小；反过来 OCR/合成行也会给出离谱的大值。 */
   function _mathBaseSize(item, m) {
-    let own = 0;
-    for (const ld of item.linesData)
-      for (const r of ld.runs)
-        if (r.g < m.b && r.g + r.t.length > m.a && r.s > own) own = r.s;
-    const body = (item.bodyRun && item.bodyRun.s) || 0;
-    if (!own) own = body || 10;
-    if (body) own = Math.min(Math.max(own, body * 0.85), body * 1.15);
-    return own;
+    return 0;
   }
-
-  /* 量“这一行的正文基线”：往行首插一个 0 尺寸的 inline-block 探针，
-     它的 margin-box 底边正好落在行基线上（inline-block 无内容时基线=底边）——
-     比用字体度量反推可靠得多，也不受宿主行高影响。 */
   function _lineBaseline(lnEl) {
-    if (!lnEl) return null;
-    const p = document.createElement("span");
-    p.style.cssText = "display:inline-block;width:0;height:0;overflow:hidden;padding:0;margin:0;border:0";
-    lnEl.insertBefore(p, lnEl.firstChild);
-    const y = p.getBoundingClientRect().bottom;
-    p.remove();
-    return y;
+    return null;
   }
-  /* KaTeX 的基线 = 它的 strut 底边：strut 就是 KaTeX 用来给盒子定基线的，本身无降部 */
   function _katexBaseline(box) {
-    const s = box.querySelector(".katex-html .strut");
-    return s ? s.getBoundingClientRect().bottom : null;
+    return null;
   }
-
-  /* 行内公式收尾：块已挂到文档上 → 量出原字形所占矩形，顶上一个 KaTeX */
   function finalizeInlineMath() {
-    for (const id in itemById) {
-      const item = itemById[id];
-      const list = item.inlineMath;
-      if (!list || !list.length || !item.el || !item.el.isConnected) continue;
-      const br = item.el.getBoundingClientRect();
-      for (let i = 0; i < list.length; i++) {
-        if (item.el.querySelector('.mathbox.inline[data-mi="' + i + '"]')) continue;
-        const spans = item.el.querySelectorAll('.mspan[data-mi="' + i + '"]');
-        if (!spans.length) continue;
-        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-        spans.forEach(s => {
-          const r = s.getBoundingClientRect();
-          if (!r.width && !r.height) return;
-          x0 = Math.min(x0, r.left); y0 = Math.min(y0, r.top);
-          x1 = Math.max(x1, r.right); y1 = Math.max(y1, r.bottom);
-        });
-        if (!isFinite(x0)) continue;
-        const wPx = x1 - x0;
-        const S = (item.linesData[0] && item.linesData[0].runs[0] && item.linesData[0].runs[0].S) || 1;
-        const box = el("div", "mathbox inline");
-        box.dataset.mi = i;
-        box.dataset.latex = list[i].latex;
-        box._blk = item.el;
-        box._origW = wPx;
-        box._ln = spans[0].closest(".ln");        // 让位时要挪的就是这一行的邻行
-        box._x0 = Math.round(x0 - br.left);       // 基准左边(复原/让位都按它算)
-        box.style.left = box._x0 + "px";
-        // 字号：**统一**用基准字号（不逐条按宽度缩 —— 那会让同页公式大小不一），
-        // 再除 KaTeX 内部的 1.21em（见 KATEX_EM），保证字高与正文一致。
-        box.style.fontSize = mathSizePx(_mathBaseSize(item, list[i]) * S) + "px";
-        // 垂直：先按原字形矩形放一个初始位置（下面会按实测基线纠正）
-        box.style.top = Math.round(y0 - br.top) + "px";
-        if (!katexRender(box, list[i].latex, false)) continue;   // 渲染失败 → 保持原字形
-        item.el.appendChild(box);
-        // 垂直对齐：**渲染后直接量、按差值平移**。
-        // 不要用字体度量去推算“盒顶→基线”的距离：那个值受宿主元素的行高影响，
-        // 在 body 里量出来的换到 .blk 里就不准（实测差 7~11px，公式整体下沉）。
-        const tb = _lineBaseline(box._ln);
-        const kb = _katexBaseline(box);
-        if (tb != null && kb != null)
-          box.style.top = Math.round(parseFloat(box.style.top) + (tb - kb)) + "px";
-        // 隐原字形**靠 class**，不能只设内联色：选句/高亮/标注都会重建 span，
-        // 重建后内联色就没了，原字形会从 KaTeX 底下冒出来变成**重影**。
-        // 但 class 也只能加在“这一条公式”所在的 span 上（渲染失败的那条要保持可见）。
-        if (!item.mathDone) item.mathDone = new Set();
-        item.mathDone.add(i);
-        const marked = item.el.querySelectorAll('.mspan[data-mi="' + i + '"]');
-        marked.forEach(s => s.classList.add("mspan-hidden"));
-      }
-      _inlineMathRoom(item);          // 公式摆好之后，把周围的间距让出来
-      // 让位会插 `.mspacer`（真的会加宽行）→ 行宽适配必须在这之后再跑一次，
-      // 否则整行会溢出到栏外。rebuildItem 里那次跑得早，看不到这些 spacer。
-      if (fitItemLines) fitItemLines(item);
-    }
+    return;
   }
-
-  /* ============ 行内公式“让位”：不压扁、不缩字号，放不下就把周围让开 ============
-     KaTeX 同字号下比原文宽 20~40%（字距/字体不同），塞进原字形框只有两条路：压扁（字形
-     走形）、缩字号（同页公式大小不一），都不好。改成把空间从**周围**借出来：
-       ① 横向：公式比原字形框宽出来的那点，补在**公式后面**（把同行后面的正文推开）；
-       ② 纵向：公式带上标/下标/分式时比一行高，把**上一行往上、下一行往下**挪一点
-          （只动紧邻的两行，行距变化最小；块的译文卡跟着往下让）。
-     幂等要求：重排 + 选中/高亮/标注都会重建 .ln，所以每次先按基准值复原再重算：
-       · 行位按 ld.baseTop，覆盖层按 box._x0（都不累计、不叠加）；
-       · 横向用 spacer 元素（随 .ln 一起被清掉，不会残留）；
-       · 纵向同一行被多条公式顶到时取**最大**让位量。 */
   function _inlineMathNaturalW(box) {
-    const w0 = box.style.width;
-    box.style.width = "max-content";
-    const w = box.scrollWidth;          // max-width:100% 挡不住 scrollWidth，量到的是内容宽
-    box.style.width = w0;
-    return w;
+    return 0;
   }
   function _lnScaleX(ln) {
-    const m = /scaleX\(([\d.]+)\)/.exec(ln.style.transform || "");
-    return m ? parseFloat(m[1]) : 1;    // fitLineEl 压过整行 → 行内长度要换算
+    return 1;
   }
   function _shiftRoomLine(ld, delta) {
-    if (!ld || !ld.el) return;
-    const cur = ld._roomShift || 0;
-    ld._roomShift = delta > 0 ? Math.max(cur, delta) : Math.min(cur, delta);
-    ld.el.style.top = (ld.baseTop + ld._roomShift) + "px";
+    return;
   }
   function _shiftRoomBox(box, dx) {
-    box._roomShift = (box._roomShift || 0) + dx;
-    box.style.left = (box._x0 + box._roomShift) + "px";
+    return;
   }
   function _resetInlineRoom(item) {
-    item.el.querySelectorAll(".mspacer").forEach(s => s.remove());
-    for (const ld of item.linesData) {
-      if (!ld.el) continue;
-      if (ld.baseTop == null) ld.baseTop = parseFloat(ld.el.style.top) || 0;
-      ld._roomShift = 0;
-      ld.el.style.top = ld.baseTop + "px";
-    }
-    item.el.querySelectorAll(".mathbox.inline").forEach(b => {
-      b._roomShift = 0;
-      if (b._x0 != null) b.style.left = b._x0 + "px";
-    });
+    return;
   }
   function _inlineMathRoom(item) {
-    const list = item.inlineMath;
-    if (!list || !list.length) return;
-    _resetInlineRoom(item);
-    const byLine = new Map();          // 一行可能有好几条公式
-    for (let i = 0; i < list.length; i++) {
-      const b = item.el.querySelector('.mathbox.inline[data-mi="' + i + '"]');
-      if (!b || !b._ln) continue;
-      if (!byLine.has(b._ln)) byLine.set(b._ln, []);
-      byLine.get(b._ln).push(b);
-    }
-    if (!byLine.size) return;
-    const b0 = item.el.querySelector(".mathbox.inline");
-    const em = (b0 && parseFloat(b0.style.fontSize)) || 15;   // 1em ≈ 公式字号
-    // PUSH_MAX/VMOVE_MAX 都按 em 算：换缩放档位时不用调常量。
-    // 上限是为了别把整行文字推得太离谱（表格/窄栏里尤其），超出的那点宁可留着少量重叠。
-    const PUSH_MAX = 2.2 * em, VMOVE_MAX = 0.45 * em;
-    const VMIN = 2;      // 小于 2px 的“重叠”是字体盒子的空隙，不值得动行距
-
-    // ① 横向：从右往左处理（往右推只影响它右边的东西），把公式右边缘之后的正文推开
-    for (const [ln, arr] of byLine) {
-      const k = _lnScaleX(ln);
-      for (let j = arr.length - 1; j >= 0; j--) {
-        const box = arr[j];
-        const spans = item.el.querySelectorAll('.mspan[data-mi="' + box.dataset.mi + '"]');
-        const last = spans[spans.length - 1];
-        if (!last) continue;
-        // 公式可能**跨行**（Surya 的 <math> 区域会横跨换行）：覆盖层是单行的，
-        // 续行后面的正文跟它没有可比性 → 只在“公式收尾还在本行”时才推。
-        if (last.closest(".ln") !== ln) continue;
-        const trail = last.nextElementSibling;
-        // 后面没正文、或紧跟的是另一条公式的字形 → 没什么可推的
-        if (!trail || trail.classList.contains("mspan")) continue;
-        const d = Math.round(box.getBoundingClientRect().left + _inlineMathNaturalW(box) + 2
-                             - trail.getBoundingClientRect().left);
-        if (d <= 0) continue;
-        const push = Math.min(d, PUSH_MAX);
-        const sp = el("span", "mspacer");
-        sp.setAttribute("aria-hidden", "true");
-        sp.style.cssText = "display:inline-block;height:0;overflow:hidden;width:0";
-        sp.style.width = (push / k).toFixed(2) + "px";   // 行内有 scaleX → 换算回行内长度
-        ln.insertBefore(sp, trail);
-        for (let m = j + 1; m < arr.length; m++) _shiftRoomBox(arr[m], push);
-      }
-    }
-
-    // ② 纵向：公式比一行高 → 上一行往上、下一行往下，别压在邻行的字上
-    for (const [, arr] of byLine)
-      for (const box of arr) {
-        const mi = box.dataset.mi;
-        const spans = item.el.querySelectorAll('.mspan[data-mi="' + mi + '"]');
-        const last = spans[spans.length - 1];
-        const li = item.linesData.findIndex(ld => ld.el === box._ln);
-        const li2 = last ? item.linesData.findIndex(ld => ld.el === last.closest(".ln")) : li;
-        const r = box.getBoundingClientRect();
-        const prev = li > 0 ? item.linesData[li - 1] : null;
-        const n = Math.max(li, li2);
-        const next = n >= 0 && n + 1 < item.linesData.length ? item.linesData[n + 1] : null;
-        if (prev && prev.el) {
-          const pr = prev.el.getBoundingClientRect();
-          const d = Math.min(VMOVE_MAX, Math.round(pr.bottom - r.top));
-          if (d >= VMIN) _shiftRoomLine(prev, -d);
-        }
-        if (next && next.el) {
-          const nr = next.el.getBoundingClientRect();
-          const d = Math.min(VMOVE_MAX, Math.round(r.bottom - nr.top));
-          if (d >= VMIN) _shiftRoomLine(next, d);
-        }
-      }
-
-    // 行被推下去 → 块高与译文卡跟着往下让，否则最后一行会顶到译文卡上
-    let bottom = 0;
-    for (const ld of item.linesData)
-      if (ld.el) bottom = Math.max(bottom, ld.baseTop + (ld._roomShift || 0) + ld.el.offsetHeight);
-    const h = Math.ceil(Math.max(item.contentH || 0, bottom));
-    if (item._roomH !== h) {
-      item._roomH = h;
-      item.el.style.height = h + "px";
-      if (item.exp) item.exp.style.top = h + "px";
-    }
+    return;
   }
 
   /* 独立公式的收尾：等块挂到文档上量出真实高度，再回填块高(KaTeX 内容本身是同步渲好的)。 */
@@ -597,24 +357,10 @@ window.R2Math = function (env) {
     if (exp) exp.style.top = h + "px";
   }
 
-  /* 公式的“主体宽度”(pt)：从块左边到**除编号行以外**所有行的最右端。
-     公式编号（如 "(1)"）在 PDF 里是贴栏右排的，和公式主体之间隔着一大段空白，
-     而公式块的外框是“行并集”会把编号算进去 → 框被撑宽。
-     宽度适配必须用主体宽度，否则带编号的公式永远轮不到缩小，
-     看上去就比同页其它同类型的公式大一号（evaluation metrics 里的 (1) 就是这种）。 */
-  const _TAG_LINE_RE = /^[（(]\s*\d+\s*[a-z]?\s*[)）]$/;
+  /* 公式的“主体宽度”(pt) —— 早期逐行公式块渲染的兼容接口，恒为 0。
+     本地解析方案直接用 `formula_boxes[].bbox_norm` 定宽，不再需要它。 */
   function formulaBodyWidth(t) {
-    let right = 0, found = false;
-    for (const ln of (t.lines || [])) {
-      // 公式块只带几何时由后端标 `tag`(见 `pdf_parser._TAG_LINE_RE`)；旧数据回退看行文本。
-      // ⚠️ 两处规则必须一致。
-      const isTag = ln.tag === true ||
-        _TAG_LINE_RE.test((ln.runs || []).map(r => r.t || "").join("").trim());
-      if (isTag) continue;                          // 编号行不算入主体
-      right = Math.max(right, ln.x + ln.w);
-      found = true;
-    }
-    return found ? Math.max(1, right - t.x) : t.w;
+    return 0;
   }
 
   /* 很多解析结果把公式编号**写进了 LaTeX**（`…\qquad(1)` / `…\quad(1)`），
@@ -639,11 +385,25 @@ window.R2Math = function (env) {
   const KATEX_EM = 1.15;
   function mathSizePx(basePx) { return Math.max(1, basePx / KATEX_EM); }
 
+  /* 行内公式统一按**行内排版**（`\textstyle`）渲染。
+
+     为什么不能只靠 KaTeX 的 `displayMode:false`：
+       · 解析后端（texify / OCR 模型）有时会在 LaTeX 开头自带 `\displaystyle`，
+         KaTeX 会照单全收 —— 求和/积分的上下限又被搬到上下方、分式也放大，
+         与 PDF 里行内公式的排版（上下限在右侧）不符；
+       · 行内公式的盒子是按 PDF 原框尺寸缩放/避让的，display 样式更容易溢出，
+         最后被 `sizeFormulaBox` 压小，和旁边的正文对不上。
+     所以这里**先剥掉开头的样式开关、再补一个 `\textstyle`**，保证行内一定走正文样式。
+     （`katexRender(..., false)` 的所有调用点 —— 页面级 `.fbox` 行内公式、
+       `renderInlineMath`、Surya/Unlimited-OCR 的 `.mspan` —— 都会经过这里。） */
   function inlineTextStyle(latex) {
-    const source = String(latex || "");
-    return /^\s*\\(?:textstyle|displaystyle)\b/.test(source)
-      ? source
-      : "\\textstyle " + source;
+    let source = String(latex || "").trim();
+    let prev;
+    do {                                   // 可能连续出现 \displaystyle \textstyle …
+      prev = source;
+      source = source.replace(/^\\(?:display|text)style\b\s*/, "");
+    } while (source !== prev);
+    return "\\textstyle " + source;
   }
 
   const KATEX_OPTS = { displayMode: true, throwOnError: true, strict: "ignore", trust: false };
@@ -806,224 +566,174 @@ window.R2Math = function (env) {
   /* 该文字块用什么渲染？返回 {latex} 或 null(按普通文字渲染)。
      公式块（`kind="formula"` + `latex`）：整页 OCR 后端（Surya 2 / Unlimited-OCR）的
      独立公式走这里；早期 OCR 链路（已删除）内联进正文的公式也是同一形状，
-     旧 doc.json 仍能渲染。检测服务组的**页面级公式框**（`pg.formula_boxes`）
-     不走这里，见 buildFormulaBoxes。只认「整块就是公式」的块；正文里内联的
-     `\(…\)` 数学交给 renderInlineMath。 */
+     旧 doc.json 仍能渲染。只认「整块就是公式」的块；正文里内联的
+     `\(…\)` / `$…$` 数学交给 renderInlineMath。 */
   function mathBlockOf(t) {
     if (!t || t.kind !== "formula") return null;
     const latex = typeof t.latex === "string" ? t.latex.trim() : "";
     return latex ? { latex } : null;
   }
 
-  /* 页面正文的基准字号(PDF 点)：取该页**非公式**文字块里字数最多的那个 run 字号。
-     公式块自己的字号常是 OCR/合成行估出来的(同一页能给出 8~17pt 的离谱值)，
-     正文的 run 字号来自 PyMuPDF 真实字体信息，可靠得多。 */
-  const _bodySizeCache = new Map();
+  /* 页面正文基准字号（本地公式框定尺的兼容接口）—— 取页面首个文字块的字号。 */
   function pageBodySize(pi) {
-    const key = docId + "#" + pi;          // 换论文后不能复用上一份的缓存
-    if (_bodySizeCache.has(key)) return _bodySizeCache.get(key);
-    const pg = (env.DOC && env.DOC.pages && env.DOC.pages[pi]) || null;
-    const texts = (pg && pg.texts) || [];
-    const cnt = new Map();
-    for (const t of texts) {
-      if (t.kind === "formula") continue;
-      for (const ln of (t.lines || []))
-        for (const r of (ln.runs || [])) {
-          const k = Math.round((r.s || 0) * 2) / 2;      // 0.5pt 一档，避开毛刺
-          if (k > 0) cnt.set(k, (cnt.get(k) || 0) + Math.max(1, (r.t || "").length));
-        }
-    }
-    let best = 0, bestN = 0;
-    for (const [k, n] of cnt) if (n > bestN) { bestN = n; best = k; }
-    if (!best) {                          // Surya 块：没有逐 run 字号，用解析侧估的块字号
-      const cnt2 = new Map();
-      for (const t of texts) {
-        if (t.kind === "formula" || !(t.size > 0)) continue;
-        const k = Math.round(t.size * 2) / 2;          // 0.5pt 一档，按文本长度加权
-        cnt2.set(k, (cnt2.get(k) || 0) + Math.max(1, (t.text || "").length));
-      }
-      for (const [k, n] of cnt2) if (n > bestN) { bestN = n; best = k; }
-    }
-    if (!best) {                                   // 整页都是 OCR 合成行 → 退回中位数
-      const all = [];
-      for (const t of texts)
-        for (const ln of (t.lines || []))
-          for (const r of (ln.runs || [])) if (r.s > 0) all.push(r.s);
-      all.sort((a, b) => a - b);
-      best = all.length ? all[all.length >> 1] : 0;
-    }
-    _bodySizeCache.set(key, best);
-    return best;
+    const doc = env.DOC;
+    const pg = doc && doc.pages && doc.pages[pi];
+    const item = pg && (pg.texts || []).find(t => t && t.kind !== "table");
+    return (item && Number(item.size)) || 10;
   }
 
-  /* 公式的主体字号：取块内**最大**的字号。
-     公式里夹着下标/上标(7pt 之类的小号 run)，取第一个 run 会随 run 顺序忽大忽小
-     ——`IC_i=\frac{1}{T}\sum…` 那种公式第一行就是求和上限的小号 `T`，
-     按它渲染整条公式会明显偏小。再拿页面正文字号夹一道，挡住离谱的估算值。
-     字号来源按新旧数据两条路取：公式块不渲染行元素(`linesData` 为空)，所以
-     主用后端下发的行级 `ln.s`；旧数据 / 行内场景仍看 runs。 */
+  /* 公式的主体字号 —— 解析侧给了 `formula_boxes[].size` 就用它，否则用正文基准。 */
   function formulaBaseSize(linesData, pi, lines) {
-    let own = 0;
-    for (const ld of (linesData || []))
-      for (const r of (ld.runs || [])) if (r.s > own) own = r.s;
-    for (const ln of (lines || [])) {
-      for (const r of (ln.runs || [])) if (r.s > own) own = r.s;
-      if ((ln.s || 0) > own) own = ln.s;
-    }
-    if (!own) own = 10;
-    const ref = pageBodySize(pi);
-    if (!ref) return own;
-    return Math.min(Math.max(own, ref * 0.8), ref * 1.25);
+    const first = lines && lines[0];
+    return (first && Number(first.size)) || pageBodySize(pi) || 10;
   }
 
-  /* ============ 页面公式框覆盖层（detection-service-group） ============
-     新版数据里公式的落地方式是「覆盖层」：解析侧把公式字形擦成等长空格
-     （位置照旧、宽度由行框反推），服务组（formula_table_service_group）返回每条
-     公式的 **bbox_norm**（归一化中心 xywh，与 YOLO 标签同口径，见 yolov13
-     `inference.py::build_detections`）与 **LaTeX**；这里按「bbox_norm × 当前页面
-     显示宽高」把 KaTeX 盖到页面上 —— 位置来自公式框、内容来自服务组。
+  /* ============ 页面级公式框覆盖层（本地解析方案） ============
+     解析侧 `pages[].formula_boxes[]` 给出 `bbox_norm`（中心 xywh / 页面尺寸）与
+     `latex`；这里在页面上放一个 `.fbox`，内部 `.katex-fit` 居中渲染 KaTeX，
+     并按框的宽高等比缩放（字体/字距与原文不同，不缩就会被框裁掉）。
+     KaTeX 未就绪或渲染失败时：有裁图就用裁图（与 PDF 原位同框），
+     连裁图也没有就显示 LaTeX 源码（`.failed`）—— 至少不会整块空白。
+     公式框的“属于哪个文字块/哪个字符区间”由 reader2.js::attachFormulaBoxes 接上。 */
+  const _fboxSet = new Set();
 
-     与旧的“公式块”渲染（`mathBlockOf`，t.latex）的区别：那个是**文本块内**的公式
-     （块自带几何、覆盖层随块走）；这里是**页面级**的独立框（`pg.formula_boxes`），
-     定位与正文块无关。字号定尺与 `fitMathBox` 同一套路：先按页面正文字号渲染，
-     再等比缩放到框内（KaTeX 同字号常比原排版宽 20~40%）。 */
-  const _fboxFit = new Set();          // 待收尾/重新定尺的公式框内层
-  let _fboxFontsHooked = false;        // fonts.ready 兜底只挂一次
+  function _fboxRect(meta, pg, S) {
+    const norm = meta && meta.bbox_norm;
+    if (norm && norm.length === 4) {
+      const cx = Number(norm[0]) || 0, cy = Number(norm[1]) || 0;
+      const w = Number(norm[2]) || 0, h = Number(norm[3]) || 0;
+      if (w > 0 && h > 0) {
+        return {
+          left: (cx * pg.w - w * pg.w / 2) * S,
+          top: (cy * pg.h - h * pg.h / 2) * S,
+          width: w * pg.w * S,
+          height: h * pg.h * S,
+        };
+      }
+    }
+    const box = meta && meta.bbox;
+    if (!box || box.length !== 4) return null;
+    return {
+      left: (Number(box[0]) || 0) * S,
+      top: (Number(box[1]) || 0) * S,
+      width: Math.max(1, (Number(box[2]) - Number(box[0])) * S),
+      height: Math.max(1, (Number(box[3]) - Number(box[1])) * S),
+    };
+  }
 
-  /* 在页面元素上建公式框覆盖层；返回新建的框数（由 render 逐页调用）。
-     `pg` 是数据里的页对象（pg.w/pg.h 为 PDF pt），`pageEl` 是该页的 .page 元素，
-     `S` 是 pt→布局 px 的换算比，`pi` 是页下标（取正文字号用）。
-
-     渲染优先级：KaTeX（latex）→ **框内裁图**（`fb.crop`，服务组回传的 base64
-     图像，KaTeX 未就绪/这条 LaTeX 渲染不出来时铺满整个框）→ LaTeX 源码文本。 */
   function buildFormulaBoxes(pg, pageEl, S, pi) {
-    const boxes = (pg && pg.formula_boxes) || [];
-    let n = 0;
-    for (const fb of boxes) {
-      const b = fb && fb.bbox_norm;
-      const latex = String((fb && fb.latex) || "").trim();
-      const crop = String((fb && fb.crop) || "");   // 框内裁图（data URI，可空）
-      if (!b || b.length !== 4 || (!latex && !crop)) continue;
-      const w = Number(b[2]) || 0, h = Number(b[3]) || 0;
-      if (!(w > 0) || !(h > 0)) continue;          // 退化框（没尺寸）：不画
-      const isInline = fb.class_name === "InlineFormula";
-      const detectedH = h * pg.h * S;
-      const host = el("div", "fbox");
-      if (latex) host.dataset.latex = latex;
-      // bbox_norm 是**中心点** + 宽高 → 左上角 = (中心 − 半宽/半高)
-      host.style.left = ((b[0] - w / 2) * pg.w * S) + "px";
-      host.style.top = ((b[1] - h / 2) * pg.h * S) + "px";
-      host.style.width = (w * pg.w * S) + "px";
-      host.style.height = detectedH + "px";
-      if (isInline) {
-        host._formulaCenterY = b[1] * pg.h * S;
-        host._formulaDetectedH = detectedH;
-        host._formulaLineFallback = (pageBodySize(pi) || 0) * S * 1.2;
-        _inlineFormulaBoxes.add(host);
-      }
-      if (fb.class_name) host.dataset.cls = fb.class_name;
-      // ⚠️ 模块内部用 `_katexReady`；`katexReady()` 是导出给 reader2.js 的函数，这里没有
+    const doc = env.DOC;
+    if (!doc || doc.parser !== "pymupdf") return 0;
+    const metas = pg.formula_boxes || [];
+    let count = 0;
+    for (const meta of metas) {
+      const rect = _fboxRect(meta, pg, S);
+      if (!rect || !(rect.width > 0) || !(rect.height > 0)) continue;
+      const latex = String(meta.latex || "").trim();
+      const fb = document.createElement("div");
+      fb.className = "fbox";
+      fb.dataset.boxId = String(meta.id);
+      fb.dataset.cls = meta.cls || (meta.role === "inline"
+        ? "InlineFormula" : "DisplayedFormulaBlock");
+      fb.dataset.latex = latex;
+      Object.assign(fb.style, {
+        left: rect.left + "px", top: rect.top + "px",
+        width: rect.width + "px", height: rect.height + "px",
+      });
+
+      const fit = document.createElement("div");
+      fit.className = "katex-fit";
+      const base = Math.max(6, Number(meta.size) || 10) * S;
+      fit.style.fontSize = mathSizePx(base) + "px";
+      fit._basePx = parseFloat(fit.style.fontSize) || base;
+      let ok = false;
       if (latex && _katexReady) {
-        const inner = el("div", "katex-fit");
-        if (katexRender(inner, latex, isInline ? false : undefined)) {
-          // 基准字号：页面正文字号（与正文观感一致）；实际大小由 fitFormulaBox 定尺
-          const ref = pageBodySize(pi) || 10;
-          inner.style.fontSize = mathSizePx(ref * S) + "px";
-          host.appendChild(inner);
-          _fboxFit.add(inner);
-          pageEl.appendChild(host);
-          n++;
-          continue;
-        }
-        // katexRender 失败时会把盒子清空 —— 不挂上去，继续走兜底分支
+        try { ok = katexRender(fit, latex, meta.role !== "inline"); }
+        catch (e) { ok = false; }
       }
-      if (crop) {
-        // 兜底一：框内裁图（服务组按 keep_crops 回传的 base64 图像）铺满整个框
-        const img = el("img");
-        img.src = crop;
+      if (ok) {
+        fb.appendChild(fit);
+      } else if (meta.file) {
+        // KaTeX 未就绪/渲染失败：用解析时裁下的公式图兜底（与 PDF 原位同框）
+        const img = document.createElement("img");
         img.alt = latex || "formula";
-        if (latex) img.title = latex;            // 悬停看 LaTeX 源码
-        host.classList.add("cropped");
-        host.appendChild(img);
+        img.loading = "lazy";
+        const url = "/api/doc/" + docId + "/img/" + meta.file;
+        img.src = meta.cache_key ? url + "?v=" + encodeURIComponent(meta.cache_key) : url;
+        fb.appendChild(img);
+      } else if (latex) {
+        fit.textContent = latex;
+        fb.classList.add("failed");
+        fb.appendChild(fit);
       } else {
-        // 兜底二：没有裁图（keep_crops=false / 老数据）→ 显示 LaTeX 源码（同公式块策略）
-        const inner = el("div", "katex-fit");
-        inner.textContent = latex;
-        host.classList.add("failed");
-        host.appendChild(inner);
+        continue;                       // 既无 LaTeX 又无裁图：不产生空盒子
       }
-      pageEl.appendChild(host);
-      n++;
+
+      pageEl.appendChild(fb);
+      _fboxSet.add(fb);
+      count++;
     }
-    return n;
+    return count;
   }
 
-  /* 公式框收尾：页已挂到文档上 → 把每个框里的 KaTeX 等比缩到框内。
-     幂等（从基准字号重算），字体加载完再跑一遍 —— 早量会用后备字体的宽度。 */
+  function sizeFormulaBox(fb) {
+    if (!fb || !fb.isConnected) return;
+    const fit = fb.firstElementChild;
+    if (!fit || !fit.classList.contains("katex-fit")) return;
+    if (!fit.querySelector(".katex")) return;      // 裁图/失败源码不参与缩放
+    const base = fit._basePx || parseFloat(fit.style.fontSize) || 0;
+    if (base) fit.style.fontSize = base + "px";
+    fit.style.transform = "translate(-50%, -50%)";
+    const availW = fb.clientWidth, availH = fb.clientHeight;
+    if (!(availW > 0) || !(availH > 0)) return;
+    const needW = fit.scrollWidth || fit.offsetWidth;
+    const needH = fit.scrollHeight || fit.offsetHeight;
+    if (!(needW > 0) || !(needH > 0)) return;
+    // 行内公式的框按 PDF **墨迹**裁，框高就是字形高度；KaTeX 的行盒还带 ascent/
+    // descent 留白，通常比墨迹高 15~30%。严格按高度缩会把行内公式压得比正文小一号
+    // （正文补回正常字号后尤其明显）。这里允许行内公式溢出框 15%（PDF 里行内公式
+    // 本来就会伸出正文行框），主要按宽度定尺；显示公式仍严格塞进框内。
+    const inline = fb.dataset.cls === "InlineFormula";
+    const hCap = inline ? 1.15 : 1;
+    let k = Math.min(1, availW / (needW * 1.02), (availH * hCap) / (needH * 1.02));
+    k = Math.max(0.55, k);
+    fit.style.transform = "translate(-50%, -50%) scale(" + k.toFixed(4) + ")";
+  }
+
   function finalizeFormulaBoxes() {
-    if (!_fboxFit.size && !_inlineFormulaBoxes.size) return;
-    refitFormulaBoxes();
-    if (!_fboxFontsHooked && document.fonts && document.fonts.ready) {
-      _fboxFontsHooked = true;
+    if (!_fboxSet.size) return;
+    for (const fb of [..._fboxSet]) {
+      if (!fb.isConnected) { _fboxSet.delete(fb); continue; }
+      sizeFormulaBox(fb);
+    }
+    // 字体晚到会让第一次量的宽度偏小/偏大：字体就绪后再量一次（幂等）
+    if (document.fonts && document.fonts.ready)
       document.fonts.ready.then(refitFormulaBoxes).catch(() => {});
-    }
   }
-  const _inlineFormulaBoxes = new Set();
+
   function refitFormulaBoxes() {
-    for (const host of [..._inlineFormulaBoxes]) {
-      if (!host.isConnected) { _inlineFormulaBoxes.delete(host); continue; }
-      fitInlineFormulaHeight(host);
-    }
-    for (const inner of [..._fboxFit]) {
-      if (!inner.isConnected) { _fboxFit.delete(inner); continue; }
-      fitFormulaBox(inner);
+    for (const fb of [..._fboxSet]) {
+      if (!fb.isConnected) { _fboxSet.delete(fb); continue; }
+      sizeFormulaBox(fb);
     }
   }
-  /* 以同一水平位置最近的正文行高定尺，公式框保持原中心点，避免移离原排版基线。 */
+
   function fitInlineFormulaHeight(host) {
-    const page = host.closest(".page");
-    if (!page) return;
-    const box = host.getBoundingClientRect();
-    const cx = (box.left + box.right) / 2;
-    const cy = host._formulaCenterY + page.getBoundingClientRect().top;
-    let lineH = 0, best = Infinity;
-    page.querySelectorAll(".blk .ln").forEach(line => {
-      const r = line.getBoundingClientRect();
-      if (!r.height) return;
-      const dx = cx < r.left ? r.left - cx : (cx > r.right ? cx - r.right : 0);
-      const dy = Math.abs((r.top + r.bottom) / 2 - cy);
-      const score = dy * 10 + dx;
-      if (score < best) { best = score; lineH = r.height; }
-    });
-    if (!lineH) lineH = host._formulaLineFallback;
-    if (!lineH) return;
-    // Clamp to 1.0–1.3 times the neighboring text line height.
-    const h = Math.min(Math.max(host._formulaDetectedH, lineH), lineH * 1.3);
-    host.style.height = h + "px";
-    host.style.top = (host._formulaCenterY - h / 2) + "px";
+    if (host) sizeFormulaBox(host.closest ? host.closest(".fbox") : null);
   }
-  /* 把一个框里的 KaTeX 等比缩放到框内（含轻微放大：检测框通常比字形紧）。
-     内容尺寸在**变换前**量（offsetWidth/Height 不受 transform 影响）；
-     `.katex-fit` 是 `width: max-content`，量的就是自然尺寸。 */
+
   function fitFormulaBox(inner) {
-    const host = inner.parentElement;
-    if (!host) return;
-    const availW = host.clientWidth, availH = host.clientHeight;
-    if (!availW || !availH) return;
-    inner.style.transform = "translate(-50%, -50%)";
-    const needW = inner.offsetWidth, needH = inner.offsetHeight;
-    if (!needW || !needH) return;
-    let k = Math.min(availW / needW, availH / needH);
-    k = Math.max(0.2, Math.min(3, k));           // 防退化框把公式拉爆/压没
-    inner.style.transform = "translate(-50%, -50%) scale(" + k.toFixed(4) + ")";
+    const fb = inner && inner.closest ? inner.closest(".fbox") : null;
+    if (fb) sizeFormulaBox(fb);
   }
 
   /* ============ 对外接口 ============ */
   return {
-    ensureKatex, docNeedsMath, renderInlineMath, inlineMathOf, _mathIdxAt, _rightAfterMath,
+    ensureKatex, docNeedsMath, renderInlineMath, renderKnownLatex,
+    inlineMathOf, _mathIdxAt, _rightAfterMath,
     finalizeInlineMath, _inlineMathRoom, finalizeDisplayMath, formulaBodyWidth, mathSizePx,
     katexRender, mathTexOf, mathBlockOf, formulaBaseSize, _katexBoxes,
-    buildFormulaBoxes, finalizeFormulaBoxes,
+    buildFormulaBoxes, finalizeFormulaBoxes, refitFormulaBoxes,
     katexReady: () => _katexReady,      // let，加载完会置 true → 必须用函数按需取
   };
 };

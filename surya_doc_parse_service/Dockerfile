@@ -56,15 +56,19 @@ FROM ${BASE_IMAGE}
 # 重新声明 BASE_IMAGE, 让下面的 RUN 里也能读到(ARG 在 FROM 之前声明时, 阶段内需重新声明)
 ARG BASE_IMAGE=ubuntu:22.04
 # ENABLE_CUDA: 1 = 编译 CUDA 版 llama-server(GPU 加速); 0 = CPU 版
-ARG ENABLE_CUDA=0
+# ARG ENABLE_CUDA=0
+ARG ENABLE_CUDA=1
 # CUDA_ARCHITECTURES: 目标 GPU 架构(仅 CUDA 构建使用), 分号分隔
 #   不传 = CMake 为编译器支持的所有架构编译, 构建时间会非常长
-#   常见值: 75(Turing) 80(A100) 86(RTX30) 89(RTX40) 90(H100)
-ARG CUDA_ARCHITECTURES=75;80;86;89
+#   ⚠ 必须覆盖实际显卡的计算能力(compute_cap), 漏掉会报
+#       CUDA error: no kernel image is available for execution on the device
+#   常见值: 70(V100) 75(Turing) 80(A100) 86(RTX30) 89(RTX40) 90(H100)
+ARG CUDA_ARCHITECTURES=70;75;80;86;89
 # surya-ocr 版本(Surya 2)
 ARG SURYA_VERSION=0.22.1
 # PyTorch CPU wheels (the later Surya install uses the regular PyPI index)
-ARG TORCH_PIP_INDEX_URL=https://download.pytorch.org/whl/cpu
+# ARG TORCH_PIP_INDEX_URL=https://download.pytorch.org/whl/cpu
+# ARG TORCH_PIP_INDEX_URL=https://download.pytorch.org/whl/cu124
 # pip 源(国内可换镜像)
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
@@ -110,8 +114,8 @@ RUN set -eux; \
 RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/python -m pip install --no-cache-dir -U pip setuptools wheel \
  && /opt/venv/bin/python -m pip install --no-cache-dir \
-      --index-url ${TORCH_PIP_INDEX_URL} \
-      torch torchvision \
+      # --index-url ${TORCH_PIP_INDEX_URL} \
+      torch==2.7 torchvision \
  && (/opt/venv/bin/python -m pip freeze | grep -iE '^(torch|torchvision|torchaudio)' \
        > /tmp/torch-constraints.txt || true) \
  && /opt/venv/bin/python -m pip install --no-cache-dir --retries 5 --timeout 60 \

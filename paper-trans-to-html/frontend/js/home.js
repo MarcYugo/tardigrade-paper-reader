@@ -141,5 +141,9 @@
     render();
   });
 
+  // 从阅读页“后退”回来时页面可能来自 bfcache（没有重新请求），而那边刚改过标题/
+  // 进度/笔记数：回到前台就重新拉一次列表，保证和阅读页显示的一致。
+  window.addEventListener("pageshow", e => { if (e.persisted) load(); });
+
   load();
 })();

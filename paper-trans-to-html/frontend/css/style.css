@@ -106,11 +106,23 @@ a { color: var(--accent); text-decoration: none; }
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--line);
 }
-.brand { font-weight: 700; color: var(--ink); white-space: nowrap; }
-.brand .logo { color: var(--accent); }
+.brand { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; color: var(--ink); white-space: nowrap; }
+.brand .logo { width: 26px; height: 26px; flex: none; display: block; border-radius: 6px; object-fit: contain; }
 .doc-title {
   font-size: 15px; font-weight: 600; margin: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
+}
+/* 有写权限时标题可点改（reader2.js::editDocTitle）：给点“可编辑”的暗示 */
+.doc-title.editable {
+  cursor: text; padding: 2px 7px; border-radius: 7px; outline: none;
+  border: 1px solid transparent; transition: background .15s, border-color .15s;
+}
+.doc-title.editable:hover { background: var(--bg-soft); border-color: var(--line); }
+.doc-title.editable:focus-visible { border-color: var(--accent); }
+.doc-title .doc-title-edit {
+  width: 100%; box-sizing: border-box; font: inherit; color: var(--ink);
+  background: var(--card); border: 1px solid var(--accent); border-radius: 6px;
+  padding: 1px 6px; outline: none;
 }
 .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
@@ -248,6 +260,10 @@ a { color: var(--accent); text-decoration: none; }
 .blk > .ln, .blk > .mathbox, .blk > .exp, .blk.has-math { pointer-events: auto; }
 .blk .ln { position: absolute; white-space: pre; line-height: 1; }
 .blk .ln .rn { display: inline; }
+/* 本地解析方案的公式占位：解析侧把公式字形换成一个空格 + 原宽度（gw），
+   JS 把 span 撑成 inline-block 并隐藏字符；真公式由页面级 .fbox 覆盖层绘制。
+   保留占位是为了让选句/高亮/笔记的字符区间与阅读顺序不变。 */
+.blk .ln .rn.rngap { display: inline-block; white-space: pre; }
 /* 行内公式：后端把 LaTeX **内联进了行文本**(`\(…\)`)，由 `renderInlineMath` 就地
    换成 KaTeX。`.ln` 是 `white-space: pre`(公式空位的等长空格要靠它显示成真实宽度)，
    而 KaTeX 的 HTML 里带换行与缩进 —— 在 pre 下会被当真实空格渲染、公式会散架，
@@ -444,6 +460,50 @@ a { color: var(--accent); text-decoration: none; }
 .blk.ul .katex-inline,
 .blk.ul .katex-inline .katex,
 .blk.ul .katex-inline .katex * { white-space: nowrap; }
+
+/* ============ 本地解析方案的表格（reader2.js::buildTextItem） ============
+   表格是 kind="table" 的块，HTML 由 SLANet_plus 识别、前端白名单渲染。
+   三线表描边与 Surya/Unlimited-OCR 两套保持同一观感（数据里只有结构）。 */
+.blk.lc > .lctable { pointer-events: auto; }   /* 表格块自身不参与选句，但点击要能命中 .blk */
+.blk.lc .lctable {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-x: auto;
+}
+.blk.lc .lctable table {
+  border-collapse: collapse;
+  width: 100%;
+  border-top: 1.5px solid var(--mut);
+  border-bottom: 1.5px solid var(--mut);
+  font-family: "Times New Roman", Times, "Noto Serif", SimSun, serif;
+}
+.blk.lc .lctable td, .blk.lc .lctable th {
+  border: 0;
+  padding: 3px 6px;
+  vertical-align: top;
+}
+.blk.lc .lctable thead tr:last-child > td,
+.blk.lc .lctable thead tr:last-child > th {
+  border-bottom: 1px solid var(--mut);
+}
+.blk.lc .lctable table:not(:has(> thead)) > tbody > tr:first-child:not(:has([colspan], [rowspan])) > td,
+.blk.lc .lctable table:not(:has(> thead)) > tbody > tr:first-child:not(:has([colspan], [rowspan])) > th,
+.blk.lc .lctable table:not(:has(> thead)) > tbody > tr:first-child:has([colspan], [rowspan]) + tr > td,
+.blk.lc .lctable table:not(:has(> thead)) > tbody > tr:first-child:has([colspan], [rowspan]) + tr > th {
+  border-bottom: 1px solid var(--mut);
+}
+.blk.lc .lctable thead,
+.blk.lc .lctable table:not(:has(> thead)) > tbody > tr:first-child,
+.blk.lc .lctable table:not(:has(> thead)) > tbody > tr:first-child:has([colspan], [rowspan]) + tr {
+  font-weight: 700;
+}
+.blk.lc .katex-inline,
+.blk.lc .katex-inline .katex,
+.blk.lc .katex-inline .katex * { white-space: nowrap; }
+
+/* 本地解析方案的页面级公式框：位置/尺寸由 JS 按 bbox_norm 写成内联样式，
+   这里只负责观感。.fbox / .katex-fit 的基础样式见下方（三个后端共用）。 */
 
 /* detection-service-group 公式框覆盖层：解析侧下发 pages[].formula_boxes（bbox_norm 为
    归一化中心 xywh），r2-math.js 按「bbox_norm × 页面显示宽高」定位这个盒子，
@@ -669,7 +729,8 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 /* ---------- 句子级标注(run 上色/下划线/选中) ----------
    注意顺序：选中与高亮的选择器权重相同，写在后面的才能压住前面的；
    所以先写“选中”，再写高亮底色 —— 选中时只保留蓝色描边，高亮色依然可见。 */
-.blk .ln .rn.sel {
+.blk .ln .rn.sel,
+.blk .ln .katex-inline.sel {
   background: rgba(47, 111, 237, .18);
   box-shadow: inset 0 0 0 1.5px rgba(47, 111, 237, .5);
   border-radius: 3px;
@@ -683,6 +744,14 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 .blk .ln .rn.hl { border-radius: 2px; }
 /* 有笔记的句子：底部一条红线 */
 .blk .ln .rn.hasnote   { box-shadow: inset 0 -2px 0 0 rgba(224, 60, 80, .85); }
+
+/* Surya / Unlimited-OCR 的行内公式（reader2.js 的 suryaInlineMath / ulInlineMath）
+   把 `.mspan` 原字形就地换成了 `<span class="katex-inline">` —— 它**不是 `.rn`**，
+   而选中/高亮/笔记的 class 是从原 span 搬过来的（见 suryaInlineMath 里的 class 复制）。
+   上面的 `.rn.sel` / `.rn.hasnote` 规则选不中它，公式看上去就像“没被选中”。
+   这里给同一套外观补一份选择器（高亮 `.hl` 的底色是 JS 复制的内联 background，无需管）。 */
+.blk .ln .katex-inline { border-radius: 3px; }
+.blk .ln .katex-inline.hasnote { box-shadow: inset 0 -2px 0 0 rgba(224, 60, 80, .85); }
 
 /* ---------- 左侧目录面板（PDF 书签 / LLM 提取） ---------- */
 /* 展开时给正文让出左侧空间：宽度 300px 要与 reader2.js 里的 TOC_W 一致 */
@@ -1075,7 +1144,9 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 .login-logo {
   width: 42px; height: 42px; border-radius: 12px; background: var(--accent-soft);
   color: var(--accent); font-size: 22px; display: flex; align-items: center; justify-content: center;
+  flex: none; overflow: hidden;
 }
+.login-logo img { width: 100%; height: 100%; display: block; object-fit: cover; border-radius: inherit; }
 .login-head h1 { font-size: 18px; margin: 0 0 3px; }
 .login-sub { font-size: 12.5px; color: var(--mut); margin: 0; }
 .login-form .login-tip { font-size: 12.5px; color: var(--mut); line-height: 1.75; margin: 0 0 14px; }
@@ -1303,7 +1374,8 @@ html.dark .user-chip .av,
 html.dark .nbadge { color: #0f1319; }          /* 亮蓝/亮红底上改用深色字才看得清 */
 html.dark .btn.primary:hover { background: #82b6ff; }
 html.dark .blk.sel .ln { background: rgba(110, 168, 255, .10); }
-html.dark .blk .ln .rn.sel {
+html.dark .blk .ln .rn.sel,
+html.dark .blk .ln .katex-inline.sel {
   background: rgba(110, 168, 255, .24);
   box-shadow: inset 0 0 0 1.5px rgba(110, 168, 255, .6);
 }
@@ -1361,6 +1433,9 @@ html.dark .cite:hover { color: #10141a; }
   width: min(440px, 92vw);
   max-height: min(54vh, 520px);
   overflow: auto;
+  /* 条目多时卡片自己能滚：滚到两端不要把滚动“传染”给页面（页面滚动会收卡片），
+     也不要把整页带着一起弹动 */
+  overscroll-behavior: contain;
   background: var(--card); color: var(--ink);
   border: 1px solid var(--line); border-radius: 10px;
   box-shadow: var(--shadow);

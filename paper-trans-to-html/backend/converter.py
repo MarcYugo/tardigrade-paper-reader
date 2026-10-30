@@ -30,14 +30,14 @@ def convert(store: Store, doc_id: str, pdf_path: Path, source_name: str,
 
     `owner` = 归属账号：论文按账号隔离，列表/打开都会按它过滤。
     解析后端按 config.json / 环境变量（默认 auto）：
-      * auto/detection_service_group：PyMuPDF 本地抽取文字版式，Figure 裁图与
-        公式框 + LaTeX 由 detection-service-group 提供；
+      * auto / pymupdf / detection_service_group：**本地解析方案** —— PyMuPDF
+        文字层 + texify 公式 + OXR 版面（D-FINE）/ SLANet 表格 + 插图提取（前端按
+        `parser === "pymupdf"` 逐行绝对定位渲染），依赖/模型缺失时直接报错；
       * surya：整页 OCR 走 Surya 2，文字/公式/插图全部用 Surya 的数据
         （前端按 `parser === "surya"` 走独立渲染），Surya 不可用时直接报错；
       * unlimited_ocr：整页 OCR 走 Unlimited-OCR，文字/公式/表格/插图全部用它的
         回包数据（前端按 `parser === "unlimited_ocr"` 走它自己那套独立渲染），
-        服务不可用时直接报错；
-      * pymupdf：纯本地、不调用外部服务。
+        服务不可用时直接报错。
     实际使用的后端与告警会记到 doc.json 里，便于排障。
     """
     images_dir = store.images_dir(doc_id)
@@ -72,12 +72,11 @@ def convert(store: Store, doc_id: str, pdf_path: Path, source_name: str,
         "parser_info": parsed.get("parser_info"),
         "warnings": parsed.get("warnings") or [],
         # 公式是怎么落地的（详见 pdf_parser 包文档）：
-        #   "boxes" = 页面上叠了公式框覆盖层（pages[].formula_boxes，前端按 bbox_norm
-        #             在页面上渲染 KaTeX —— detection-service-group 可用时的正常路径）；
-        #   "space" = 公式字形已擦成等长空白（服务不可用 / 一条都没返回）；
-        #   "surya" / "unlimited_ocr" = 公式来自整页 OCR 回包的 LaTeX（行内区间 +
-        #             独立公式块）；"inline" 是早期 OCR 链路的历史取值，
-        #             仅存在于重解析前的旧 doc.json。
+        #   "boxes" = 本地方案：页面级公式框覆盖层（KaTeX / 裁图兜底）；
+        #   "none"  = 本地方案没拿到公式框（文字层保留原字形）；
+        #   "surya" / "unlimited_ocr" = 公式来自整页 OCR 回包的 LaTeX；
+        #   "space" / "inline" = 早期 PyMuPDF / OCR 链路的历史取值，
+        #             仅存在于重解析前的旧 doc.json（前端仍兼容读取）。
         # 这个字段是给排障与分流用的。
         "formula_action": parsed.get("formula_action"),
         "pages": parsed["pages"],
@@ -124,8 +123,12 @@ def _block_texts(pages) -> dict[str, str]:
 
 
 def _latex_count(pages) -> int:
-    return sum(1 for pg in pages or [] for t in pg.get("texts") or []
-               if t.get("latex"))
+    """带 LaTeX 的内容条数：整块公式（OCR 后端）+ 页面级公式框（本地方案）。"""
+    total = sum(1 for pg in pages or [] for t in pg.get("texts") or []
+                if t.get("latex"))
+    total += sum(1 for pg in pages or [] for box in pg.get("formula_boxes") or []
+                 if isinstance(box, dict) and box.get("latex"))
+    return total
 
 
 def _remap_translations(store, doc_id: str, old_pages, new_pages) -> int:
@@ -192,7 +195,7 @@ def reparse(store: Store, doc_id: str, pdf_path: Path,
         "parser": parsed.get("parser"),
         "parser_info": parsed.get("parser_info"),
         "warnings": parsed.get("warnings") or [],
-        "formula_action": parsed.get("formula_action"),   # boxes = 公式框覆盖层；space = 公式已擦成空格
+        "formula_action": parsed.get("formula_action"),   # surya / unlimited_ocr（旧值 boxes / space 仅历史数据）
         "pages": new_pages,
         "num_pages": parsed.get("num_pages"),
         "page_w": parsed.get("page_w"),

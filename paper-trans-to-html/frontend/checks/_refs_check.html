@@ -1,9 +1,9 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <title>PENDING</title>
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="../css/style.css">
 <script>
 /* 只认 SyntaxError（reader2.js 在本页会因缺 DOM 元素中途 TypeError，那不算语法问题） */
 window.__synErrs = [];
@@ -24,18 +24,30 @@ window.addEventListener("error", function (e) {
         <span class="rn" data-g="0">Intro cites </span><span class="rn" data-g="12">[1]</span><span class="rn" data-g="15"> and </span><span class="rn" data-g="20">[2]</span><span class="rn" data-g="23"> here.</span>
       </div>
     </div>
+    <!-- 作者-年份：一条引用横跨 3 个 run（解析侧按颜色切 run），首尾还都是“半截 span” -->
+    <div class="blk" data-id="p0b2" style="position:absolute;left:20px;top:70px;width:540px;height:40px">
+      <div class="ln" style="position:relative">
+        <span class="rn" data-g="0" style="color:#000000">see </span><span class="rn" data-g="4" style="color:#0064e0">(Wang et al., 2025;</span><span class="rn" data-g="23" style="color:#0064e0"> Movahedi et al., 2026)</span>
+      </div>
+    </div>
+    <!-- 编号制：`[` / `12` / `]` 落在三个不同字体的 run 上 -->
+    <div class="blk" data-id="p0b3" style="position:absolute;left:20px;top:120px;width:540px;height:40px">
+      <div class="ln" style="position:relative">
+        <span class="rn" data-g="0">as shown </span><span class="rn" data-g="9">[</span><span class="rn" data-g="10">12</span><span class="rn" data-g="12">]</span><span class="rn" data-g="13"> above.</span>
+      </div>
+    </div>
   </div>
 </div>
 <div id="notice" hidden></div>
 <pre id="log" style="font-size:12px"></pre>
 
-<script src="js/common.js"></script>
-<script src="js/r2-md.js"></script>
-<script src="js/r2-nav.js"></script>
-<script src="js/r2-math.js"></script>
-<script src="js/r2-notes.js"></script>
-<script src="js/r2-ai.js"></script>
-<script src="js/r2-refs.js"></script>
+<script src="../js/common.js"></script>
+<script src="../js/r2-md.js"></script>
+<script src="../js/r2-nav.js"></script>
+<script src="../js/r2-math.js"></script>
+<script src="../js/r2-notes.js"></script>
+<script src="../js/r2-ai.js"></script>
+<script src="../js/r2-refs.js"></script>
 
 <script>
 /* 功能自检（在 reader2.js 之前跑：避免两个实例同时监听 #pages 时互相抢事件） */
@@ -53,17 +65,48 @@ window.addEventListener("error", function (e) {
       links: [
         { page: 0, block: "p0b1", start: 12, end: 15, token: "[1]", refs: [0], nums: [1] },
         { page: 0, block: "p0b1", start: 20, end: 23, token: "[2]", refs: [1], nums: [2] },
-        { page: 0, block: "p0b1", start: 99, end: 102, token: "[9]", refs: [0], nums: [9] }
+        { page: 0, block: "p0b1", start: 99, end: 102, token: "[9]", refs: [0], nums: [9] },
+        /* 一条引用横跨 3 个 run（首尾是半截 span）—— 必须合成**一个** chip */
+        { page: 0, block: "p0b2", start: 3, end: 45,
+          token: "(Wang et al., 2025; Movahedi et al., 2026", refs: [0, 1], nums: [] },
+        /* 编号制的 `[` / `12` / `]` 分在三个 run 上 —— 也是**一个** chip */
+        { page: 0, block: "p0b3", start: 9, end: 13, token: "[12]", refs: [0], nums: [12] }
       ]
     });
     ui.markAll();
     var chips = document.querySelectorAll("#pages .cite");
-    ok("chip 数量=2（越界锚点被跳过）", chips.length === 2);
+    ok("chip 数量=4（越界锚点被跳过）", chips.length === 4);
     ok("chip[0] 文本 [1]", !!chips[0] && chips[0].textContent === "[1]");
     ok("chip[1] refs=1", !!chips[1] && chips[1].dataset.refs === "1");
 
+    // 跨 run 的一组引用：一个 chip（不碎成多块），文本与原 span 串一致
+    var group = document.querySelectorAll('.blk[data-id="p0b2"] .cite');
+    ok("作者-年份跨 run 合成 1 个 chip", group.length === 1);
+    ok("跨 run chip 文本完整",
+       !!group[0] && group[0].textContent === " (Wang et al., 2025; Movahedi et al., 2026");
+    ok("跨 run chip 内含 3 个 data-g 片段",
+       !!group[0] && group[0].querySelectorAll("[data-g]").length === 3);
+    ok("正文文字未丢失",
+       document.querySelector('.blk[data-id="p0b2"] .ln').textContent.trim() ===
+       "see (Wang et al., 2025; Movahedi et al., 2026)");
+
+    var numGroup = document.querySelectorAll('.blk[data-id="p0b3"] .cite');
+    ok("编号制括号+数字合成 1 个 chip",
+       numGroup.length === 1 && numGroup[0].textContent === "[12]");
+
     ui.markItem({ id: "p0b1", el: document.querySelector('.blk[data-id="p0b1"]') });
-    ok("重复标记幂等", document.querySelectorAll("#pages .cite").length === 2);
+    ok("重复标记幂等", document.querySelectorAll("#pages .cite").length === 4);
+
+    // 跨 run 的组重打两遍：仍然一个 chip，文字与 data-g 片段数都不变（幂等）
+    var el2 = document.querySelector('.blk[data-id="p0b2"]');
+    ui.markItem({ id: "p0b2", el: el2 });
+    ui.markItem({ id: "p0b2", el: el2 });
+    var g2 = el2.querySelectorAll(".cite");
+    ok("跨 run 组重打幂等",
+       g2.length === 1 && g2[0].querySelectorAll("[data-g]").length === 3 &&
+       g2[0].textContent === " (Wang et al., 2025; Movahedi et al., 2026" &&
+       el2.querySelector(".ln").textContent.trim() ===
+       "see (Wang et al., 2025; Movahedi et al., 2026)");
 
     // ⚠️ 幂等重打会把旧 chip 换掉（clearBlock 后重建）→ 点击前必须重新查询
     document.querySelector("#pages .cite").dispatchEvent(
@@ -85,6 +128,29 @@ window.addEventListener("error", function (e) {
     var reopened = !pop.hidden;
     pop.querySelector(".rp-x").dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     ok("✕ 按钮能关闭卡片", reopened && pop.hidden);
+
+    // 跨 run 的组：点它也弹同一批条目（一组引用 = 一个整体）
+    var g3 = document.querySelector('.blk[data-id="p0b2"] .cite');
+    g3.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    ok("跨 run 组点击弹卡", !pop.hidden && /J\. Smith/.test(pop.textContent) &&
+       /A\. Doe/.test(pop.textContent));
+    ok("跨 run 组 refs=0,1", g3.dataset.refs === "0,1");
+
+    /* ---- 卡片内的鼠标操作不能把卡片收掉（用户反馈：条目多时滚不到下面） ---- */
+    var innerText = pop.querySelector(".rp-text") || pop;
+    innerText.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true }));
+    ok("卡片内滚轮不收卡", !pop.hidden);
+    pop.dispatchEvent(new Event("scroll"));             // 真实滚动事件的 target 就是卡片
+    ok("卡片内滚动不收卡", !pop.hidden);
+    pop.scrollTop = 55;
+    ok("卡片可滚动（滚动位置生效或内容本来就不高）",
+       pop.scrollTop > 0 || pop.scrollHeight <= pop.clientHeight + 1);
+    pop.querySelector(".rp-text").dispatchEvent(
+      new MouseEvent("click", { bubbles: true, cancelable: true }));
+    ok("点卡片内部不收卡", !pop.hidden);
+    // 而在**页面**上滚动仍然收卡
+    window.dispatchEvent(new Event("scroll"));
+    ok("页面滚动收卡", pop.hidden);
   } catch (e) {
     log.push("EXC " + (e && e.message));
   }
@@ -93,7 +159,7 @@ window.addEventListener("error", function (e) {
   if (pre) pre.textContent = window.__refsLog;
 })();
 </script>
-<script src="js/reader2.js"></script>
+<script src="../js/reader2.js"></script>
 <script>
 /* 汇总：REFS-OK/BAD（模块功能）+ SYN-OK/ERR（reader2.js 语法） */
 (function () {

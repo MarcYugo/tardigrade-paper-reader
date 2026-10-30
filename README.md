@@ -26,17 +26,22 @@
    <center><img src="./function_display/citation2.png" width=400px></center>
    <center><img src="./function_display/citation3.png" width=400px></center>
 
+6. [26/10/30] a. 增加本地解析方案，使用pymupdf+OXR的版面分析模型+量化后的texify+SLANet，对latex代码编译的pdf有效；b. 优化参考文献显示功能，信息卡片持久显示和作者-年份引用显示效果；c. 翻译功能，翻译卡片可显示公式。
+   
+   <center><img src="./function_display/translate-formula2.png" width=400px></center>
+
 ## Pdf 解析模块
 
 把论文 PDF 解析成**可还原原版式的数据**（文字块 + 插图，保留原坐标、字号、字体）。提供三种解析方式，输出结构一致，前端无需改动。
 
-### 1. 本地模式
+### 1. 本地解析方案
 
-不依赖显卡和外部服务，装好即用，也是其他方式不可用时的**兜底**。
+不依赖显卡和外部服务，装好即用，也是其他方式不可用时的**兜底**，解析latex代码编译生成的pdf效果最好。
 
 - 文字按 PDF 原始行框、字号、字体、颜色还原；
 - 自动提取插图（内嵌图片与矢量图表），过滤整页背景、过小贴图；
-- 不具备数学语义，公式按原文文字显示。
+- 数学公式（独立公式和行内公式）提取靠字体识别+texify转换。
+- 使用前需要下载，详情查看该模块中的 [README.md](./paper-trans-to-html/backend/pdf_parser/local_parse_pipeline/README.md)
 
 ### 2. Surya
 
@@ -110,8 +115,13 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 - [x] ~~公式解析优化，重影缺失等问题~~
 - [x] ~~图片显示，子图caption重影缺失等问题~~
-- [ ] pymupdf 本地解析优化
+- [x] ~~pymupdf 本地解析优化~~
 - [x] ~~unlimited ocr 解析和渲染路径实现~~
-- [ ] 引用链接显示功能优化
+- [x] ~~引用链接显示功能优化~~
+- [ ] OXR解析后端
+- [ ] unlimited-ocr解析后端优化
+- [ ] 笔记导出功能
+- [ ] cpu解析组的解析和渲染服务优化
+
 
 <!-- https://github.com/MarcYugo/crockroach-paper-reader -->
