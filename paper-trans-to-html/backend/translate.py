@@ -413,10 +413,18 @@ class Translator:
     # ---------------- OpenAI 兼容接口(DeepSeek / OpenAI / 自建中转) ----------------
     def _post_chat(self, body: dict) -> str:
         """POST 一次 chat/completions，返回助手正文。"""
+        data = self._post_chat_payload(body)
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception as exc:
+            raise TranslationUnavailable(f"翻译响应解析失败：{exc}") from exc
+
+    def _post_chat_payload(self, body: dict) -> dict:
+        """POST 一次 chat/completions，返回完整的 OpenAI 兼容响应。"""
         try:
             resp = httpx.post(
                 f"{self.base}/chat/completions",
-                headers={"Authorization": f"Bearer {self.key}",
+                headers={"Authorization": "Bearer " + self.key,
                          "Content-Type": "application/json"},
                 json=body, timeout=self.timeout)
         except Exception as exc:
@@ -427,7 +435,7 @@ class Translator:
                 f"翻译服务返回 {resp.status_code}：{resp.text[:200]}")
 
         try:
-            return resp.json()["choices"][0]["message"]["content"]
+            return resp.json()
         except Exception as exc:
             raise TranslationUnavailable(f"翻译响应解析失败：{exc}") from exc
 
@@ -466,6 +474,111 @@ class Translator:
             "temperature": temperature,
         }) or "").strip()
 
+    def chat_completion(self, system: str, messages: list[dict], *,
+                        tools: list[dict] | None = None,
+                        temperature: float = 0.3) -> dict:
+        """执行一次 OpenAI 兼容聊天请求，返回 assistant message（可包含 tool_calls）。"""
+        convo = self._convo(system, messages)
+        body = {"model": self.model, "messages": convo, "temperature": temperature}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        data = self._post_chat_payload(body)
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise TranslationUnavailable(f"翻译响应解析失败：{exc}") from exc
+        if not isinstance(message, dict):
+            raise TranslationUnavailable("翻译响应格式不符")
+        return message
+
+    def chat_completion_stream(self, system: str, messages: list[dict], *,
+                               tools: list[dict] | None = None,
+                               temperature: float = 0.3) -> Iterator[dict]:
+        """流式输出正文增量，并在末尾返回完整的 assistant message/tool_calls。"""
+        convo = self._convo(system, messages)
+        body = {"model": self.model, "messages": convo,
+                "temperature": temperature, "stream": True}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        return self._stream_completion(body)
+
+    def _stream_completion(self, body: dict) -> Iterator[dict]:
+        content: list[str] = []
+        calls: dict[int, dict] = {}
+        try:
+            with httpx.stream(
+                    "POST", f"{self.base}/chat/completions",
+                    headers={"Authorization": "Bearer " + self.key,
+                             "Content-Type": "application/json",
+                             "Accept": "text/event-stream"},
+                    json=body, timeout=self.timeout) as resp:
+                if resp.status_code != 200:
+                    detail = resp.read().decode("utf-8", "replace")[:200]
+                    raise TranslationUnavailable(
+                        f"翻译服务返回 {resp.status_code}：{detail}")
+                for raw in resp.iter_lines():
+                    line = (raw or "").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line:
+                        continue
+                    if line == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    choices = chunk.get("choices") if isinstance(chunk, dict) else None
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    choice = choices[0] if isinstance(choices[0], dict) else {}
+                    delta = choice.get("delta")
+                    if not isinstance(delta, dict):
+                        message = choice.get("message")
+                        delta = message if isinstance(message, dict) else {}
+                    text = delta.get("content")
+                    if isinstance(text, str) and text:
+                        content.append(text)
+                        yield {"type": "delta", "text": text}
+                    for call in delta.get("tool_calls") or []:
+                        if not isinstance(call, dict):
+                            continue
+                        try:
+                            index = int(call.get("index", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        row = calls.setdefault(index, {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        })
+                        if call.get("id"):
+                            row["id"] = str(call["id"])
+                        function = call.get("function")
+                        if isinstance(function, dict):
+                            if isinstance(function.get("name"), str):
+                                row["function"]["name"] += function["name"]
+                            arguments = function.get("arguments")
+                            if isinstance(arguments, str):
+                                row["function"]["arguments"] += arguments
+                            elif isinstance(arguments, dict):
+                                row["function"]["arguments"] = arguments
+            message = {"content": "".join(content)}
+            if calls:
+                message["tool_calls"] = [calls[i] for i in sorted(calls)]
+            yield {"type": "completion", "message": message}
+        except TranslationUnavailable:
+            raise
+        except Exception as exc:
+            raise TranslationUnavailable(f"请求翻译服务失败：{exc}") from exc
+
+    def validate_chat(self, messages: list[dict]) -> None:
+        """在开启流式响应前校验当前账号是否可用对话模型。"""
+        self._convo("", messages)
+
     def _convo(self, system: str, messages: list[dict]) -> list[dict]:
         """把 `system` + 多轮消息拼成 OpenAI 的 `messages`，顺便做能力校验。"""
         if not self.ready or self.backend != "openai":
@@ -475,9 +588,18 @@ class Translator:
         convo = [{"role": "system", "content": system}]
         for m in messages or []:
             role = m.get("role")
-            content = (m.get("content") or "").strip()
-            if role in ("user", "assistant") and content:
-                convo.append({"role": role, "content": content})
+            if role in ("user", "assistant"):
+                content = m.get("content")
+                if isinstance(content, str):
+                    content = content.strip() or None
+                if content or (role == "assistant" and m.get("tool_calls")):
+                    row = {"role": role, "content": content}
+                    if role == "assistant" and m.get("tool_calls"):
+                        row["tool_calls"] = m["tool_calls"]
+                    convo.append(row)
+            elif role == "tool" and m.get("tool_call_id"):
+                convo.append({"role": "tool", "tool_call_id": str(m["tool_call_id"]),
+                              "content": str(m.get("content") or "")})
         if len(convo) < 2:                       # 只有 system，没什么可答的
             raise TranslationUnavailable("没有可发送的内容")
         return convo
@@ -498,7 +620,7 @@ class Translator:
         try:
             with httpx.stream(
                     "POST", f"{self.base}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.key}",
+                    headers={"Authorization": "Bearer " + self.key,
                              "Content-Type": "application/json",
                              "Accept": "text/event-stream"},
                     json=body, timeout=self.timeout) as resp:
@@ -572,7 +694,7 @@ def probe_llm(base_url: str, api_key: str, model: str, timeout: float = 30) -> s
     try:
         resp = httpx.post(
             f"{base}/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
             json={"model": model,
                   "messages": [{"role": "user", "content": "ping"}],
                   "max_tokens": 1},

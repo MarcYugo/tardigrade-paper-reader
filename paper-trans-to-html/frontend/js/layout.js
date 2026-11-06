@@ -89,11 +89,23 @@ window.R2Layout = function (env) {
     return best;
   }
   // 页面尺寸与批注栏宽度只跟窗口/缩放/有无笔记有关，不依赖已渲染的 DOM
+  /* Unlimited-OCR 文档的默认显示比例。
+     这一套解析给的是 PDF 真实字号（正文 12pt、标题 28pt），按 CSS_W(900) 铺满后
+     比网页阅读习惯大一号。这里把**页面基准宽度**乘一个系数 —— 因为 S = pageW / PDF宽，
+     所以正文/标题/公式/图片/行高/文字坐标全部同比例缩，块与块的相对位置一点不变。
+     （只缩 font-size 不行：版式是绝对定位的，字号变小后每段底部会空出一截。）
+     1 = 与 PDF 等比，0.8 = 更小。只影响 parser=unlimited_ocr 的文档。 */
+  const DOC_SCALE = 0.85;
+  function basePageW() {
+    const p = env.DOC && env.DOC.parser;
+    const k = (p === "unlimited_ocr" || p === "unlimited_ocr_online") ? DOC_SCALE : 1;
+    return env.CSS_W * k;
+  }
   function computePageTarget() {
     // 整体缩放时视口在布局坐标里只有 clientWidth/ZOOM 这么宽；页面宽度保持 CSS_W，
     // 由 <html> 的 zoom 把它放大(不支持 zoom 的浏览器才退回“直接算宽页面”的老算法)
     const clientW = env.vpW();
-    const want = env.ZOOM_OK ? env.CSS_W : env.CSS_W * env.ZOOM();
+    const want = env.ZOOM_OK ? basePageW() : basePageW() * env.ZOOM();
     const drawerOpen = !!($("side") && $("side").classList.contains("open"));
     // 左侧目录展开时也要给它让出宽度，否则页面会被盖住
     const tocW = env.tocPanelOpen() ? env.TOC_W : 0;
@@ -149,7 +161,8 @@ window.R2Layout = function (env) {
     box.style.position = side ? "absolute" : "";
     box.style.minWidth = side ? "0" : "";
     box.style.width = side ? env.noteW + "px" : "";
-    box.style.left = side ? (env.noteLeft - it.x) + "px" : "";
+    box.style.left = side
+      ? (env.noteLeft - it.x - (it.ulXShift || 0)) + "px" : "";
     if (!side) box.style.top = "";
   }
   // 右侧笔记卡：先按“句子首行”定高，再自上而下依次避让；返回最底部(页面坐标)
@@ -167,7 +180,13 @@ window.R2Layout = function (env) {
     for (const it of boxes) {
       const h = it.nbox.offsetHeight;
       const y = Math.max(it.noteY, cursor + env.NOTE_GAP);
-      it.nbox.style.top = (y - it.y - it.contentH) + "px";   // 相对 .exp(块顶+contentH)
+      // ⚠️ nbox 挂在 `.exp` 里，而 `.exp` 是 `.blk` 的子元素 —— 块被内容避让
+      //    （syShift/ulShift，走 style.top）和卡片顶开（shift，走 transform）挪动时，
+      //    笔记卡**已经**跟着一起挪了。这里只补「目标页面 y」与「块当前页面 y」的差值；
+      //    若再减去 `it.y + contentH`，位移量就被加了两遍：实测一张译文卡把正文顶开
+      //    111px 时，笔记卡多下移了整整 111px，与它对应的句子彻底错位。
+      const blkPageY = it.y + (it.syShift || 0) + (it.ulShift || 0) + (it.shift || 0);
+      it.nbox.style.top = (y - blkPageY - it.contentH) + "px";   // 相对 .exp(块顶+contentH)
       cursor = y + h;
     }
     return boxes.length ? cursor : 0;
@@ -187,7 +206,7 @@ window.R2Layout = function (env) {
       if (it.kind !== "blk") continue;
       const col = it.col = columnOf(it, cols);
       if (col) {
-        it.exp.style.left = (col.x - it.x).toFixed(1) + "px";
+        it.exp.style.left = (col.x - it.x - (it.ulXShift || 0)).toFixed(1) + "px";
         it.exp.style.width = col.w.toFixed(1) + "px";
       } else {
         it.exp.style.left = "";
@@ -211,11 +230,12 @@ window.R2Layout = function (env) {
       if (!it.surya || it.syShift === undefined) continue;
       it.el.style.top = (it.y + it.syShift).toFixed(1) + "px";
     }
-    // ⓪-b Unlimited-OCR 内容和图片的避让（settleUnlimitedVertical 精确计算）：
-    //    避让量存在 ulShift，与 Surya 的 syShift 各自独立。
+    // ⓪-b Unlimited-OCR 内容和图片的二维避让（settleUnlimitedLayout 精确计算）：
+    //    避让量存在 ulShift / ulXShift，与 Surya 的 syShift 各自独立。
     for (const it of items) {
       if (!it.unlimited || it.ulShift === undefined) continue;
       it.el.style.top = (it.y + it.ulShift).toFixed(1) + "px";
+      it.el.style.left = (it.x + (it.ulXShift || 0)).toFixed(1) + "px";
     }
     /* ① 卡片矩形避让：一张展开的卡片占据**一块矩形**——
        纵向从宿主内容底往下 expH，横向是卡片宽度（expW）。
@@ -234,15 +254,28 @@ window.R2Layout = function (env) {
          2) `+= 卡片高` 只在「块紧贴宿主内容底」时才够，块顶到卡片顶之间原有行距
             没算进去 → 卡片下方总要少推一截（实测压 15px）。 */
     const CARD_GAP = 6;                          // 卡片底与下方正文之间留的间隙
+    const layoutX = it => it.x + (it.ulXShift || 0);
+    const layoutY = it => it.y + (it.syShift || 0) + (it.ulShift || 0);
     // 卡片的横向范围：卡片已按栏对齐（`exp.style.left` 挪到栏起点），所以不能再用
     // 宿主的 `x/w` 判重叠，要拿**栏**的 x/w 去跟内容比。
     const cardHits = (o, it) => {
-      const cx = o.col ? o.col.x : o.x;
+      const cx = o.col ? o.col.x : layoutX(o);
       const cw = o.expW || o.w;
-      return Math.max(0, Math.min(cx + cw, it.x + it.w) - Math.max(cx, it.x)) > 1;
+      return Math.max(0, Math.min(cx + cw, layoutX(it) + it.w) -
+                        Math.max(cx, layoutX(it))) > 1;
     };
+    /* 阅读顺序：原始 y 更小 ⇒ 这块正文在卡片宿主**上方**。
+       卡片只负责把它**下面**的内容顶开；一块上方的正文若被挤进了卡片矩形，
+       说明它是被上面更早的卡片顶下来的 —— 这时要让卡片（连同宿主）挪到它下面，
+       而不是把这块更早的正文继续往下拖。
+
+       ⚠️ 少了这条判定会形成“级联下推”：A 卡把 T3 顶下去 → T3 落进 T4 卡的矩形
+       → T3 又被 T4 卡顶下去 → 再落进 T5 卡…… 每次叠加一整张卡高 + 间隙，
+       实测第 5 页 T3 被推到 594px、其后逐块 831/913px，卡下方空出半页
+       （复算脚本可复现）。 */
+    const isAbove = (it, o) => layoutY(it) < layoutY(o) - 0.5;
     for (const it of items) it.shift = 0;
-    for (let pass = 0; pass < 12; pass++) {
+    for (let pass = 0; pass <= items.length; pass++) {
       let grew = false;
       // (b) 同栏单调：后一块不能被甩到前一块上面（阅读顺序会乱、卡片区看着像“错行”）
       //     放在 (a) 前面：先把「宿主上面那块被顶开后，宿主自己也得跟着走」跑完，
@@ -250,28 +283,34 @@ window.R2Layout = function (env) {
       for (let i = 1; i < items.length; i++) {
         const prev = items[i - 1], it = items[i];
         if (prev.kind !== "blk" || it.kind !== "blk") continue;
-        if (!xOverlap(prev, it)) continue;
+        if (Math.max(0, Math.min(layoutX(prev) + prev.w, layoutX(it) + it.w) -
+                           Math.max(layoutX(prev), layoutX(it))) <= 1) continue;
         if ((it.shift || 0) < (prev.shift || 0) - 0.5) {
           it.shift = prev.shift || 0; grew = true;
         }
       }
-      // (a) 卡片矩形：与矩形相交、且**起点在宿主之下**的同栏内容统统落到矩形底之下
-      //     （`it` 不限于文字块：插图/表格压在卡片下面同样要顶开）
-      //     ⚠️ `it.y <= o.y` 的（在宿主上方、只是 bbox 与宿主重叠的邻块）**不能被这张卡推**：
-      //     它们往下顶时应该带着宿主一起走（见 (b)），否则会被上面每一张卡各推一次 ——
-      //     实测 p7s1 被三张卡连着推到 242px，实际只需 90px（页面上多出一大块空白）。
+      // (a) 卡片矩形：只把实际与卡片矩形相交、且横向重叠的内容移到卡片下方
+      //     （`it` 不限于文字块：插图/表格压在卡片下面同样要顶开）。
+      //     用实际相交判定而非块顶相对宿主块顶的位置，避免已避让下移的块仍压住卡片。
+      //     cardTop 每轮重算：本规则里会改宿主的 shift（让位分支），矩形跟着动。
       for (const o of items) {
         if (o.kind !== "blk" || !o.expH) continue;
-        const cardTop = o.y + o.contentH + (o.shift || 0);
-        const cardBottom = cardTop + o.expH + CARD_GAP;
         for (const it of items) {
-          if (it === o || it.y <= o.y + 1) continue;             // 宿主上方的块不归这张卡推
+          if (it === o) continue;
           if (!cardHits(o, it)) continue;
+          const cardTop = layoutY(o) + o.contentH + (o.shift || 0);
+          const cardBottom = cardTop + o.expH + CARD_GAP;
           const ih = it.kind === "blk" ? it.contentH : it.h;    // 内容高（插图直接用外框）
-          const top = it.y + (it.shift || 0);
+          const top = layoutY(it) + (it.shift || 0);
+          // 上方的正文被顶进了卡片矩形：卡片让到它下面（见 isAbove 说明）
+          if (isAbove(it, o)) {
+            const need = top + ih + CARD_GAP - (layoutY(o) + o.contentH);
+            if (need > (o.shift || 0) + 0.5) { o.shift = need; grew = true; }
+            continue;
+          }
           if (top >= cardBottom - 0.5) continue;                 // 已经在卡片下方
           if (top + ih <= cardTop + 0.5) continue;               // 整块在卡片上方
-          const need = cardBottom - it.y;
+          const need = cardBottom - layoutY(it);
           if (need > (it.shift || 0) + 0.5) { it.shift = need; grew = true; }
         }
       }
@@ -280,38 +319,40 @@ window.R2Layout = function (env) {
       for (let oi = 0; oi < items.length; oi++) {
         const o = items[oi];
         if (o.kind !== "blk" || !o.expH) continue;
-        const oTop = o.y + o.contentH + (o.shift || 0);
+        const oTop = layoutY(o) + o.contentH + (o.shift || 0);
         const oBottom = oTop + o.expH + CARD_GAP;
         for (let ii = oi + 1; ii < items.length; ii++) {
           const it = items[ii];
           if (it.kind !== "blk" || !it.expH) continue;
           if (!cardHits(o, it)) continue;
-          const itTop = it.y + it.contentH + (it.shift || 0);
+          const itTop = layoutY(it) + it.contentH + (it.shift || 0);
           if (itTop + it.expH <= oTop + 0.5 || itTop >= oBottom - 0.5) continue;
-          const need = oBottom - (it.y + it.contentH);
+          const need = oBottom - (layoutY(it) + it.contentH);
           if (need > (it.shift || 0) + 0.5) { it.shift = need; grew = true; }
         }
       }
-      if (!grew) break;
-    }
-    // ② 传递位移：被顶开的**宽元素**（典型是跨栏插图）会把压在它正下方的内容也带下去。
-    //    例：右栏的卡片把下面的插图顶下去 154px，插图下方那半栏的标题/页码 x 不与
-    //    卡片栏重叠，①不会动它们 —— 结果就被下移的插图盖住。这里让「某个已位移元素
-    //    正下方 + 横向相交」的元素至少取那个位移；取 max，迭代到收敛。
-    //    ⚠️ 必须要求 `it` 的顶在 `m` 的顶之下（`it.y > m.y + 1`）：只比底边的话，
-    //    同一视觉行的左右邻块（底边齐平）会互相传染，卡片宿主自己也被推走。
-    let grew = true;
-    while (grew) {
-      grew = false;
-      for (const it of items) {
-        const bottom = it.kind === "blk" ? it.y + it.contentH : it.y + it.h;
-        for (const m of items) {
-          if (m === it || m.shift <= it.shift) continue;
-          if (it.y <= m.y + 1) continue;                 // 不是「在它正下方」，不传染
-          const mb = m.kind === "blk" ? m.y + m.contentH : m.y + m.h;
-          if (mb <= bottom + 0.5 && xOverlap(m, it)) { it.shift = m.shift; grew = true; }
+      // ② 传递位移：被顶开的宽元素会把压在它正下方的内容也带下去。
+      //    在卡片避让循环内传播，确保传播后移动的卡片宿主会再次参与碰撞计算。
+      let propagationGrew = true;
+      while (propagationGrew) {
+        propagationGrew = false;
+        for (const it of items) {
+          const bottom = layoutY(it) + (it.kind === "blk" ? it.contentH : it.h);
+          for (const m of items) {
+            if (m === it || m.shift <= it.shift) continue;
+            if (layoutY(it) <= layoutY(m) + 1) continue;
+            const mb = layoutY(m) + (m.kind === "blk" ? m.contentH : m.h);
+            const overlapX = Math.max(0, Math.min(layoutX(m) + m.w, layoutX(it) + it.w) -
+                                        Math.max(layoutX(m), layoutX(it)));
+            if (mb <= bottom + 0.5 && overlapX > 1) {
+              it.shift = m.shift;
+              propagationGrew = true;
+              grew = true;
+            }
+          }
         }
       }
+      if (!grew) break;
     }
     for (const it of items) {
       it.el.style.transform = it.shift ? "translateY(" + it.shift + "px)" : "";
@@ -331,11 +372,11 @@ window.R2Layout = function (env) {
 
     let maxB = pg.h;
     for (const it of items) {
-      const base = it.kind === "blk" ? it.y + it.contentH : it.y + it.h;
+      const base = layoutY(it) + (it.kind === "blk" ? it.contentH : it.h);
       const sy = it.syShift || 0;         // Surya 内容避让量（走 style.top，不在 shift 里）
       const ul = it.ulShift || 0;         // Unlimited-OCR 内容避让量（同口径，独立字段）
-      let b = base + sy + ul + (it.shift || 0);
-      if (it.expH) b = Math.max(b, it.y + it.contentH + sy + ul + (it.shift || 0) + it.expH);
+      let b = base + (it.shift || 0);
+      if (it.expH) b = Math.max(b, base + (it.shift || 0) + it.expH);
       if (b > maxB) maxB = b;
     }
     if (noteBottom > maxB) maxB = noteBottom;   // 右侧笔记卡也不能压到下一页
@@ -343,5 +384,6 @@ window.R2Layout = function (env) {
   }
 
   /* ============ 对外接口 ============ */
-  return { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, xOverlap, pageColumns };
+  return { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, xOverlap, pageColumns,
+           basePageW };
 };

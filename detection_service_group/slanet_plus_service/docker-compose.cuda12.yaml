@@ -1,7 +1,0 @@
-# Deprecated: 本文件已废弃（新版 Dockerfile 默认就用 CUDA 12.6 runtime 基础镜像）。
-#
-# GPU 直通现在放在 docker-compose.gpu.yaml：
-#   docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up -d --build
-# 或者直接跑 ./docker-up.sh（脚本会自动探测 nvidia-smi 后决定是否叠加）。
-# 基础镜像要换版本时，用构建参数即可：
-#   docker compose build --build-arg BASE_IMAGE=<镜像>

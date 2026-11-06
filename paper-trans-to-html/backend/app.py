@@ -26,8 +26,9 @@ from . import converter
 from . import pdf_parser
 from . import records
 from . import pdf_refs as refs_mod
-from .ai_read import (article_text, build_summary, clean_notes, clean_summary,
-                      notes_fingerprint, reply_chat_stream, summary_empty)
+from .ai_read import (add_summary_item, article_text, build_summary, clean_notes,
+                      clean_summary, locate_page, locate_text_block,
+                      notes_fingerprint, reply_agent_stream, summary_empty)
 from .db import StorageUnavailable, mongo
 from .storage import build as build_storage
 from .storage import rebuild as rebuild_storage
@@ -639,7 +640,8 @@ async def api_convert(request: Request, file: UploadFile = File(...)):
     tmp.write_bytes(await file.read())
     try:
         meta = await run_in_threadpool(converter.convert, store, doc_id, tmp, name,
-                                       user["username"])
+                                       user["username"],
+                                       _parser_options_for(user["username"]))
     except Exception as exc:
         store.delete(doc_id)
         raise HTTPException(400, f"转换失败：{exc}") from exc
@@ -659,6 +661,7 @@ async def api_doc_reparse(request: Request, doc_id: str,
     `pages`/`parser`/`parser_info`/插图，笔记、高亮、译文、进度一个不动。
     解析失败不改动已有数据。
     """
+    user = _require_user(request)
     _doc_access(request, doc_id, "write")
     name = file.filename or "paper.pdf"
     if not name.lower().endswith(".pdf"):
@@ -668,7 +671,9 @@ async def api_doc_reparse(request: Request, doc_id: str,
     tmp = tmp_dir / f"reparse-{doc_id}.pdf"
     tmp.write_bytes(await file.read())
     try:
-        summary = await run_in_threadpool(converter.reparse, store, doc_id, tmp)
+        summary = await run_in_threadpool(
+            converter.reparse, store, doc_id, tmp,
+            parser_options=_parser_options_for(user["username"]))
     except FileNotFoundError as exc:
         raise HTTPException(404, "文档数据缺失") from exc
     except Exception as exc:
@@ -906,14 +911,37 @@ def api_apply_anno(request: Request, doc_id: str, payload: dict = Body(...)):
     rec, _perm = _doc_access(request, doc_id, "write")      # 只读共享不能改笔记/高亮
     user = _require_user(request)
     action = payload.get("action")
-    if action not in ("add_highlight", "remove_highlight", "add_note", "remove_note"):
+    if action not in ("add_highlight", "remove_highlight", "add_note", "remove_note",
+                      "add_free_note", "update_free_note", "remove_free_note"):
         raise HTTPException(400, "不支持的操作")
+    title = str(payload.get("title") or "").strip()
+    text = payload.get("text")
+    if action in ("add_free_note", "update_free_note"):
+        if payload.get("title") is not None and not isinstance(payload.get("title"), str):
+            raise HTTPException(400, "独立笔记标题格式无效")
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(400, "独立笔记内容不能为空")
+        if len(text) > 12000:
+            raise HTTPException(400, "独立笔记内容不能超过 12000 字")
+        if len(title) > 200:
+            raise HTTPException(400, "独立笔记标题不能超过 200 字")
+        note_id = str(payload.get("note_id") or "").strip() or None
+        if action in ("update_free_note", "remove_free_note") and not note_id:
+            raise HTTPException(400, "缺少独立笔记 ID")
+        if action in ("update_free_note", "remove_free_note") and not any(
+                n.get("id") == note_id
+                for n in (store.get_annotations(doc_id).get("free_notes") or [])
+                if isinstance(n, dict)):
+            raise HTTPException(404, "独立笔记不存在")
+    else:
+        note_id = payload.get("note_id")
     anno = store.apply_anno(
         doc_id, action,
         block_id=payload.get("block_id"),
         color=payload.get("color"),
-        text=payload.get("text"),
-        note_id=payload.get("note_id"),
+        text=text,
+        note_id=note_id,
+        title=title,
         by=user["username"],        # 笔记要记下是谁写的（共享论文里会显示）
     )
     return records.anno_with_authors(anno, rec)
@@ -1054,22 +1082,18 @@ def _sse(obj: dict) -> str:
 def _ai_doc_notes(doc_id: str) -> list[dict]:
     """该论文当前的笔记（存储层口径，带 block_id）：用来算指纹。"""
     try:
-        return store.get_annotations(doc_id).get("notes") or []
+        anno = store.get_annotations(doc_id)
+        return (anno.get("notes") or []) + (anno.get("free_notes") or [])
     except Exception:
         return []
 
 
-def _ai_doc_article(doc_id: str) -> str:
-    """整篇正文（含每页公式 LaTeX），给 AI 对话当上下文。
-
-    读不到文档（老数据/存储异常）时返回空串：对话**照常可用**，只是不带全文语境。
-    """
+def _ai_doc_data(doc_id: str) -> dict:
     try:
-        doc = store.read_doc(doc_id)
-    except Exception as exc:                # FileNotFoundError / 存储异常
-        log.warning("AI 对话：读取 %s 的文档失败，本次不带正文上下文（%s）", doc_id, exc)
-        return ""
-    return article_text(doc)
+        return store.read_doc(doc_id)
+    except Exception as exc:
+        log.warning("AI 对话：读取 %s 的文档失败（%s）", doc_id, exc)
+        return {}
 
 
 def _ai_stale(rec: dict) -> bool:
@@ -1175,16 +1199,13 @@ def api_ai_summary_save(request: Request, doc_id: str, payload: dict = Body(...)
 
 @app.post("/api/doc/{doc_id}/ai/chat")
 async def api_ai_chat(request: Request, doc_id: str, payload: dict = Body(...)):
-    """就这篇论文聊一轮（带着**整篇正文 + 每页公式 LaTeX**、笔记与已生成的整理），
-    **流式**返回。
+    """论文阅读 Agent：带着整篇正文、公式、笔记与整理回答，可把内容写进右侧整理卡片并定位内容。
 
-    正文由服务端从文档数据里现拼（`_ai_doc_article`）：模型从一开始就看到全文，
-    而不是只有笔记；公式位置在正文里是空格，对应的 LaTeX 附在每页末尾。
+    正文由服务端从文档数据里现拼；公式位置在正文里是空格，对应的 LaTeX 附在每页末尾。
+    Agent 写内容时走 `add_note_to_summary`：按分区追加到**右侧「笔记整理」卡片**，
+    不新建笔记。
 
-    SSE：先把正文**逐段**推给前端（`{"type":"delta","text":"..."}`），
-    避免"等整段生成完才一次性刷出来"的干等；最后一条
-    `{"type":"done","chat":[...]}` 给出落库后的完整对话（失败则是
-    `{"type":"error","message":"..."}`，此时服务端**不写库**）。
+    SSE 同时传输回复增量、工具状态与页面动作，结束时给出落库后的完整对话。
     """
     rec, _perm = _doc_access(request, doc_id, "write")
     user = _require_user(request)
@@ -1194,16 +1215,147 @@ async def api_ai_chat(request: Request, doc_id: str, payload: dict = Body(...)):
     if len(message) > AI_MAX_MESSAGE:
         raise HTTPException(400, f"消息太长了（上限 {AI_MAX_MESSAGE} 字）")
     tr = _translator_for(user["username"])
+    try:
+        tr.validate_chat([{"role": "user", "content": message}])
+    except TranslationUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
     ai = dict(rec.get("ai") or {})
     notes = clean_notes(payload.get("notes")) or (ai.get("notes") or [])
     history = ai.get("chat") or []
-    article = await run_in_threadpool(_ai_doc_article, doc_id)
+    doc = await run_in_threadpool(_ai_doc_data, doc_id)
+    article = article_text(doc)
+    stored_anno = await run_in_threadpool(store.get_annotations, doc_id)
+    pending_navigation = payload.get("pending_navigation")
+    navigation_answer = payload.get("navigation_answer")
+    if navigation_answer not in (None, "yes", "no"):
+        raise HTTPException(400, "导航确认选项无效")
+    if pending_navigation is not None:
+        if not isinstance(pending_navigation, dict):
+            raise HTTPException(400, "待确认的导航目标无效")
+        target = pending_navigation.get("target")
+        if target == "paper":
+            page = pending_navigation.get("page")
+            if (isinstance(page, bool) or not isinstance(page, int)
+                    or page < 1 or page > len(doc.get("pages") or [])):
+                raise HTTPException(400, "待确认的论文页码无效")
+            block_id = pending_navigation.get("block_id")
+            page_texts = (doc.get("pages") or [])[page - 1].get("texts") or []
+            if block_id is not None and (
+                    not isinstance(block_id, str)
+                    or not any(isinstance(block, dict) and block.get("id") == block_id
+                               for block in page_texts)):
+                raise HTTPException(400, "待确认的相关文本块无效")
+            pending_navigation = {"target": "paper", "page": page}
+            if block_id:
+                pending_navigation["block_id"] = block_id
+        elif target == "note":
+            note_id = pending_navigation.get("note_id")
+            all_notes = (stored_anno.get("notes") or []) + (stored_anno.get("free_notes") or [])
+            if (not isinstance(note_id, str)
+                    or not any(n.get("id") == note_id for n in all_notes if isinstance(n, dict))):
+                raise HTTPException(400, "待确认的笔记不存在")
+            pending_navigation = {"target": "note", "note_id": note_id}
+        else:
+            raise HTTPException(400, "待确认的导航类型无效")
+    elif navigation_answer is not None:
+        raise HTTPException(400, "缺少待确认的导航目标")
+
+    free_note_rows = []
+    free_note_ids = set()
+    for note in stored_anno.get("free_notes") or []:
+        if isinstance(note, dict) and note.get("id") and note.get("text"):
+            free_note_ids.add(note["id"])
+            free_note_rows.append({
+                "id": note["id"], "title": note.get("title") or "",
+                "note": note.get("text") or "", "page": 0,
+            })
+    notes = clean_notes(free_note_rows + [
+        note for note in notes if note.get("id") not in free_note_ids
+    ])
+
+    def execute_tool(name: str, args: dict) -> dict:
+        nonlocal stored_anno
+        if name == "add_note_to_summary":
+            # 写进右侧整理卡片（不新建笔记）：卡片为空时按分区先建起来
+            result, summary = add_summary_item(ai.get("summary"), args)
+            if result.get("ok"):
+                ai["summary"] = summary
+                ai["summary_edited_at"] = datetime.datetime.now().isoformat(
+                    timespec="seconds")
+                store.update_record(doc_id, ai=ai)
+                result["action"] = {"type": "summary_changed", "summary": summary}
+            return result
+
+        target = args.get("target")
+        if not isinstance(target, str):
+            return {"ok": False, "message": "定位目标格式无效"}
+        if target == "notes_panel":
+            return {"ok": True, "message": "已打开笔记栏",
+                    "action": {"type": "navigate", "target": "notes_panel"}}
+        if target == "note":
+            note_id = args.get("note_id")
+            if not isinstance(note_id, str):
+                return {"ok": False, "message": "笔记 ID 格式无效"}
+            all_notes = (stored_anno.get("notes") or []) + (stored_anno.get("free_notes") or [])
+            if not note_id or not any(n.get("id") == note_id for n in all_notes if isinstance(n, dict)):
+                return {"ok": False, "message": "没有找到这条笔记"}
+            action = {"type": "navigate", "target": "note", "note_id": note_id}
+            label = "指定笔记"
+        if target == "paper":
+            page = args.get("page")
+            total = len(doc.get("pages") or [])
+            if page is not None and (isinstance(page, bool) or not isinstance(page, int)
+                                     or page < 1 or page > total):
+                return {"ok": False, "message": f"页码无效，本文共 {total} 页"}
+            if page is None:
+                query = args.get("query") or ""
+                if not isinstance(query, str):
+                    return {"ok": False, "message": "论文检索内容格式无效"}
+                query = query.strip()[:500]
+                page = locate_page(doc, query)
+            else:
+                query = args.get("query") or ""
+                if not isinstance(query, str):
+                    return {"ok": False, "message": "论文检索内容格式无效"}
+                query = query.strip()[:500]
+            if not page:
+                return {"ok": False, "message": "无法从论文内容中确定相关页"}
+            action = {"type": "navigate", "target": "paper", "page": page}
+            block_id = locate_text_block(doc, page, query)
+            if block_id:
+                action["block_id"] = block_id
+            label = f"论文第 {page} 页"
+        if target in ("paper", "note"):
+            if pending_navigation:
+                same_destination = (
+                    pending_navigation.get("target") == action.get("target")
+                    and pending_navigation.get("page") == action.get("page")
+                    and pending_navigation.get("note_id") == action.get("note_id")
+                )
+                if navigation_answer == "no":
+                    return {"ok": False, "message": "用户拒绝了跳转，不要导航"}
+                if navigation_answer != "yes":
+                    return {"ok": False, "message": "用户尚未确认跳转，不要导航"}
+                if not same_destination:
+                    return {"ok": False, "message": "只能执行用户刚确认的导航目标"}
+                if target == "paper" and pending_navigation.get("block_id"):
+                    action["block_id"] = pending_navigation["block_id"]
+                return {"ok": True, "message": f"用户已回答，正在定位到{label}",
+                        "action": action}
+            return {"ok": True,
+                    "message": f"已找到{label}。先询问用户是否定位；确认后才能执行跳转。",
+                    "confirmation": action}
+        return {"ok": False, "message": "未知的定位目标"}
+
     try:
         # 这一步就把能提前发现的错误（没配 LLM / 没内容 / 参数不对）抛出来，
         # 而不是等 SSE 头已经发出去了才报错
-        chunks = reply_chat_stream(tr, title=rec.get("title") or "", notes=notes,
-                                   summary=ai.get("summary"), history=history,
-                                   message=message, article=article)
+        chunks = reply_agent_stream(tr, title=rec.get("title") or "", notes=notes,
+                                    summary=ai.get("summary"), history=history,
+                                    message=message, article=article,
+                                    execute_tool=execute_tool,
+                                    pending_navigation=pending_navigation,
+                                    navigation_answer=navigation_answer)
     except TranslationUnavailable as exc:
         # 只给原因：前端会自己加上「对话失败：」前缀（不然会重复）
         raise HTTPException(503, str(exc)) from exc
@@ -1211,9 +1363,10 @@ async def api_ai_chat(request: Request, doc_id: str, payload: dict = Body(...)):
     def gen():
         parts: list[str] = []
         try:
-            for piece in chunks:
-                parts.append(piece)
-                yield _sse({"type": "delta", "text": piece})
+            for event in chunks:
+                if event.get("type") == "delta":
+                    parts.append(event.get("text") or "")
+                yield _sse(event)
         except TranslationUnavailable as exc:
             yield _sse({"type": "error", "message": str(exc)})
             return
@@ -1263,69 +1416,63 @@ def api_config(request: Request):
         "backend": tr.backend,
         "llm_owner": user["username"],
         # PDF 解析后端：
-        #   auto / pymupdf / detection_service_group → 本地解析方案
+        #   auto / pymupdf → 本地解析方案
         #     （PyMuPDF 版式 + texify 公式 + OXR 版面 / SLANet 表格，见 backend_pymupdf.py）
         #   surya → 整页 OCR：文字/公式/插图全用 Surya 数据
         #   unlimited_ocr → 整页 OCR：文字/公式/表格/插图全用 Unlimited-OCR 数据
-        "parser": pdf_parser.status(CONFIG_FILE),
+        "parser": pdf_parser.status(
+            CONFIG_FILE, account_options=_parser_options_for(user["username"])),
         # 数据存储后端：mongo(MongoDB) / json(本地文件回退)
         "storage": _storage_state(),
     }
 
 
 # ---------------- PDF 解析后端切换 ----------------
-PARSER_BACKENDS = ("auto", "detection_service_group", "surya", "unlimited_ocr",
-                   "pymupdf")
+PARSER_BACKENDS = ("auto", "surya", "unlimited_ocr", "pymupdf")
 
 
-def _write_parser_backend(backend: str) -> None:
-    """把选定的解析后端写进 config.json 的 parser 段(安装级配置，所有账号共用)。"""
-    data: dict = {}
-    if CONFIG_FILE.exists():
-        try:
-            loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception:
-            data = {}          # 配置损坏时用最小结构重建，不阻塞切换
-    parser = data.get("parser")
+def _parser_options_for(username: str) -> dict:
+    """返回账号专属的解析选项；未设置时沿用 config.json 中的安装级默认值。"""
+    parser = auth.get_prefs(username).get("parser")
     if not isinstance(parser, dict):
-        parser = {}
-    parser["backend"] = backend
-    data["parser"] = parser
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(CONFIG_FILE)
+        return {}
+    return {key: value for key, value in parser.items()
+            if key == "backend" and value in PARSER_BACKENDS}
 
 
 @app.get("/api/settings/parser")
 def api_settings_parser_get(request: Request):
     """当前 PDF 解析(OCR)后端状态。"""
-    _require_user(request)
-    return pdf_parser.status(CONFIG_FILE)
+    user = _require_user(request)
+    return pdf_parser.status(
+        CONFIG_FILE, account_options=_parser_options_for(user["username"]))
 
 
 @app.post("/api/settings/parser")
 def api_settings_parser_set(request: Request, payload: dict = Body(...)):
-    """切换 PDF 解析后端：auto / detection_service_group / surya / unlimited_ocr /
-    pymupdf。
+    """切换 PDF 解析后端：auto / surya / unlimited_ocr / pymupdf。
 
-    安装级配置(写 config.json 的 parser.backend)，与本机所有账号共用。
-    若环境变量 PDF_PARSER_BACKEND 已设置，它会覆盖这里的取值
+    保存到当前账号的 users.prefs.parser.backend；解析服务参数仍来自安装级配置。
+    若环境变量 PDF_PARSER_BACKEND 已设置，它会覆盖账号选择
     (status 里的 env_override 会告诉前端)。
     """
-    _require_user(request)
+    user = _require_user(request)
     backend = str((payload or {}).get("backend") or "").strip().lower()
     if backend not in PARSER_BACKENDS:
         raise HTTPException(400, f"未知的解析后端：{backend or '(空)'}；"
                                  f"可选 {'/'.join(PARSER_BACKENDS)}")
+    parser_prefs = auth.get_prefs(user["username"]).get("parser")
+    parser_prefs = dict(parser_prefs) if isinstance(parser_prefs, dict) else {}
+    parser_prefs["backend"] = backend
     try:
-        _write_parser_backend(backend)
-    except OSError as exc:
-        raise HTTPException(500, f"写入 {CONFIG_FILE.name} 失败：{exc}") from exc
-    log.info("PDF 解析(OCR)后端已切换为 %s", backend)
-    return {"ok": True, "backend": backend, "parser": pdf_parser.status(CONFIG_FILE)}
+        auth.set_prefs(user["username"], {"parser": parser_prefs})
+    except auth_mod.AuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    log.info("账号 %s 的 PDF 解析(OCR)后端已切换为 %s",
+             user["username"], backend)
+    parser_status = pdf_parser.status(
+        CONFIG_FILE, account_options=_parser_options_for(user["username"]))
+    return {"ok": True, "backend": backend, "parser": parser_status}
 
 
 # ---------------- 存储状态 / 热切换 ----------------

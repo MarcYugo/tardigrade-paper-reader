@@ -51,23 +51,27 @@
     </div>
   </main>
 
-  <!-- 文末 · AI 辅助阅读：左边聊思路，右边是笔记整理（读到 ≥95% 自动整理一次）。
-       放在 .reader-main 之外：它不需要为右侧批注栏留白，否则整理框会被挤得很窄。 -->
+  <!-- 随阅读视口悬浮的 AI 辅助阅读：左边聊思路，右边是笔记整理（读到 ≥95% 自动整理一次）。 -->
   <section class="ai-end" id="aiEnd">
     <div class="ai-in">
       <div class="ai-head">
-        <b><i class="ai-mark" aria-hidden="true"></i>AI 辅助阅读</b>
+        <button class="ai-collapse" id="aiToggle" type="button" aria-expanded="true"
+                aria-controls="aiBody" title="收起 AI 辅助阅读和笔记">
+          <i class="ai-mark" aria-hidden="true"></i>
+          <span>AI 辅助阅读与笔记</span>
+          <span class="ai-collapse-icon" aria-hidden="true"></span>
+        </button>
         <span class="ai-sub" id="aiSub"></span>
         <span class="grow"></span>
         <button class="btn ghost" id="aiRegen" type="button" title="按当前笔记重新整理一次">重新整理</button>
         <button class="btn ghost" id="aiClear" type="button" title="只清掉对话，整理结果保留">清空对话</button>
       </div>
-      <div class="ai-body" id="aiBody">
+      <div class="ai-body" id="aiBody" aria-labelledby="aiToggle">
         <div class="ai-chat" id="aiChat">
           <div class="ai-msgs" id="aiMsgs"></div>
           <div class="ai-send">
             <textarea id="aiText" rows="2" spellcheck="false"
-                      placeholder="就这篇论文或你的笔记提问（Enter 发送，Shift+Enter 换行）"></textarea>
+                      placeholder="提问、要求添加独立笔记，或让 AI 定位论文/笔记（Enter 发送，Shift+Enter 换行）"></textarea>
             <button class="btn primary" id="aiSend" type="button">发送</button>
           </div>
         </div>
@@ -92,17 +96,18 @@
         <span class="cnt" id="tocAiState"></span>
       </div>
       <div class="toc-ai-list" id="tocAiList"></div>
-      <button class="toc-ai-go" id="tocAiGo" type="button">去文末看整理 / 聊一聊 →</button>
+      <button class="toc-ai-go" id="tocAiGo" type="button">打开 AI 阅读与笔记 →</button>
     </div>
 
     <div class="toc-foot" id="tocFoot"></div>
   </aside>
 
-  <!-- 右侧“全部笔记”总览（笔记正文内嵌在正文句下方，这里只做一览/定位） -->
+  <!-- 右侧笔记栏：句子笔记与独立笔记 -->
   <aside class="side-panel" id="side">
     <div class="sp-head">
-      <b>📝 全部笔记</b>
+      <b>📝 笔记</b>
       <span class="cnt" id="spCount"></span>
+      <button class="btn ghost" id="newFreeNote" type="button">+ 独立笔记</button>
       <button class="sp-close" id="closeSide" title="收起">×</button>
     </div>
     <div class="sp-list" id="spList"></div>

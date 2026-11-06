@@ -2,7 +2,7 @@
    unlimited_ocr 后端（backend/pdf_parser/backend_unlimited_ocr.py）下发的版面数据是
    **块级**的（每块只有 bbox / kind / 文本，块内没有行几何）。思路与 Surya 那套相同
    （绝对定位的 .blk + 块内流式排版），但代码**刻意独立成一整套**（buildUnlimitedItem /
-   ulInlineMath / ulTableEl / finalizeUnlimitedBlocks / settleUnlimitedVertical，
+   ulInlineMath / ulTableEl / finalizeUnlimitedBlocks / settleUnlimitedLayout，
    DOM 类名 ul-*），两边互不引用、可各自演化：
      · `.blk.ul` 按 bbox 绝对定位；块内文字正常流式排版，字号/行高由解析侧估算
        （t.size / t.line_h，单位 pt），标题加粗放大、图注/脚注/页眉页脚小一号
@@ -15,8 +15,8 @@
 
    装配（reader2.js，R2Math 之后）：
      const { buildUnlimitedItem, ulInlineMath, ulLineBreaks, ulCleanNode,
-             finalizeUnlimitedBlocks, settleUnlimitedVertical } = R2ItemUl({ … });
-   `pages` 是共享的稳定数组（settleUnlimitedVertical 按页遍历）；`nextOrd` 是
+             finalizeUnlimitedBlocks, settleUnlimitedLayout } = R2ItemUl({ … });
+   `pages` 是共享的稳定数组（settleUnlimitedLayout 按页遍历）；`nextOrd` 是
    reader2 里的文字块序号分配器（render 时归零）。
    ============================================================================ */
 window.R2ItemUl = function (env) {
@@ -24,7 +24,137 @@ window.R2ItemUl = function (env) {
   const { el, splitSentences, bodyRunOf, mathBlockOf, mathSizePx,
           katexReady, katexRender, _katexBoxes, itemById, nextOrd, pages } = env;
 
+  /* 旧数据兼容：老 doc.json 里定界符没摘（文本还留着 `$ x(t) \\in \\mathbb{R}^N $`），
+     解析侧没下发 `t.math`，公式就只能看见 LaTeX 源码。这里按与后端
+     `backend_unlimited_ocr._text_with_math` 同样的判据**就地补一遍**：摘掉定界符、
+     把字符区间写回 `t.math`，后面 ulInlineMath 就会把它换成 KaTeX。
+     · 老数据可能**部分**提取过（旧判据漏掉 `$A$` 这类单字母），所以即使 `t.math`
+       非空也要再扫一遍，并把老区间按同一份「旧下标 → 新下标」映射搬过来；
+     · 幂等：文本里没有可摘的定界符时原样返回；公式块与表格不碰。 */
+  const UL_DOLLAR_MAX = 200;
+  const UL_MATH_HINT = /[\\_^{}]/;
+  // 与后端 `_looks_inline_math` 同口径：含 LaTeX 命令字符 / 单个变量名 /
+  // 纯数字（含 `[29]` 这种引文）/「ASCII + 运算符且没有 3 个以上连续字母」的短式子
+  const UL_ALLOWED = /^[A-Za-z0-9\s\\{}_^()\[\]+=*/<>|,.'’\-]*$/;
+  const UL_LONG_WORD = /[A-Za-z]{3,}/;
+  const UL_NUMERIC = /^[\[(]?[\d\s.,\-–]+[\])]?$/;
+  function ulLooksInlineMath(inner) {
+    const core = String(inner || "").trim();
+    if (!core || core.length > UL_DOLLAR_MAX) return false;
+    if (UL_MATH_HINT.test(core)) return true;
+    if (/^[A-Za-z]$/.test(core)) return true;
+    if (UL_NUMERIC.test(core)) return true;
+    if (!UL_ALLOWED.test(core) || UL_LONG_WORD.test(core)) return false;
+    if (!/[A-Za-z]/.test(core)) return false;
+    return /[=()\[\]+*/<>-]/.test(core);
+  }
+  function ulNormalizeMath(t) {
+    if (!t || t.kind === "formula" || t.kind === "table") return t;
+    const src = String(t.text || "");
+    if (!src || (src.indexOf("$") < 0 && src.indexOf("\\(") < 0
+                 && src.indexOf("\\[") < 0)) return t;
+    // ⚠️ 偏移必须按**字符数**累计（后端 `_record_math` 是逐字符 extend）。
+    //    早先这里拿「片段个数」当偏移 —— 多字符片段一出现区间就整体错位
+    //    （表现：公式渲染出半截、正文字符被吃掉）。
+    const parts = [];
+    const ranges = [];
+    const map = new Array(src.length);   // 旧下标 → 新下标（只记原样保留下来的字符）
+    let pos = 0;
+    const emitMath = (s, e, openStart, closeEnd) => {
+      const raw = src.slice(s, e);
+      const core = raw.trim();
+      if (core) {
+        const lead = raw.length - raw.trimStart().length;
+        const a = pos;
+        for (let k = 0; k < core.length; k++) map[s + lead + k] = pos + k;
+        parts.push(core);
+        pos += core.length;
+        ranges.push({ a, b: pos, latex: core });
+      }
+      for (let k = openStart; k < s; k++) map[k] = undefined;        // 开定界符
+      for (let k = e; k < closeEnd; k++) map[k] = undefined;         // 首尾空白 + 闭定界符
+      return core.length;
+    };
+    let i = 0;
+    while (i < src.length) {
+      const ch = src[i];
+      if (ch === "\\" && i + 1 < src.length
+          && (src[i + 1] === "(" || src[i + 1] === "[")) {
+        const close = src[i + 1] === "(" ? "\\)" : "\\]";
+        const j = src.indexOf(close, i + 2);
+        if (j >= 0) { emitMath(i + 2, j, i, j + 2); i = j + 2; continue; }
+      } else if (ch === "$") {
+        if (src.startsWith("$$", i)) {
+          const j = src.indexOf("$$", i + 2);
+          if (j >= 0) { emitMath(i + 2, j, i, j + 2); i = j + 2; continue; }
+        } else {
+          const j = src.indexOf("$", i + 1);
+          const inner = j >= 0 ? src.slice(i + 1, j) : "";
+          // 定界符内侧允许空格（在线回包的写法）
+          if (j >= 0 && inner.indexOf("\n") < 0 && ulLooksInlineMath(inner)) {
+            emitMath(i + 1, j, i, j + 1); i = j + 1; continue;
+          }
+        }
+      }
+      map[i] = pos;
+      parts.push(ch);
+      pos += 1;
+      i += 1;
+    }
+    if (!ranges.length) return t;                  // 没摘到东西：文本别动
+    const text = parts.join("");
+    // 老的 math 区间（解析侧已摘过定界符的那批）按映射搬过来
+    const remapped = [];
+    for (const m of (Array.isArray(t.math) ? t.math : [])) {
+      const a = map[m.a], b1 = map[m.b - 1];
+      if (a === undefined || b1 === undefined) continue;
+      if (b1 + 1 - a !== m.b - m.a) continue;      // 长度对不上：宁可不搬
+      remapped.push({ a, b: b1 + 1, latex: m.latex });
+    }
+    t.text = text;
+    t.math = remapped.concat(ranges).sort((x, y) => x.a - y.a);
+    const ln = t.lines && t.lines[0];
+    if (ln) ln.runs = ln.runs && ln.runs.length
+      ? [Object.assign({}, ln.runs[0], { t: text })] : [{ t: text }];
+    return t;
+  }
+
+  function ulTableMath(table) {
+    if (!table || !katexReady()) return;
+    const walker = document.createTreeWalker(table, NodeFilter.SHOW_TEXT, null);
+    const nodes = [];
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.nodeValue && (node.nodeValue.indexOf("$") >= 0
+          || node.nodeValue.indexOf("\\(") >= 0)) nodes.push(node);
+    }
+    const delim = /\\\(([^]*?)\\\)|\$\$([^]*?)\$\$|\$([^$\n]{1,200}?)\$/g;
+    for (const tn of nodes) {
+      const source = tn.nodeValue || "";
+      const parts = [];
+      let last = 0, match;
+      delim.lastIndex = 0;
+      while ((match = delim.exec(source))) {
+        const latex = (match[1] != null ? match[1]
+          : (match[2] != null ? match[2] : match[3])).trim();
+        if (!latex || (match[3] != null && !ulLooksInlineMath(latex))) continue;
+        if (match.index > last) parts.push(document.createTextNode(source.slice(last, match.index)));
+        const rendered = document.createElement("span");
+        rendered.className = "katex-inline";
+        if (katexRender(rendered, latex, false)) parts.push(rendered);
+        else parts.push(document.createTextNode(match[0]));
+        last = match.index + match[0].length;
+      }
+      if (last === 0) continue;
+      if (last < source.length) parts.push(document.createTextNode(source.slice(last)));
+      const frag = document.createDocumentFragment();
+      parts.forEach(part => frag.appendChild(part));
+      tn.parentNode.replaceChild(frag, tn);
+    }
+  }
+
   function buildUnlimitedItem(t, S, pageEl, pi) {
+    t = ulNormalizeMath(t);                        // 旧数据：就地补 math 区间
     const bx = t.x * S, by = t.y * S;
     const blk = el("div", "blk ul");
     if (t.kind) blk.classList.add("ul-" + t.kind);
@@ -69,7 +199,12 @@ window.R2ItemUl = function (env) {
       _katexBoxes.add(box);
     } else if (t.kind === "table") {
       const tb = ulTableEl(t.html);
-      blk.appendChild(tb || el("div", "ln ulln", t.text || ""));
+      if (tb) {
+        ulTableMath(tb);
+        blk.appendChild(tb);
+      } else {
+        blk.appendChild(el("div", "ln ulln", t.text || ""));
+      }
     } else {
       // 文本块：唯一一条“流式行”。类名要含 ln（行内公式的让位机制按 .ln 找行），
       // `ld.free` 让 fitLineEl 跳过（这里的宽度是排版自然宽，不是 PDF 行框）。
@@ -295,33 +430,100 @@ window.R2ItemUl = function (env) {
     }
   }
 
-  /* Unlimited-OCR 块与图片的**碰撞避让**：按页统一检查实际内容高度和横向范围，
-     将发生纵向碰撞的后续元素下移到前项底部之后。双栏左右栏互不影响，跨栏内容
-     会同时避开两栏；图片和表格也参与排版，位移级联自然收敛。
+  /* Unlimited-OCR 内容块与图片的二维碰撞避让：先尝试向下、向左或向右移动当前项，
+     选择位移最小且不越出页面的方向。图片与文字/表格都参与，避免内容重叠。
      ⚠️ 位移量每轮都**基于原始 it.y 重算**（且不写回数据）：缩放/窗口变化会
      整页重建，每次都以原始几何为基准，不会累积漂移；应用交给 relayoutPage 的
-     位移链（ulShift 是它的起点，与“卡片顶开”量叠加）。与 Surya 的 syShift 各自
+     位移链（ulShift / ulXShift 是它的起点，与“卡片顶开”量叠加）。与 Surya 的 syShift 各自
      独立（字段、类名都不共用），互不干涉。 */
-  const UL_VGAP = 2;      // px：避让后相邻块内容之间至少保留的空隙
-  function settleUnlimitedVertical() {
-    for (const page of pages) {
-      const list = page.items.filter(it =>
-        it.unlimited && !(it.kind === "blk" && it.el.classList.contains("ul-vertical")));
-      list.sort((a, b) => (a.y - b.y) || (a.x - b.x));
-      const settled = [];           // [{x, w, bottom}]：已排元素（bottom 含避让量）
-      for (const it of list) {
-        let need = -Infinity;
-        const width = it.kind === "blk" ? Math.max(it.w, it.el.offsetWidth) : it.w;
-        for (const s of settled) {
-          const ov = Math.min(s.x + s.w, it.x + width) - Math.max(s.x, it.x);
-          if (ov < Math.min(s.w, width) * 0.5) continue;      // 不同栏
-          need = Math.max(need, s.bottom + UL_VGAP);
+  const UL_GAP = 2;       // px：避让后相邻内容之间至少保留的空隙
+  // OCR may emit equation numbers as independent formula blocks at the paragraph's original y.
+  function unlimitedEquationTagMatches(page) {
+    const items = page.items.filter(it => it.unlimited && it.kind === "blk");
+    const tags = items.filter(it => /^\(\d+\)$/.test(it.latex.trim()));
+    const formulas = items.filter(it => it.latex && !/^\(\d+\)$/.test(it.latex.trim()));
+    const textBlocks = items.filter(it => it.el.classList.contains("ul-text")
+      && it.w >= page.w * 0.4);
+    const claimed = new Set();
+    const matches = [];
+    for (const tag of tags) {
+      const candidates = [];
+      for (const formula of formulas) {
+        const formulaCenterX = formula.x + formula.w / 2;
+        const formulaCenterY = formula.y + (formula.contentH || formula.h) / 2;
+        for (const block of textBlocks) {
+          if (formulaCenterX < block.x || formulaCenterX > block.x + block.w) continue;
+          if (Math.abs(formulaCenterX - (block.x + block.w / 2)) > block.w * 0.15) continue;
+          const columnRight = block.x + block.w;
+          if (page.w - columnRight < tag.w * 0.5) continue;
+          const tagRight = tag.x + tag.w;
+          if (Math.abs(tagRight - columnRight) > page.w * 0.1) continue;
+          const distance = Math.abs(tag.y + tag.h / 2 - formulaCenterY);
+          if (distance > page.w * 0.18 || claimed.has(formula)) continue;
+          candidates.push({ formula, block, distance });
         }
-        it.ulShift = Math.max(0, need - it.y);      // 只下移，绝不上移
+      }
+      candidates.sort((a, b) => a.distance - b.distance);
+      const match = candidates[0];
+      if (!match) continue;
+      claimed.add(match.formula);
+      matches.push({ tag, ...match });
+    }
+    return matches;
+  }
+
+  function settleUnlimitedLayout() {
+    for (const page of pages) {
+      const equationTags = unlimitedEquationTagMatches(page);
+      const equationTagSet = new Set(equationTags.map(match => match.tag));
+      const list = page.items.filter(it => it.unlimited &&
+        !(it.kind === "blk" && (it.el.classList.contains("ul-vertical")
+          || equationTagSet.has(it))));
+      list.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+      const settled = [];
+      for (const it of list) {
+        const width = it.kind === "blk" ? Math.max(it.w, it.el.offsetWidth) : it.w;
         const height = it.kind === "blk" ? Math.max(it.contentH || 0, it.el.offsetHeight)
                                          : it.h;
-        settled.push({ x: it.x, w: width,
-                       bottom: it.y + it.ulShift + height });
+        const overlaps = (x, y, other) =>
+          x < other.x + other.w && x + width > other.x &&
+          y < other.y + other.h && y + height > other.y;
+        const place = direction => {
+          let x = it.x, y = it.y;
+          for (let tries = 0; tries <= settled.length; tries++) {
+            const hit = settled.find(other => overlaps(x, y, other));
+            if (!hit) return { x, y };
+            if (direction === "down") {
+              y = hit.y + hit.h + UL_GAP;
+            } else if (direction === "right") {
+              x = hit.x + hit.w + UL_GAP;
+              if (x + width > page.w) return null;
+            } else {
+              x = hit.x - width - UL_GAP;
+              if (x < 0) return null;
+            }
+          }
+          return null;
+        };
+        const candidates = [
+          place("down"),
+          place("left"),
+          place("right"),
+        ].filter(Boolean);
+        candidates.sort((a, b) =>
+          (Math.abs(a.x - it.x) + a.y - it.y) -
+          (Math.abs(b.x - it.x) + b.y - it.y));
+        const pos = candidates[0] || { x: it.x, y: it.y };
+        it.ulXShift = pos.x - it.x;
+        it.ulShift = pos.y - it.y;
+        settled.push({ x: pos.x, y: pos.y, w: width, h: height });
+      }
+      // Apply after collision settlement so a moved equation and its tag stay together.
+      for (const { tag, formula, block } of equationTags) {
+        const columnRight = block.x + (block.ulXShift || 0) + block.w;
+        const formulaY = formula.y + (formula.ulShift || 0);
+        tag.ulXShift = columnRight - tag.w - tag.x;
+        tag.ulShift = formulaY + (formula.contentH || formula.h) / 2 - tag.h / 2 - tag.y;
       }
     }
   }
@@ -329,6 +531,6 @@ window.R2ItemUl = function (env) {
   /* ============ 对外接口 ============ */
   return {
     buildUnlimitedItem, ulInlineMath, ulLineBreaks, ulTableEl, ulCleanNode,
-    finalizeUnlimitedBlocks, settleUnlimitedVertical,
+    finalizeUnlimitedBlocks, settleUnlimitedLayout,
   };
 };

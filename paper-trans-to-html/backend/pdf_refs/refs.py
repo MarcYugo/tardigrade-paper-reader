@@ -471,8 +471,25 @@ def _expand_nums(inner: str) -> set:
     return nums
 
 
+# hyperref 的目标点（`to`）通常落在条目**行顶以上**几个 pt（实测 Nature 排版 4~5pt，
+# 见 doc 13573b44…：`to`=500.91 而条目行 bbox 顶=506.0），所以“落在条目上”的
+# 纵向容差要按行高放宽，不能只给 3pt。
+_ENTRY_TOP_SLACK = 6.0
+_ENTRY_TOP_SLACK_RATIO = 0.5      # 行高的一半也算“点在这条条目上”
+_ENTRY_SIDE_SLACK = 12.0          # 目标 x 常落在页边距/悬挂缩进之前一点
+_ENTRY_NEAR = 28.0                # 兜底：离条目块多远还算“最近”
+
+
 def _entry_block_at(page, to, by_block):
-    """目标点 → 条目块：先找包含点的条目块（±3pt），否则取最近条目块（≤28pt）。"""
+    """目标点 → 条目块：先找“点在它上面”的条目块（上方按行高放宽），
+    否则取**矩形距离**最近的条目块（≤28pt）。
+
+    ⚠️ 兜底距离必须用“点到 bbox 的矩形距离”，不能再用“到块中心”的距离：
+    OCR 路线（surya / unlimited_ocr）的条目块常常整行宽（400pt+），而目标点
+    总是贴在页面左边距，横向到中心差 ~200pt 会把纵向只差 4pt 的偏差彻底淹没
+    —— 实测 `unlimited_ocr` 的 199 条链接只有 6 条能映射上（其余 179 条全是
+    这个原因），改用矩形距离后 100+ 条恢复，且与 PDF 真实条目编号逐条一致。
+    """
     x, y = float(to[0]), float(to[1])
     best = None
     best_d = 1e9
@@ -480,13 +497,17 @@ def _entry_block_at(page, to, by_block):
         if str(t.get("id")) not in by_block:
             continue
         x0, y0, x1, y1 = _bbox(t)
-        if x0 - 3 <= x <= x1 + 3 and y0 - 3 <= y <= y1 + 3:
+        top = max(_ENTRY_TOP_SLACK,
+                  _ENTRY_TOP_SLACK_RATIO * float(t.get("line_h") or 0.0))
+        if (x0 - _ENTRY_SIDE_SLACK <= x <= x1 + 3
+                and y0 - top <= y <= y1 + 3):
             return t
-        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        d = abs(cx - x) + abs(cy - y)
+        dx = max(x0 - x, 0.0, x - x1)
+        dy = max(y0 - y, 0.0, y - y1)
+        d = dx + dy
         if d < best_d:
             best_d, best = d, t
-    return best if best_d <= 28 else None
+    return best if best_d <= _ENTRY_NEAR else None
 
 
 def _ay_entry_profile(entry) -> tuple:

@@ -30,7 +30,7 @@
   const itemById = {};
   const zh = {};            // 段落(块)id -> 中文
   const noZh = new Set();
-  let anno = { highlights: {}, notes: [] };
+  let anno = { highlights: {}, notes: [], free_notes: [] };
   /* 暗夜下正文颜色的反色缓存（r2-color.js 的 pageInk 用，r2-notes.js 换主题时清空） */
   const inkCache = new Map();
   let sel = null;           // 选中：{ sents: [{item, si}, …] }，按阅读顺序(支持拖拽多选)
@@ -75,6 +75,7 @@
     return name === "pymupdf" ? "本地解析方案"
          : name === "surya" ? "Surya 2"
          : name === "unlimited_ocr" ? "Unlimited-OCR"
+         : name === "unlimited_ocr_online" ? "Unlimited-OCR（在线）"
          : (name || "?");
   }
 
@@ -82,6 +83,28 @@
 
   /* ================= 基础查询 ================= */
   function findItem(id) { return itemById[id] || null; }
+  let relatedFlashTimer = 0;
+  function flashRelatedBlock(id) {
+    const item = findItem(id);
+    if (!item || !item.el) return false;
+    if (relatedFlashTimer) clearTimeout(relatedFlashTimer);
+    document.querySelectorAll(".blk.related-flash").forEach(block =>
+      block.classList.remove("related-flash"));
+    const block = item.el;
+    block.classList.remove("related-flash");
+    void block.offsetWidth;
+    block.classList.add("related-flash");
+    const rect = block.getBoundingClientRect();
+    window.scrollTo({
+      top: toScrollTop(scrolled() + rect.top - anchorProbe()),
+      behavior: "smooth",
+    });
+    relatedFlashTimer = window.setTimeout(() => {
+      block.classList.remove("related-flash");
+      relatedFlashTimer = 0;
+    }, 1900);
+    return true;
+  }
   function sentenceText(item, si) {
     const ss = item.sents[si];
     return ss ? item.canonical.slice(ss.s, ss.e).replace(/\n+/g, " ").trim() : "";
@@ -241,10 +264,14 @@
 
     // 三条渲染分支：
     //   · surya / unlimited_ocr：块级数据（bbox + 文本/html），各自流式渲染；
+    //     Unlimited-OCR 的本地 / 在线两条数据来源**共用**一套渲染路径
+    //     （解析后端已把在线回包转成同构结构，`parser_info.unlimited_ocr_route` 可区分）；
+    //     `unlimited_ocr_online` 只是兼容取值（旧数据 / 以后单独标记时也不落空）。
     //   · 本地解析方案（parser=pymupdf）：逐行几何 + 页面级公式框，走 buildTextItem；
     //     旧 doc.json（parser=pymupdf）同样是这套结构，一并兼容。
     const surya = DOC.parser === "surya";
-    const unlimited = DOC.parser === "unlimited_ocr";
+    const unlimited = DOC.parser === "unlimited_ocr"
+                   || DOC.parser === "unlimited_ocr_online";
     DOC.pages.forEach((pg, pi) => {
       const S = t.pageW / pg.w;
       const pageEl = el("div", "page");
@@ -301,7 +328,7 @@
     finalizeSuryaBlocks();     // surya 块：量流式内容的真实高度 → 回填 contentH / 卡片位置
     settleSuryaVertical();     // surya 块：算内容纵向避让量 syShift（relayoutPage 应用）
     finalizeUnlimitedBlocks(); // unlimited-ocr 块：同上的收尾（独立一套）
-    settleUnlimitedVertical(); // unlimited-ocr 块：算内容纵向避让量 ulShift
+    settleUnlimitedLayout(); // unlimited-ocr 内容块与图片：计算二维避让
     finalizeLocalBlocks();     // 本地解析方案：按基线摆行 + 压缩行宽 + 回填表格高度
     // 字体晚到会改变字体的 ascent/descent（行内基线）与 KaTeX 的缩放：就绪后再摆一次。
     // finalizeLocalBlocks 是幂等的（top 绝对值、公式先回中再量）。
@@ -331,7 +358,7 @@
         restoreAnchor(anchor);      // 重排：停在原来那处内容上，不跳页
       } else if (!restoreLastPos(false)) {
         // 没有精确位置（老论文）：退回“上次读到的最远一页”。
-        // 连页码都没有（从没滚过）且已读完的，才在 init() 里落到文末 AI 面板。
+        // 连页码都没有（从没滚过）且已读完的，才在 init() 里展开 AI 悬浮卡片。
         if (META && META.last_page) {
           // META.last_page 存的是“页码”(从 1 开始)，scrollToPage 收的是“下标”，
           // 这里必须减 1 并夹紧，否则读到最后一页时 pages[n] 为 undefined 会抛异常，
@@ -378,7 +405,7 @@
      三个模块都只负责“造 DOM + 量高/避让”；重建（高亮/选中/笔记）仍走本文件的
      rebuildItem。 */
   const { buildUnlimitedItem, ulInlineMath, ulLineBreaks, ulCleanNode,
-          finalizeUnlimitedBlocks, settleUnlimitedVertical } = R2ItemUl({
+          finalizeUnlimitedBlocks, settleUnlimitedLayout } = R2ItemUl({
     el, splitSentences, bodyRunOf, mathBlockOf, mathSizePx, katexReady, katexRender,
     _katexBoxes, itemById, nextOrd, pages,
   });
@@ -590,7 +617,7 @@
      · curPageW / noteSide / noteW / noteLeft 本段既读又写 → getter + setter；
      · notesCount / notesOfBlock / tocPanelOpen 来自更后面的 r2-notes、r2-nav 装配 →
        包一层转发；TOC_W 是常量，用 getter 延后取值。 */
-  const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage } = R2Layout({
+  const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, basePageW } = R2Layout({
     $, CSS_W, ZOOM, ZOOM_OK, vpW, NOTE_GAP, pages,
     keyParts, lineOfChar, sentRange, render, paintFormulaMarks,
     get DOC() { return DOC; },
@@ -614,13 +641,15 @@
      · sel / DOC —— 段内只读，给 getter；
      · canWrite / renderTocAi 声明在**本段之后**（共享权限段 / AI 段装配处），
        装配这一刻还在 TDZ，所以包一层转发，等真正调用时再去读。 */
-  const { notesOfBlock, notesCount, renderAllNotes, openNoteEditor, refreshSideList } = R2Notes({
+  const { notesOfBlock, notesCount, renderAllNotes, openNoteEditor, refreshSideList,
+          openSidePanel, jumpToNoteId } = R2Notes({
     $, itemById, docId, toScrollDelta, inkCache,
     keyParts, relayoutAll, placeBar, updateBar, relayoutPage, needWrite, findItem,
     sentKey, sentenceText, noteOf, selCount, selAnchor, isSelRef, pageOfItem,
     render, renderHmenuSwatches, setAnnoRanges, rebuildItem, selectSentence, syncExp,
     canWrite: (...a) => canWrite(...a),
     renderTocAi: (...a) => renderTocAi(...a),
+    markAiStale: (...a) => markAiStale(...a),
     get anno() { return anno; }, set anno(v) { anno = v; },
     get editingKey() { return editingKey; }, set editingKey(v) { editingKey = v; },
     get noteDraft() { return noteDraft; }, set noteDraft(v) { noteDraft = v; },
@@ -641,6 +670,7 @@
   const { currentPageIndex, updatePageInd, scrollToPage, TOC_W, tocPanelOpen,
           scheduleSave, updateFinishBtn, refreshZoomLabel } = R2Nav({
     $, pages, docId, CSS_W, vpH, ZOOMS, pagesEl, ZOOM, GZ, toScrollDelta,
+    baseW: (...a) => basePageW(...a),
     relayoutAll, applyZoom, pageAnchor, render,
     canWrite: (...a) => canWrite(...a),
     maybeAutoSummarize: (...a) => maybeAutoSummarize(...a),
@@ -649,10 +679,10 @@
     set zoomIdx(v) { zoomIdx = v; },
   });
 
-  /* ================= 文末 · AI 辅助阅读：已拆到 r2-ai.js =================
+  /* ================= 悬浮 AI 辅助阅读：已拆到 r2-ai.js =================
      这里只做装配：把跨模块共享的东西交出去，再把模块接口接回本作用域。
-     · $ / docId / findItem / keyParts / pageOfItem / scrolled / toScrollTop / needWrite /
-       anchorProbe 都是稳定引用（函数声明会提升），装配时取一次即可；
+     · $ / docId / findItem / keyParts / pageOfItem / needWrite 都是稳定引用，
+       装配时取一次即可；
      · META / anno 用 getter —— 换论文 / 重拉批注时会整体替换，模块里要每次取最新值；
      · canWrite 声明在**本段之后**（共享权限那一段），装配这一刻还在 TDZ，
        所以包一层转发，等真正调用时再去读它。
@@ -661,12 +691,19 @@
        交给它们就地换成 KaTeX（没加载过则懒加载）。
      原来那段里 AI 自己的状态（aiSummary / aiChat / aiBusyWhat / aiEdit / …）
      随模块一起搬走了，不再占用本文件的作用域。 */
-  const { maybeAutoSummarize, syncAiButtons, jumpToAi, renderTocAi, loadAi } = R2Ai({
-    $, docId, findItem, keyParts, pageOfItem, scrolled, toScrollTop, needWrite, anchorProbe,
+  const { maybeAutoSummarize, syncAiButtons, jumpToAi, renderTocAi, loadAi, markAiStale } = R2Ai({
+    $, docId, findItem, keyParts, pageOfItem, needWrite,
     canWrite: (...a) => canWrite(...a),
+    scrollToPage, flashRelatedBlock, jumpToNoteId, openSidePanel, refreshSideList, layoutAi,
+    refreshNotes: async () => {
+      anno = await api("/api/doc/" + docId + "/anno");
+      renderAllNotes();
+      refreshSideList();
+    },
     renderInlineMath, katexReady, ensureKatex,
     get META() { return META; },
     get anno() { return anno; },
+    set anno(v) { anno = v; },
   });
 
   /* ================= 初始化 ================= */
@@ -873,7 +910,7 @@
       document.title = DOC.title;
       setupDocTitle();              // 顶栏标题：点一下就地改名（同步回首页列表）
       updateFinishBtn();
-      $("notesCount").textContent = (anno.notes || []).length;
+      $("notesCount").textContent = (anno.notes || []).length + (anno.free_notes || []).length;
       const cfg = await appConfig();
       applyPerm();
       const tips = [];
@@ -884,12 +921,16 @@
       // 解析后端就绪状态：本地解析方案/两条整页 OCR 链都是“全有或全无”，
       // 不满足条件时上传与重解析会失败，这里提前提示。
       const pr = cfg && cfg.parser;
-      const localBackends = ["pymupdf", "auto", "detection_service_group"];
+      const localBackends = ["pymupdf", "auto"];
       if (pr && pr.backend === "surya" && pr.surya_ready !== true) {
         tips.push("⚠️ 解析后端现为 surya，但 Surya 2 还未就绪：" + (pr.surya_message || "") +
           "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
-      } else if (pr && pr.backend === "unlimited_ocr" && pr.unlimited_ocr_ready !== true) {
-        tips.push("⚠️ 解析后端现为 unlimited_ocr，但 Unlimited-OCR 服务还未就绪：" +
+      } else if (pr && pr.backend === "unlimited_ocr"
+                 && pr.unlimited_ocr_ready !== true
+                 && pr.unlimited_ocr_online_ready !== true) {
+        // 本地推理服务不可用时会自动改用在线解析（百度智能云 Unlimited-OCR）；
+        // 两者都不行才算“全有或全无”的失败。
+        tips.push("⚠️ 解析后端现为 unlimited_ocr，但本地 Unlimited-OCR 服务与在线解析都不可用：" +
           (pr.unlimited_ocr_message || "") +
           "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
       } else if (pr && localBackends.indexOf(pr.backend) >= 0 && pr.local_ready !== true) {
@@ -914,14 +955,12 @@
       // 笔记已内嵌在正文里（render 时自动展开），这里只把“全部笔记”总览的口径刷新一下，
       // 不再自动弹右侧面板——面板只在你主动点顶栏「📝 笔记」时打开。
       refreshSideList();
-      // 文末的 AI 面板：先拿回上次的整理/对话；若之前已读到 95% 且还没整理，这里补一次
+      // AI 悬浮面板：先拿回上次的整理/对话；若之前已读到 95% 且还没整理，这里补一次
       await loadAi();
       maybeAutoSummarize();
-      // 回到上次离开时的位置：`META.last_pos` 记的是精确位置（页内比例 / 距文末多远），
-      // 所以“读完的文章”不再一律甩到文末 AI 面板 —— 你停在哪儿就回哪儿。
-      // 文末面板的高度只有 loadAi() 之后才定型，故这里只补处理“停在 AI 面板”那种；
+      // 回到上次离开时的位置：`META.last_pos` 记的是精确位置（页内比例 / 距文档底部多远）。
       // 没有 last_pos 的老论文按 render() 里还原的“最远一页”即可，
-      // 只有在既没位置数据、也从没滑过页面时，读完的才落到文末面板。
+      // 只有在既没位置数据、也从没滑过页面时，读完的才自动展开 AI 卡片。
       if (!restoreLastPos(true) && !META.last_page && META.status === "done") jumpToAi(true);
     } catch (err) {
       showNotice("加载失败：" + err.message, true);

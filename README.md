@@ -1,4 +1,4 @@
-# CrockRoach Paper Reader - Pdf 转 HTML 阅读应用
+# Tardigrade Paper Reader - Pdf 转 HTML 阅读应用
 
 > AI 辅助工具为 Deepseek-v4-flash/Deepseek-v4.1-flash/GPT-6-Luna + VScode copilot
 
@@ -30,6 +30,8 @@
    
    <center><img src="./function_display/translate-formula2.png" width=400px></center>
 
+7. [26/11/7] a. Unlimited-OCR增加官网api调用；b. 增加ai辅助阅读时的agent功能，可以通过聊天找到论文相关内容/笔记位置 和 帮助写入笔记内容；c. 更换logo（水熊虫三角立体艺术拼接风格）
+
 ## Pdf 解析模块
 
 把论文 PDF 解析成**可还原原版式的数据**（文字块 + 插图，保留原坐标、字号、字体）。提供三种解析方式，输出结构一致，前端无需改动。
@@ -53,19 +55,10 @@
 
 ### 3. Unlimited-OCR
 
-接入 **Unlimited-OCR 推理服务**，Unlimited-OCR模型做版面分析、文本和图表的检测和识别（部署方式见 `unlimited_ocr_service`）。
+接入 **Unlimited-OCR 推理服务**，Unlimited-OCR模型做版面分析、文本和图表的检测和识别（部署方式见 `unlimited_ocr_service`）。增加 Unlimited-OCR 2 的官网api调用，需要再百度智能云平台创建应用。程序检测本地部署不存在时自动切换至api调用模式。
 
 - 逐页识别，文本、图片和表格
-
-<!-- ### 3. Paddle-OCR
-
-接入 **PaddleOCR-VL 推理服务**，推理速度最快，**推荐有显卡时使用**（部署方式见 `paddle_ocr_doc_parse_service`）。
-
-- 逐页识别，补齐插图和公式（公式同样输出 LaTeX）；
-- 电子版论文保留原有精确版式，扫描件也能较好还原；
-- 个别页面识别失败不影响整篇，该页自动改用本地模式。
-
-> 三种方式都会避免插图与文字叠成“重影”。服务在运行时会自动优先使用，服务不可用则自动降级到本地模式，不会因此打不开论文。实测surya的图片和公式提取能力更好，paddle-ocr速度更快。 -->
+- 需要配置 config.json 中的unlimited_ocr_online_api_key和unlimited_ocr_online_secret_key
 
 ## MongoDB 数据存储
 
@@ -111,6 +104,14 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 <img src="./function_display/6.note-share.gif">
 
+### 7. 笔记和内容定位
+
+<img src="./function_display/7.agent-location.gif">
+
+### 8. 笔记添加
+
+<img src="./function_display/8.agent-write-notes.gif">
+
 ## TODO
 
 - [x] ~~公式解析优化，重影缺失等问题~~
@@ -118,10 +119,9 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 - [x] ~~pymupdf 本地解析优化~~
 - [x] ~~unlimited ocr 解析和渲染路径实现~~
 - [x] ~~引用链接显示功能优化~~
-- [ ] OXR解析后端
-- [ ] unlimited-ocr解析后端优化
+- [ ] Agent功能优化
+- [x] ~~unlimited-ocr解析后端优化~~
 - [ ] 笔记导出功能
-- [ ] cpu解析组的解析和渲染服务优化
 
 
 <!-- https://github.com/MarcYugo/crockroach-paper-reader -->

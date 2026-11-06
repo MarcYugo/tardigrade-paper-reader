@@ -277,16 +277,23 @@ class MongoStore:
               for d in self.highlights.find({"doc": doc_id}, {"_id": 0})}
         # 笔记 id 统一转成字符串：早期/手工插入的文档 _id 可能是 ObjectId，
         # 直接返回会导致 JSON 序列化 500
+        note_docs = list(self.notes.find({"doc": doc_id}).sort("created_at", 1))
         notes = [{"id": str(d.get("_id")), "block_id": d.get("block_id"),
                   "text": d.get("text") or "", "by": d.get("by") or "",
                   "created_at": d.get("created_at"), "updated_at": d.get("updated_at")}
-                 for d in self.notes.find({"doc": doc_id}).sort("created_at", 1)]
-        return {"highlights": hl, "notes": notes}
+                 for d in note_docs if d.get("kind") != "free" and d.get("block_id")]
+        free_notes = [{"id": str(d.get("_id")), "title": d.get("title") or "",
+                       "text": d.get("text") or "", "by": d.get("by") or "",
+                       "created_at": d.get("created_at"), "updated_at": d.get("updated_at")}
+                      for d in note_docs if d.get("kind") == "free"]
+        return {"highlights": hl, "notes": notes, "free_notes": free_notes}
 
     def apply_anno(self, doc_id: str, action: str, block_id: str | None = None,
                    color: str | None = None, text: str | None = None,
-                   note_id: str | None = None, by: str | None = None) -> dict:
-        """动作: add_highlight / remove_highlight / add_note / remove_note。
+                   note_id: str | None = None, by: str | None = None,
+                   title: str | None = None) -> dict:
+        """动作: add_highlight / remove_highlight / add_note / remove_note /
+        add_free_note / update_free_note / remove_free_note。
 
         每个动作都是**单文档**的 upsert/delete（不再整份文件读改写），
         所以并发下不会互相覆盖。`by` = 写这条笔记的账号（共享论文标识作者用）。
@@ -314,11 +321,27 @@ class MongoStore:
                 self.notes.update_one({"doc": doc_id, "block_id": block_id},
                                       {"$set": fields})
         elif action == "remove_note" and note_id:
-            self.notes.delete_one({"_id": note_id, "doc": doc_id})
+            self.notes.delete_one({"_id": note_id, "doc": doc_id, "kind": {"$ne": "free"}})
+        elif action == "add_free_note" and text is not None:
+            now = _now()
+            note = {"_id": _uid(), "doc": doc_id, "kind": "free",
+                    "title": (title or "").strip(), "text": text,
+                    "created_at": now, "updated_at": now}
+            if by:
+                note["by"] = by
+            self.notes.insert_one(note)
+        elif action == "update_free_note" and note_id and text is not None:
+            fields = {"title": (title or "").strip(), "text": text, "updated_at": _now()}
+            if by:
+                fields["by"] = by
+            self.notes.update_one({"_id": note_id, "doc": doc_id, "kind": "free"},
+                                  {"$set": fields})
+        elif action == "remove_free_note" and note_id:
+            self.notes.delete_one({"_id": note_id, "doc": doc_id, "kind": "free"})
 
         anno = self.get_annotations(doc_id)
         self.update_record(doc_id, highlights=len(anno["highlights"]),
-                           notes=len(anno["notes"]))
+                           notes=len(anno["notes"]) + len(anno["free_notes"]))
         return anno
 
     # ---------------- 译文缓存 ----------------
@@ -386,8 +409,17 @@ class MongoStore:
                  "created_at": n.get("created_at"),
                  "updated_at": n.get("updated_at")},
                 upsert=True)
+        for n in (anno.get("free_notes") or []):
+            note_id = n.get("id") or _uid()
+            self.notes.replace_one(
+                {"_id": note_id},
+                {"_id": note_id, "doc": doc_id, "kind": "free",
+                 "title": n.get("title") or "", "text": n.get("text") or "",
+                 "by": n.get("by") or "", "created_at": n.get("created_at"),
+                 "updated_at": n.get("updated_at")},
+                upsert=True)
         self.update_record(doc_id, highlights=len(anno.get("highlights") or {}),
-                           notes=len(anno.get("notes") or []))
+                           notes=len(anno.get("notes") or []) + len(anno.get("free_notes") or []))
 
 
 class MongoAuthBackend:

@@ -25,12 +25,12 @@ def _now() -> str:
 
 
 def convert(store: Store, doc_id: str, pdf_path: Path, source_name: str,
-            owner: str = "") -> dict:
+            owner: str = "", parser_options: dict | None = None) -> dict:
     """转换一份 PDF → 版式文档 + 阅读记录，返回记录元数据(meta)。
 
     `owner` = 归属账号：论文按账号隔离，列表/打开都会按它过滤。
-    解析后端按 config.json / 环境变量（默认 auto）：
-      * auto / pymupdf / detection_service_group：**本地解析方案** —— PyMuPDF
+    解析后端按账号设置 / config.json / 环境变量（默认 auto）：
+      * auto / pymupdf：**本地解析方案** —— PyMuPDF
         文字层 + texify 公式 + OXR 版面（D-FINE）/ SLANet 表格 + 插图提取（前端按
         `parser === "pymupdf"` 逐行绝对定位渲染），依赖/模型缺失时直接报错；
       * surya：整页 OCR 走 Surya 2，文字/公式/插图全部用 Surya 的数据
@@ -45,10 +45,12 @@ def convert(store: Store, doc_id: str, pdf_path: Path, source_name: str,
         # 图片要进数据库：先解析到临时目录（解析器不用改），再整批入库。
         # 入库失败会抛出去，临时目录自动清理；外面还会 store.delete() 收尾。
         with tempfile.TemporaryDirectory(prefix="paper-img-") as staging:
-            parsed = pdf_parser.parse_pdf(pdf_path, Path(staging))
+            parsed = pdf_parser.parse_pdf(pdf_path, Path(staging),
+                                          account_options=parser_options)
             store.put_images(doc_id, staging)
     else:
-        parsed = pdf_parser.parse_pdf(pdf_path, images_dir)
+        parsed = pdf_parser.parse_pdf(pdf_path, images_dir,
+                                      account_options=parser_options)
 
     if not parsed["pages"]:
         raise ValueError("未能从 PDF 解析出任何页面")
@@ -166,7 +168,8 @@ def _remap_translations(store, doc_id: str, old_pages, new_pages) -> int:
 
 
 def reparse(store: Store, doc_id: str, pdf_path: Path,
-            backend: str | None = None) -> dict:
+            backend: str | None = None,
+            parser_options: dict | None = None) -> dict:
     """用原 PDF **原地**重解析一篇论文的版式数据，返回对比摘要。
 
     只换 `pages` / `parser` / `parser_info` / `warnings` 与插图；笔记、高亮、译文、
@@ -180,7 +183,8 @@ def reparse(store: Store, doc_id: str, pdf_path: Path,
     old_pages = old.get("pages") or []
 
     with tempfile.TemporaryDirectory(prefix="paper-reparse-") as staging:
-        parsed = pdf_parser.parse_pdf(pdf_path, Path(staging), backend=backend)
+        parsed = pdf_parser.parse_pdf(pdf_path, Path(staging), backend=backend,
+                                      account_options=parser_options)
         if not parsed.get("pages"):
             msg = "未能从 PDF 解析出任何页面"
             for warn in parsed.get("warnings") or []:

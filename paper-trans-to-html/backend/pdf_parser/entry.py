@@ -1,15 +1,14 @@
 """入口：`parse_pdf`。
 
-见包文档 `backend/pdf_parser/__init__.py`。三条解析链并列：
+见包文档 `backend/pdf_parser/__init__.py`。三类解析链并列：
 
-  * `backend` = `pymupdf` / `auto` / `detection_service_group`：**本地解析方案**
+  * `backend` = `pymupdf` / `auto`：**本地解析方案**
     （`backend_pymupdf._parse_with_pymupdf`）—— PyMuPDF 文字层 + `local_parse_pipeline`
     的 texify 公式识别、OXR 版面分析（D-FINE）定位表格/插图、SLANet_plus 表格结构识别与插图提取。
     页面下发**逐行几何**（`pages[].texts[].lines[].runs[]`）与页面级公式框
     （`pages[].formula_boxes[]`，LaTeX + 裁图），前端走逐行绝对定位渲染
     （见 `frontend/js/reader2.js::buildTextItem` 与 `r2-math.js::buildFormulaBoxes`）。
     依赖/模型缺失时直接报错（`backend_pymupdf.LocalParseUnavailable`）。
-    `detection_service_group` 仅作为历史取值保留，本地链路不再调用该服务。
   * `backend` = `surya`：整页 OCR 走 Surya 2（`backend_surya._parse_with_surya`），
     文字/公式（`<math>`→LaTeX）/插图裁图/阅读顺序全部来自 Surya 的版面 block，
     前端按 `DOC.parser === "surya"` 走独立的块级渲染
@@ -20,7 +19,11 @@
     （LaTeX）/表格（HTML）/插图裁图/阅读顺序全部来自 Unlimited-OCR 回包，前端按
     `DOC.parser === "unlimited_ocr"` 走它**自己那套**独立的块级渲染
     （见 `frontend/js/reader2.js::buildUnlimitedItem`，与 Surya 那套各自维护）。
-    服务不可用时直接报错（`backend/unlimited_ocr.UnlimitedOcrUnavailable`）。
+    数据来源有两条，**设置项不变**：本地推理服务（`backend/unlimited_ocr.py`）
+    → 本地服务没配置 / 没起来时自动切到在线解析（`backend/unlimited_ocr_online.py`，
+    百度智能云「文档解析（Unlimited-OCR）」）；两条都不可用时抛
+    `backend/unlimited_ocr.UnlimitedOcrUnavailable`。实际走了哪条记在
+    `parser_info["unlimited_ocr_route"]`（`local` / `online`）。
 
 对外签名与返回结构**保持不变**(仍是 `parser` / `parser_info` / `toc` /
 `warnings`)，所以 `converter.py` / `app.py` / `tools/*` 都不用改；
@@ -41,26 +44,10 @@ from .options import (load_options)
 from ..pdf_refs.refs_surya import split_surya_reference_blocks
 
 
-# =====================================================================
-#  公式后处理挂载点（detection-service-group）
-# =====================================================================
-def _formula_postprocess(result: dict, pdf_path: Path, images_dir: Optional[Path],
-                         opts: dict, warnings: list[str]) -> dict:
-    """本地解析**之后**的增强钩子（当前无事可做）。
-
-    公式识别与插图/表格提取已经由 `local_parse_pipeline.process_pages` 一并完成
-    （`backend_pymupdf`），原 detection-service-group 后处理不再参与；函数保留
-    挂载点，方便以后加“公式二次审核”之类的步骤。
-    """
-    return result
-
-
 def pop_private(result: dict) -> dict:
     """摘掉只给内部用的字段(页级 `_` 前缀键) —— **不能进 doc.json**。
 
-    当前有 `_formula_slots`(公式空位；detection-service-group 后处理用它挑「哪些页要送
-    检测」，见 `backend_pymupdf`)—— 体积不小，且前端与接口层都不该看见；
-    必须在公式后处理**之后**调用(后处理正是它的使用者)。
+    当前保留解析过程中的页级内部字段；它们不应进入持久化文档或接口响应。
     """
     for pg in result.get("pages") or []:
         for key in [k for k in pg if k.startswith("_")]:
@@ -103,13 +90,14 @@ def _attach_links(result: dict, pdf_path: Path, warnings: list[str]) -> None:
 # =====================================================================
 def parse_pdf(pdf_path: Path, images_dir: Optional[Path] = None, *,
               backend: Optional[str] = None, options: Optional[dict] = None,
-              config_file: Optional[Path] = None) -> dict:
+              config_file: Optional[Path] = None,
+              account_options: Optional[dict] = None) -> dict:
     """解析 PDF → 版式数据(即 doc.json 的 pages 结构)。
 
     `backend` / `options` / `config_file` 三个参数为**兼容旧调用方保留**
     (`converter.reparse(..., backend=…)`、`tools/selftest.py --backend …`)：
 
-      * `pymupdf` / `auto` / `detection_service_group`：**本地解析方案** —— PyMuPDF
+      * `pymupdf` / `auto`：**本地解析方案** —— PyMuPDF
         文字层 + `local_parse_pipeline` 的 texify（公式）/ OXR 版面 + SLANet（表格）/
         矢量图与位图提取；前端逐行绝对定位渲染，公式走页面级 KaTeX 覆盖层。
         依赖/模型缺失时直接抛 `LocalParseUnavailable`（不回退）；
@@ -117,8 +105,10 @@ def parse_pdf(pdf_path: Path, images_dir: Optional[Path] = None, *,
         Surya，**不使用 PyMuPDF 版式**；失败直接抛 `SuryaUnavailable`
         （不会悄悄回退，免得看起来像解析成功了）；
       * `unlimited_ocr`：整页 OCR 走 Unlimited-OCR —— 文字、公式（LaTeX）、表格
-        （HTML）、插图都来自它的回包，**不使用 PyMuPDF 版式**；失败直接抛
-        `UnlimitedOcrUnavailable`（同样不回退）。
+        （HTML）、插图都来自它的回包，**不使用 PyMuPDF 版式**；**本地推理服务**
+        （`../unlimited_ocr.py`）没有配置 / 未就绪时自动改用**在线解析**
+        （`../unlimited_ocr_online.py`），本地解析中途失败也会兜底切在线；
+        两条都不可用时抛 `UnlimitedOcrUnavailable`（同样不回退 PyMuPDF）。
 
     返回值：
       * parser      `"pymupdf"` / `"surya"` / `"unlimited_ocr"`
@@ -127,7 +117,7 @@ def parse_pdf(pdf_path: Path, images_dir: Optional[Path] = None, *,
       * warnings    说明性信息(列表，可能为空)
     """
     opts, warnings = load_options(config_file=config_file, overrides=options,
-                                  backend=backend)
+                                  backend=backend, account_options=account_options)
     if images_dir is not None:
         # `_parse_with_pymupdf` / `_parse_with_surya` 里都要 images_dir.mkdir()，
         # str 会 AttributeError
@@ -138,7 +128,7 @@ def parse_pdf(pdf_path: Path, images_dir: Optional[Path] = None, *,
         # 前端按 `parser === "surya"` 走块级渲染（见 backend_surya 模块文档）。
         warnings.append("解析后端 'surya'：文字版式、公式（<math>→LaTeX）与插图都由 "
                         "Surya 2 整页 OCR 提供；不使用 PyMuPDF 版式，"
-                        "也不跑 detection-service-group")
+                        "也不跑本地解析方案")
         result = _parse_with_surya(pdf_path, images_dir, opts)
         split_counts = split_surya_reference_blocks(result.get("pages") or [])
         if split_counts:
@@ -158,27 +148,25 @@ def parse_pdf(pdf_path: Path, images_dir: Optional[Path] = None, *,
         # Unlimited-OCR 也是**独立解析链**（与 surya 同级、各自维护）：文字 / 公式 /
         # 表格 / 插图全部用它自己的回包，前端按 `parser === "unlimited_ocr"`
         # 走它自己那套块级渲染（见 backend_unlimited_ocr 模块文档）。
+        # 数据来源本地/在线由后端内部路由（本地没配置就切在线解析）。
         warnings.append("解析后端 'unlimited_ocr'：文字、公式（LaTeX）、表格与插图都由 "
                         "Unlimited-OCR 整页 OCR 提供；不使用 PyMuPDF 版式，"
-                        "也不跑 detection-service-group")
+                        "也不跑本地解析方案")
         result = _parse_with_unlimited_ocr(pdf_path, images_dir, opts)
+        # 后端自己的告警（本地不可用→切在线、在线页面做了角度矫正…）要一并保留
+        warnings.extend(result.get("warnings") or [])
         _attach_links(result, pdf_path, warnings)
         result["warnings"] = warnings
         return result
 
     # ---- 本地解析方案：PyMuPDF 版式 + local_parse_pipeline 小模型链路 ----
-    # `auto` / `detection_service_group` / `pymupdf` 都落到这里。
-    if opts["backend"] == "detection_service_group":
-        warnings.append("解析后端 'detection_service_group' 现在使用本地解析方案"
-                        "（公式/表格/插图都由本地模型完成，不再调用 detection-service-group）")
-    else:
-        warnings.append("解析后端 " + repr(opts["backend"])
-                        + " → 本地解析方案：PyMuPDF 版式 + texify 公式 + "
-                        "OXR 版面分析 + SLANet 表格；公式以页面覆盖层渲染")
+    # `auto` / `pymupdf` 都落到这里。
+    warnings.append("解析后端 " + repr(opts["backend"])
+                    + " → 本地解析方案：PyMuPDF 版式 + texify 公式 + "
+                    "OXR 版面分析 + SLANet 表格；公式以页面覆盖层渲染")
     result = _parse_with_pymupdf(pdf_path, images_dir, opts)
     # 后端自己的告警（例如“有 N 个公式框没有拿到 LaTeX”）要一并保留
     warnings.extend(result.get("warnings") or [])
-    result = _formula_postprocess(result, pdf_path, images_dir, opts, warnings)
     # 公式最后是怎么落地的：
     #   "boxes" = 页面上叠了公式框覆盖层（pages[].formula_boxes，前端按 bbox_norm
     #             在页面上渲染 KaTeX，见 frontend/js/r2-math.js）；

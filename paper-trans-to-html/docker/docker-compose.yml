@@ -69,6 +69,14 @@ services:
       UNLIMITED_OCR_TIMEOUT: ${UNLIMITED_OCR_TIMEOUT:-600}
       # 服务端设了 VLLM_API_KEY 时才需要；没设时留空即可
       UNLIMITED_OCR_API_KEY: ${UNLIMITED_OCR_API_KEY:-}
+      # 数据来源：auto(默认，本地没配置/没起来就自动改用百度智能云在线解析)
+      # / local（只用本地）/ online（只用在线）。仅排障用，平时留空即可。
+      # ⚠️ 走在线解析时容器需要能访问公网（aip.baidubce.com）。
+      UNLIMITED_OCR_ROUTE: ${UNLIMITED_OCR_ROUTE:-auto}
+      # 在线解析（百度智能云）凭据：一般写在 config.json 的 parser 段
+      # （unlimited_ocr_online_api_key / unlimited_ocr_online_secret_key）；这里可覆盖
+      UNLIMITED_OCR_ONLINE_API_KEY: ${UNLIMITED_OCR_ONLINE_API_KEY:-}
+      UNLIMITED_OCR_ONLINE_SECRET_KEY: ${UNLIMITED_OCR_ONLINE_SECRET_KEY:-}
 
       # ---- PaddleOCR-VL 解析服务（已删除：旧客户端与配对链路已随代码移除，
       #      这组变量保留仅作历史记录，不再被读取）----
@@ -82,16 +90,6 @@ services:
       # 服务端设了 --api-key 时才需要；没设时留空即可（vLLM 会忽略该头）
       PADDLE_OCR_API_KEY: ${PADDLE_OCR_API_KEY:-}
 
-      # ---- detection-service-group 公式/表格识别服务组（formula_table_service_group）----
-      # 同样：容器里的 127.0.0.1 连不到宿主机上的 router_service；
-      #    默认走 host.docker.internal（宿主端口 9003 由该服务的 compose 映射）。
-      #    若把它接进了同一个 Docker 网络，可改成 http://router-service:9003/v1
-      DETECTION_SERVICE_GROUP_URL: ${DETECTION_SERVICE_GROUP_URL:-http://host.docker.internal:9003/v1}
-      # 一次预测（检测 + 识别）的整体超时（秒）
-      DETECTION_SERVICE_GROUP_TIMEOUT: ${DETECTION_SERVICE_GROUP_TIMEOUT:-300}
-      # 回包里是否带回框内裁图（base64；前端 KaTeX 渲染失败时兜底，默认开）
-      DETECTION_SERVICE_GROUP_KEEP_CROPS: ${DETECTION_SERVICE_GROUP_KEEP_CROPS:-true}
-
       # ---- PDF 解析后端（OCR）----
       # ⚠️ 默认**留空**（不注入环境变量）= 用网页「⚙ 设置 → 存储 / OCR」里保存的值。
       #    以前这里硬编码成 `${PDF_PARSER_BACKEND:-auto}`，容器里永远存在这个变量，
@@ -99,9 +97,7 @@ services:
       #    一份 config.json）。要强制锁定后端才填：
       #    surya=Surya 2 整页 OCR（文字/公式/插图全用 Surya）/
       #    unlimited_ocr=Unlimited-OCR 整页 OCR（文字/公式/表格/插图全用它）；
-      #    ⚠️ auto / detection_service_group / pymupdf 仍被识别，但本地 PyMuPDF
-      #    链路已移除（调用会报未实现）；
-      #    （旧值 ftgroup 仍被接受，等同 detection_service_group）
+      #    auto / pymupdf 使用本地解析方案；
       PDF_PARSER_BACKEND: ${PDF_PARSER_BACKEND:-}
 
       TZ: Asia/Shanghai

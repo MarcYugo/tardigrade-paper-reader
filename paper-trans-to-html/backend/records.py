@@ -133,15 +133,17 @@ def anno_with_authors(anno: dict, rec: dict) -> dict:
         前端见不到字段就自然不显示。
     """
     out = dict(anno or {})
-    notes = out.get("notes")
-    if not isinstance(notes, list):
-        return out
-    if not shared_entries(rec):
-        out["notes"] = [{k: v for k, v in n.items() if k != "by"}
-                        if isinstance(n, dict) else n for n in notes]
-        return out
-    out["notes"] = [dict(n, by=note_author(rec, n)) if isinstance(n, dict) else n
-                    for n in notes]
+    shared = bool(shared_entries(rec))
+    for field in ("notes", "free_notes"):
+        notes = out.get(field)
+        if not isinstance(notes, list):
+            continue
+        if not shared:
+            out[field] = [{k: v for k, v in n.items() if k != "by"}
+                          if isinstance(n, dict) else n for n in notes]
+        else:
+            out[field] = [dict(n, by=note_author(rec, n)) if isinstance(n, dict) else n
+                          for n in notes]
     return out
 
 
@@ -336,8 +338,12 @@ class Store:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def get_annotations(self, doc_id: str) -> dict:
-        return self._read_json(self.anno_file(doc_id),
-                               {"highlights": {}, "notes": []})
+        anno = self._read_json(self.anno_file(doc_id),
+                               {"highlights": {}, "notes": [], "free_notes": []})
+        anno.setdefault("highlights", {})
+        anno.setdefault("notes", [])
+        anno.setdefault("free_notes", [])
+        return anno
 
     def get_translations(self, doc_id: str) -> dict:
         return self._read_json(self.trans_file(doc_id), {})
@@ -369,15 +375,18 @@ class Store:
 
     def apply_anno(self, doc_id: str, action: str, block_id: str | None = None,
                    color: str | None = None, text: str | None = None,
-                   note_id: str | None = None, by: str | None = None) -> dict:
+                   note_id: str | None = None, by: str | None = None,
+                   title: str | None = None) -> dict:
         """返回更新后的 annotations。动作:
-          add_highlight / remove_highlight / add_note / remove_note
+          add_highlight / remove_highlight / add_note / remove_note /
+          add_free_note / update_free_note / remove_free_note
 
         `by` = 写这条笔记的账号（共享论文里要标识「谁写的」，见 `anno_with_authors`）。
         """
         anno = self.get_annotations(doc_id)
         hl = anno.setdefault("highlights", {})
         notes = anno.setdefault("notes", [])
+        free_notes = anno.setdefault("free_notes", [])
 
         if action == "add_highlight" and block_id:
             hl[block_id] = {"color": color or "yellow", "at": _now()}
@@ -398,9 +407,26 @@ class Store:
                 notes.append(note)
         elif action == "remove_note" and note_id:
             anno["notes"] = [n for n in notes if n.get("id") != note_id]
+        elif action == "add_free_note" and text is not None:
+            now = _now()
+            note = {"id": _uid(), "title": (title or "").strip(), "text": text,
+                    "created_at": now, "updated_at": now}
+            if by:
+                note["by"] = by
+            free_notes.append(note)
+        elif action == "update_free_note" and note_id and text is not None:
+            existing = next((n for n in free_notes if n.get("id") == note_id), None)
+            if existing:
+                existing["title"] = (title or "").strip()
+                existing["text"] = text
+                existing["updated_at"] = _now()
+                if by:
+                    existing["by"] = by
+        elif action == "remove_free_note" and note_id:
+            anno["free_notes"] = [n for n in free_notes if n.get("id") != note_id]
 
         self._write_json(self.anno_file(doc_id), anno)
         self.update_record(doc_id,
                            highlights=len(anno["highlights"]),
-                           notes=len(anno["notes"]))
+                           notes=len(anno["notes"]) + len(anno["free_notes"]))
         return anno

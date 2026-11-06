@@ -1,10 +1,10 @@
 """Surya 2 解析后端：版式来源 = Surya 整页 OCR 的版面 block（前端独立渲染分支）。
 
-与「PyMuPDF + detection-service-group」组合的区别（本后端存在的意义）：
+与本地解析方案的区别：
 
   * **完全使用 Surya 的数据**：文字 / 公式（`<math>` → LaTeX）/ 插图裁图 / 阅读顺序
-    全部来自 Surya 的版面 block；不读 PyMuPDF 的文字层、行框与字体，也不调用
-    detection-service-group。Surya 不可用时**直接报错**（不会悄悄回退 PyMuPDF，
+    全部来自 Surya 的版面 block；不读 PyMuPDF 的文字层、行框与字体。Surya
+    不可用时**直接报错**（不会悄悄回退 PyMuPDF，
     免得用户以为看到了 Surya 的效果）。
   * 页面 `texts[]` 是**块级**数据（没有逐行几何）：
 

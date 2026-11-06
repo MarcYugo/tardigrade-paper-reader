@@ -193,9 +193,7 @@ window.R2Nav = function (env) {
   $("btnToc").addEventListener("click", () => { tocPanelOpen() ? closeToc() : openToc(); });
   $("tocClose").addEventListener("click", closeToc);
   function scheduleSave() { clearTimeout(saveTimer); saveTimer = setTimeout(saveProgress, 800); }
-  /* 阅读完成度：只按**正文页面**算。
-     文末还有 AI 面板，若用整页 scrollHeight 会把它的高度也算进去 —— 同样读到文末，
-     进度反而变小（连带“读完自动标记”和“95% 自动整理笔记”都难以触发）。 */
+  /* 阅读完成度：只按**正文页面**算，不受视口固定的 AI 悬浮卡片影响。 */
   function readRatio() {
     const r = pagesEl.getBoundingClientRect();
     const h = r.height || 1;
@@ -212,7 +210,7 @@ window.R2Nav = function (env) {
     env.META.last_page = Math.max(env.META.last_page || 0, pi + 1);
     // 精确位置：与只增不减的 progress / last_page 相反，这个是**覆盖写**
     // （用户往回翻就是往回翻，不能又被拽回读到过的最远处）。
-    // {pi, ratio} = 第几页 + 页内比例；{pi:-1, fromBottom} = 已经滚到文末 AI 面板。
+    // {pi, ratio} = 第几页 + 页内比例；{pi:-1, fromBottom} = 已滚到正文末尾。
     // 量不到（还没页面）时保留原值，不要用 null 盖掉。
     const pos = pageAnchor();
     if (pos) env.META.last_pos = pos;
@@ -263,11 +261,14 @@ window.R2Nav = function (env) {
     render(anchor);
   }
   function refreshZoomLabel() {
-    // 右侧留出批注栏时页面会等比缩小(fit)，这里显示**实际**渲染比例，避免和看到的不一致
+    // 右侧留出批注栏时页面会等比缩小(fit)，这里显示**实际**渲染比例，避免和看到的不一致。
+    // 基准宽度用“本文档的基准宽”(= CSS_W × 文档显示比例)：unlimited-ocr 默认 85%，
+    // 但它就是那个文档的 100%，不能因为文档本身小一号就显示 85%。
+    const base = env.baseW ? env.baseW() : CSS_W;
     const pg = pages[0];
-    const pct = pg ? Math.round(pg.w * GZ() / CSS_W * 100) : Math.round(ZOOM() * 100);
+    const pct = pg ? Math.round(pg.w * GZ() / base * 100) : Math.round(ZOOM() * 100);
     $("zoomVal").textContent = pct + "%";
-    const capped = pg && pg.w < CSS_W - 1;
+    const capped = pg && pg.w < base - 1;
     $("zoomVal").title = capped
       ? "窗口宽度要留出侧栏（目录 / 笔记栏），页面已自动适宽；想放大请加宽窗口或收起侧栏"
       : "当前缩放比例";

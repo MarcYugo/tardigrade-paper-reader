@@ -1,7 +1,7 @@
 /* ============ 句子笔记（正文内嵌卡片 + 右侧“全部笔记”抽屉）：从 reader2.js 拆出来的模块 ============
    与 r2-math.js / r2-ai.js / r2-nav.js 同一套路：整段**按原样搬过来**（缩进没动），
    改动只有一类：跨模块共享的**可变状态**改成 `env.xxx`，因为本段会读写它们：
-     · anno        —— 读 `.notes`，并且**整体重新赋值**（`anno = await api(...)`）→ 需要 setter
+     · anno        —— 读句子笔记与独立笔记，并且**整体重新赋值**→ 需要 setter
      · editingKey  —— 正在编辑哪条笔记（`块id#句号`），段内多次赋值 → setter
      · noteDraft   —— 编辑框草稿，段内多次赋值 → setter
      · showNotesOn —— “显示笔记”开关，段内赋值 → setter
@@ -11,12 +11,13 @@
    其余（$ / itemById / inkCache / docId 等 const，以及 20 多个函数声明）装配时取一次即可。
 
    装配（reader2.js 原位置）：
-     const { notesOfBlock, notesCount, renderAllNotes, openNoteEditor, refreshSideList } =
+     const { notesOfBlock, notesCount, renderAllNotes, openNoteEditor, refreshSideList,
+             openSidePanel, jumpToNoteId } =
        R2Notes({ … });
      `canWrite` / `renderTocAi` 声明在**本段之后**（共享权限段 / AI 段装配处），
      装配这一刻还在 TDZ → 包一层转发，调用时才去读。
 
-   对外接口在文件末尾的 return，共 5 项。
+   对外接口在文件末尾的 return，包含笔记列表、编辑与 Agent 定位操作。
    ============================================================================ */
 window.R2Notes = function (env) {
   "use strict";
@@ -25,6 +26,7 @@ window.R2Notes = function (env) {
           sentKey, sentenceText, noteOf, selCount, selAnchor, isSelRef, pageOfItem,
           render, renderHmenuSwatches, setAnnoRanges, rebuildItem, selectSentence, syncExp,
           canWrite, renderTocAi } = env;
+  let freeDraft = null;
 
   /* ================= 句子笔记(内嵌在正文里) =================
      一条笔记 = 一个句子，卡片直接插在该句所属文字块下方（与译文同一套“顶开版式”），
@@ -167,6 +169,7 @@ window.R2Notes = function (env) {
       env.editingKey = null; env.noteDraft = "";
       toast("笔记已保存 ✓");
       applyAnnoRefresh();
+      env.markAiStale();
     } catch (err) { toast(err.message); }
   }
 
@@ -180,6 +183,7 @@ window.R2Notes = function (env) {
       if (env.editingKey === note.block_id) { env.editingKey = null; env.noteDraft = ""; }
       toast("笔记已删除");
       applyAnnoRefresh();
+      env.markAiStale();
       if (item) relayoutPage(item.pi);
     } catch (err) { toast(err.message); }
   }
@@ -191,7 +195,7 @@ window.R2Notes = function (env) {
     relayoutAll();
   });
 
-  /* ---- 右侧“全部笔记”总览(只做一览/定位/删除，编辑仍走正文内嵌卡片) ---- */
+  /* ---- 右侧笔记栏：句子笔记总览 + 独立笔记编辑 ---- */
   function sideOpen() { document.body.classList.add("side-open"); $("side").classList.add("open"); relayoutAll(); }
   function sideClose() { document.body.classList.remove("side-open"); $("side").classList.remove("open"); relayoutAll(); }
   $("btnNotes").addEventListener("click", () => {
@@ -199,19 +203,24 @@ window.R2Notes = function (env) {
     if (isOpen) sideClose(); else { sideOpen(); refreshSideList(); }
   });
   $("closeSide").addEventListener("click", sideClose);
+  $("newFreeNote").addEventListener("click", () => openFreeEditor());
 
   function refreshSideList() {
     const list = $("spList");
+    $("newFreeNote").hidden = !canWrite();
     list.textContent = "";
     const notes = (env.anno.notes || []).slice().reverse();
-    $("spCount").textContent = notes.length ? notes.length + " 条" : "";
-    if (!notes.length) {
+    const freeNotes = (env.anno.free_notes || []).slice().reverse();
+    const total = notes.length + freeNotes.length;
+    $("spCount").textContent = total ? total + " 条" : "";
+    $("notesCount").textContent = total;
+    if (freeDraft) renderFreeEditor(list);
+    if (!total) {
       const d = el("div", "sp-empty");
-      d.innerHTML = '<div class="big">💡</div>选中论文中的一句话<br>点击「笔记」即可在句子下方直接写笔记';
+      d.innerHTML = '<div class="big">💡</div>可以新建独立笔记，或选中论文中的句子添加关联笔记';
       list.appendChild(d);
-      return;
     }
-    $("notesCount").textContent = notes.length;
+    for (const n of freeNotes) renderFreeNoteCard(list, n);
     for (const n of notes) {
       const p = keyParts(n.block_id);
       const item = findItem(p.id);
@@ -237,6 +246,89 @@ window.R2Notes = function (env) {
       list.appendChild(card);
     }
   }
+  function openFreeEditor(note = null) {
+    if (!needWrite()) return;
+    freeDraft = note
+      ? { id: note.id, title: note.title || "", text: note.text || "" }
+      : { id: "", title: "", text: "" };
+    sideOpen();
+    refreshSideList();
+    const input = $("spList").querySelector(".free-note-editor textarea");
+    if (input) input.focus();
+  }
+  function renderFreeEditor(list) {
+    const box = el("div", "free-note-editor");
+    box.appendChild(el("b", "", freeDraft.id ? "编辑独立笔记" : "新建独立笔记"));
+    const title = el("input");
+    title.type = "text";
+    title.maxLength = 200;
+    title.placeholder = "标题（可选）";
+    title.value = freeDraft.title;
+    title.addEventListener("input", () => { freeDraft.title = title.value; });
+    const text = el("textarea");
+    text.maxLength = 12000;
+    text.placeholder = "写下要保存的内容…";
+    text.value = freeDraft.text;
+    text.addEventListener("input", () => { freeDraft.text = text.value; });
+    const row = el("div", "row");
+    const save = el("button", "btn primary", "保存");
+    save.addEventListener("click", saveFreeNote);
+    const cancel = el("button", "btn ghost", "取消");
+    cancel.addEventListener("click", () => { freeDraft = null; refreshSideList(); });
+    row.append(save, cancel);
+    box.append(title, text, row);
+    list.appendChild(box);
+  }
+  async function saveFreeNote() {
+    if (!needWrite()) return;
+    const draft = freeDraft;
+    if (!draft || !draft.text.trim()) { toast("笔记内容不能为空"); return; }
+    try {
+      env.anno = await api(`/api/doc/${docId}/anno`, {
+        method: "POST",
+        json: { action: draft.id ? "update_free_note" : "add_free_note",
+          note_id: draft.id || undefined, title: draft.title.trim(), text: draft.text.trim() },
+      });
+      freeDraft = null;
+      applyAnnoRefresh();
+      env.markAiStale();
+      toast("独立笔记已保存 ✓");
+    } catch (err) { toast(err.message); }
+  }
+  function renderFreeNoteCard(list, note) {
+    const card = el("div", "note-card free-note-card");
+    card.dataset.noteId = note.id;
+    if (note.title) card.appendChild(el("b", "free-note-title", note.title));
+    const who = authorChip(note);
+    if (who) card.appendChild(who);
+    card.appendChild(el("div", "sent-src", "独立笔记"));
+    card.appendChild(el("div", "body", note.text || ""));
+    const row = el("div", "row");
+    const locate = el("button", "", "定位");
+    locate.addEventListener("click", () => jumpToNoteId(note.id));
+    row.appendChild(locate);
+    if (canWrite()) {
+      const edit = el("button", "", "编辑");
+      edit.addEventListener("click", () => openFreeEditor(note));
+      const remove = el("button", "del", "删除");
+      remove.addEventListener("click", () => deleteFreeNote(note));
+      row.append(edit, remove);
+    }
+    card.appendChild(row);
+    list.appendChild(card);
+  }
+  async function deleteFreeNote(note) {
+    if (!needWrite()) return;
+    if (!confirm("删除这条独立笔记？")) return;
+    try {
+      env.anno = await api(`/api/doc/${docId}/anno`, {
+        method: "POST", json: { action: "remove_free_note", note_id: note.id },
+      });
+      applyAnnoRefresh();
+      env.markAiStale();
+      toast("独立笔记已删除");
+    } catch (err) { toast(err.message); }
+  }
   function jumpToNote(p, scroll = true) {
     const item = findItem(p.id);
     if (!item) return;
@@ -245,6 +337,25 @@ window.R2Notes = function (env) {
       const r = item.el.getBoundingClientRect();
       window.scrollBy({ top: toScrollDelta(r.top - 130), behavior: "smooth" });
     }
+  }
+  function jumpToNoteId(noteId) {
+    const anchored = (env.anno.notes || []).find(n => n.id === noteId);
+    if (anchored) {
+      const p = keyParts(anchored.block_id);
+      if (!findItem(p.id)) return false;
+      jumpToNote(p);
+      return true;
+    }
+    const free = (env.anno.free_notes || []).find(n => n.id === noteId);
+    if (!free) return false;
+    sideOpen();
+    refreshSideList();
+    requestAnimationFrame(() => {
+      const card = Array.from($("spList").querySelectorAll("[data-note-id]"))
+        .find(node => node.dataset.noteId === noteId);
+      if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    return true;
   }
   function applyAnnoRefresh() {
     for (const id in itemById) { const it = itemById[id]; setAnnoRanges(it); rebuildItem(it); }
@@ -265,5 +376,6 @@ window.R2Notes = function (env) {
   });
 
   /* ============ 对外接口 ============ */
-  return { notesOfBlock, notesCount, renderAllNotes, openNoteEditor, refreshSideList };
+  return { notesOfBlock, notesCount, renderAllNotes, openNoteEditor, refreshSideList,
+    openSidePanel: () => { sideOpen(); refreshSideList(); }, jumpToNoteId };
 };

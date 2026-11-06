@@ -545,7 +545,6 @@ function createLangDropdown(o) {
 const OCR_BACKENDS = [
   { value: "auto", name: "自动（本地解析方案）", sub: "默认：PyMuPDF 版式 + 本地公式/表格模型", badge: "默认" },
   { value: "pymupdf", name: "本地解析方案", sub: "PyMuPDF + texify 公式 + OXR 版面/SLANet 表格" },
-  { value: "detection_service_group", name: "本地解析方案（不调用服务组）", sub: "历史取值，内部等价于本地解析方案" },
   { value: "surya", name: "Surya 2 推理服务", sub: "整页 OCR：文字 / 公式 / 插图" },
   { value: "unlimited_ocr", name: "Unlimited-OCR 推理服务", sub: "整页 OCR：文字 / 公式 / 表格 / 插图" },
 ];
@@ -681,8 +680,7 @@ function openLlmModal(tab) {
       </div>
       <div class="modal-body" id="paneSys" hidden>
         <p class="hint" style="margin:0 0 12px">
-          数据存储与 <b>PDF 解析 / 图片与公式检测</b>是安装级配置，本机所有账号共用，
-          与账号无关。
+          数据存储和解析服务参数为安装级配置；PDF 解析后端选择则跟随当前账号保存。
         </p>
         <div class="field">
           <label>数据存储</label>
@@ -700,7 +698,6 @@ function openLlmModal(tab) {
             <select id="ocrBackend" hidden>
               <option value="auto">自动（本地解析方案：PyMuPDF + 本地模型）</option>
               <option value="pymupdf">本地解析方案</option>
-              <option value="detection_service_group">本地解析方案（不调用服务组）</option>
               <option value="surya">Surya 2 推理服务（整页 OCR：文字 / 公式 / 插图）</option>
               <option value="unlimited_ocr">Unlimited-OCR 推理服务（整页 OCR：文字 / 公式 / 表格 / 插图）</option>
             </select>
@@ -1067,20 +1064,19 @@ function openLlmModal(tab) {
   }
 
   /* PDF 解析后端：
-       · auto / pymupdf / detection_service_group：**本地解析方案** —— PyMuPDF 版式
+       · auto / pymupdf：**本地解析方案** —— PyMuPDF 版式
          + texify 公式识别 + OXR 版面分析 + SLANet 表格识别，前端逐行绝对定位渲染；
        · surya：整页 OCR —— 文字 / 公式（<math>→LaTeX）/ 插图全用 Surya 的数据；
        · unlimited_ocr：整页 OCR —— 文字 / 公式（LaTeX）/ 表格（HTML）/ 插图全用
-         Unlimited-OCR 的数据。
+         Unlimited-OCR 的数据（本地推理服务；不可用时自动改用在线解析）。
      服务没起 / 依赖没装时这里如实显示状态。 */
   const OCR_TEXT = {
-    detection_service_group: "本地解析方案（不调用服务组）",
     surya: "Surya 2 推理服务（文字 / 公式 / 插图全用 Surya）",
-    unlimited_ocr: "Unlimited-OCR 推理服务（文字 / 公式 / 表格 / 插图全用 OCR）",
+    unlimited_ocr: "Unlimited-OCR 推理服务（本地优先，自动兜底在线解析）",
     pymupdf: "本地解析方案（PyMuPDF + 本地公式/表格模型）",
     unavailable: "不可用（本地解析方案的模型/依赖未就绪）",
   };
-  const OCR_NAME = { auto: "自动（本地解析方案）", detection_service_group: "本地解析方案（不调用服务组）", surya: "Surya 2", unlimited_ocr: "Unlimited-OCR", pymupdf: "本地解析方案" };
+  const OCR_NAME = { auto: "自动（本地解析方案）", surya: "Surya 2", unlimited_ocr: "Unlimited-OCR", pymupdf: "本地解析方案" };
 
   function renderParser(p) {
     const el2 = $("lmParser");
@@ -1103,11 +1099,22 @@ function openLlmModal(tab) {
       (p.surya_client_ready === false ? "（本机缺 surya-ocr 客户端依赖）" : "") +
       (p.surya_message ? `<span title="${esc(p.surya_message)}">` : "") +
       "</span>";
-    html += `<br>${p.unlimited_ocr_ready ? "✅" : "⛔"} Unlimited-OCR ` +
+    html += `<br>${p.unlimited_ocr_ready ? "✅" : (p.unlimited_ocr_online_ready ? "↪️" : "⛔")} Unlimited-OCR ` +
       `<code>${esc(p.unlimited_ocr_url || "")}</code>` +
       `（模型 <code>${esc(p.unlimited_ocr_model || "")}</code>）` +
       (p.unlimited_ocr_message
         ? `<span title="${esc(p.unlimited_ocr_message)}"> ⓘ</span>` : "");
+    // 在线解析（百度智能云）是内置兜底：本地服务没配置 / 没起来时自动切过去
+    html += `<br>${p.unlimited_ocr_online_ready ? "✅" : "⛔"} 在线解析（百度智能云 Unlimited-OCR）` +
+      (p.unlimited_ocr_online_ready
+        ? "：本地服务不可用时自动切换，按页计费"
+        : "（凭据缺失，本地服务不可用时会报错）") +
+      (p.unlimited_ocr_online_message
+        ? `<span title="${esc(p.unlimited_ocr_online_message)}"> ⓘ</span>` : "");
+    if (p.unlimited_ocr_route) {
+      html += `<br>ℹ️ Unlimited-OCR 当前数据来源：` +
+        `<b>${p.unlimited_ocr_route === "online" ? "在线解析" : "本地推理服务"}</b>`;
+    }
     if (p.message) html += `<br>ℹ️ ${esc(p.message)}`;
     if (p.env_override) html += `<br>⚠️ 已设置环境变量 <code>PDF_PARSER_BACKEND</code>，` +
       `它会<b>覆盖</b>这里保存的值（环境变量优先级高于 <code>config.json</code>）—— ` +
@@ -1127,7 +1134,7 @@ function openLlmModal(tab) {
     }
   }
 
-  /* 保存解析后端：安装级配置，写 config.json 的 parser.backend */
+  /* 保存解析后端：跟随当前账号，服务参数仍使用安装级配置 */
   $("ocrSave").onclick = async () => {
     const v = $("ocrBackend").value;
     const btn = $("ocrSave");
@@ -1139,7 +1146,7 @@ function openLlmModal(tab) {
       // 环境变量优先级高于 config.json：这种情况“保存成功”≠“真的切过去了”，
       // 必须直说，否则看起来就像“选了 pymupdf 但解析依旧走 OCR”。
       toast(p.env_override
-        ? "已写入配置，但环境变量 PDF_PARSER_BACKEND 会覆盖它（见下方提示）"
+        ? "已保存账号设置，但环境变量 PDF_PARSER_BACKEND 会覆盖它（见下方提示）"
         : "PDF 解析后端已切换为：" + (OCR_NAME[v] || v));
       appConfig(true);            // 让其它页面读到最新状态
     } catch (e) {

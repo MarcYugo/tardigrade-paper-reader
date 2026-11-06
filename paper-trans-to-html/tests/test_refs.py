@@ -153,6 +153,42 @@ class ReferenceFallbackTest(unittest.TestCase):
             [("[Smith et al., 2020]", [0]), ("[Wu et al., 2021]", [1])],
         )
 
+    def test_goto_target_above_entry_top_still_maps_to_that_entry(self):
+        """hyperref 目标点比条目行顶高几个 pt、条目块又整行宽（OCR 路线的常态）时也要对上。
+
+        实测 `unlimited_ocr` 的参考文献条目块宽 414pt、`to` 贴在页面左边距
+        （x≈95.14，y 比条目行顶高 4~5pt）：旧判据拿“到块中心”的距离兜底 →
+        每条都差 200pt+，199 条链接只有 6 条能映射上。
+        """
+        doc = {
+            "parser": "unlimited_ocr",
+            "parser_info": {"links_total": 2},
+            "pages": [
+                {
+                    "texts": [_text("p0b0", "Earlier work [1] and [2].", 20)],
+                    "links": [
+                        # 目标点比条目块顶（100 / 140）高 5pt，x 在页面左边距
+                        {"kind": "goto", "rect": [10, 20, 26, 32],
+                         "page": 1, "to": [10, 95]},
+                        {"kind": "goto", "rect": [40, 20, 56, 32],
+                         "page": 1, "to": [10, 135]},
+                    ],
+                },
+                {"texts": [
+                    _text("p1b0", "References", 60),
+                    _text("p1b1", "[1] First cited paper, 2020.", 100),
+                    _text("p1b2", "[2] Second cited paper, 2021.", 140),
+                ]},
+            ],
+        }
+
+        result = build_refs(doc)
+
+        self.assertEqual(
+            [(link["token"], link["refs"]) for link in result["links"]],
+            [("[1]", [0]), ("[2]", [1])],
+        )
+
     def test_unlabelled_author_year_list_is_split_by_hanging_indent(self):
         """ACL/arXiv 风格的参考文献没有 `[作者, 年份]` 标签：条目行首直接是作者名。
 

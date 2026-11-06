@@ -1,7 +1,7 @@
 # ---- 依赖源 ----
 # PyTorch 官方 CPU 索引：下面锁定的 torch/torchvision `+cpu` 版本要从这里取。
 # 注意：requirements 文件里的 index 选项是**全局**的，对本文件所有包生效。
-# --extra-index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 fastapi>=0.110
 uvicorn[standard]>=0.29
@@ -27,8 +27,8 @@ pymongo==4.18.0
 #     3) torch 2.14.0 ↔ torchvision 0.29.0 是官方配套版本（与 doc_parse_service
 #        服务端装的一致）；torchvision 元数据要求 torch==2.14.0，正好匹配。
 #  gpu 设备推理的话把cpu版本的torch和torchvision 注释掉
-# torch==2.14.0+cpu
-# torchvision==0.29.0+cpu
+torch==2.14.0+cpu
+torchvision==0.29.0+cpu
 # onnxruntime
 
 surya-ocr==0.22

@@ -1,12 +1,12 @@
 """解析自检：不启动服务，直接验证“模块一 · 文档解析”。
 
 运行:
-    python tools/selftest.py [pdf路径] [--backend auto|detection_service_group|surya|unlimited_ocr|pymupdf] [--dpi 150]
+    python tools/selftest.py [pdf路径] [--backend auto|surya|unlimited_ocr|pymupdf] [--dpi 150]
 默认用 samples/sample.pdf；backend 留空时按 config.json / 环境变量(默认 auto)。
 输出: 实际使用的后端、页数、文字块/图片数、版面标签统计，
       并把图片落盘到 data/selftest_images/。
 
-`pymupdf` / `auto` / `detection_service_group` 走**本地解析方案**：PyMuPDF 文字层 +
+`pymupdf` / `auto` 走**本地解析方案**：PyMuPDF 文字层 +
 `local_parse_pipeline.process_pages()`（texify 公式 / OXR 版面 + SLANet 表格 / 插图），
 需要本机模型权重与依赖（见 `backend/pdf_parser/local_parse_pipeline/README.md`）：
     python tools/selftest.py samples/latex_sample.pdf --backend pymupdf
@@ -30,8 +30,7 @@ def main() -> None:
     ap.add_argument("pdf", nargs="?", default=None,
                     help="PDF 路径(默认 samples/sample.pdf)")
     ap.add_argument("--backend", default=None,
-                    choices=["auto", "detection_service_group", "surya",
-                             "unlimited_ocr", "pymupdf"],
+                    choices=["auto", "surya", "unlimited_ocr", "pymupdf"],
                     help="解析后端；不传则按 config.json / 环境变量(默认 auto)")
     ap.add_argument("--dpi", type=int, default=None, help="公式检测/识别渲染 DPI")
     args = ap.parse_args()

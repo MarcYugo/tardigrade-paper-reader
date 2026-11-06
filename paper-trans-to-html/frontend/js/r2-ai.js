@@ -8,8 +8,8 @@
 
    装配（reader2.js 原位置）：
      const { maybeAutoSummarize, syncAiButtons, jumpToAi, renderTocAi, loadAi } =
-       R2Ai({ $, docId, findItem, keyParts, pageOfItem, scrolled, toScrollTop,
-              needWrite, anchorProbe, canWrite: (...a) => canWrite(...a),
+       R2Ai({ $, docId, findItem, keyParts, pageOfItem,
+              needWrite, canWrite: (...a) => canWrite(...a),
               renderInlineMath, katexReady, ensureKatex,
               get META() { return META; }, get anno() { return anno; } });
    注：`canWrite` 声明在 AI 段**之后**（共享权限那一段），所以这里只能包一层转发，
@@ -26,8 +26,7 @@
    ============================================================================ */
 window.R2Ai = function (env) {
   "use strict";
-  const { $, docId, findItem, keyParts, pageOfItem, scrolled, toScrollTop,
-          needWrite, anchorProbe, canWrite } = env;
+  const { $, docId, findItem, keyParts, pageOfItem, needWrite, canWrite } = env;
   // 可选：KaTeX 三件套（AI 文字里的行内数学用），由 reader2.js 装配传入
   const { renderInlineMath, katexReady, ensureKatex } = env;
 
@@ -41,20 +40,121 @@ window.R2Ai = function (env) {
   let aiMeta = {};          // 最近一次服务端状态（整理时间/笔记条数/是否配了 LLM）
   let aiDraft = null;       // 流式回复的已收到文本；null = 还没开始/已结束
   let aiDraftEl = null;     // 上面那个气泡的 DOM，增量更新用（不整框重画）
+  let aiToolStatus = "";
+  let aiPendingNavigation = null;
+  const aiCollapsedKey = "paperReader.aiCollapsed." + docId;
+  let aiCollapsed = true;
+  try {
+    const savedCollapseState = localStorage.getItem(aiCollapsedKey);
+    if (savedCollapseState !== null) aiCollapsed = savedCollapseState === "1";
+  } catch (e) { /* storage unavailable */ }
   let aiEdit = "";          // 正在就地编辑哪一块（aiKeyOf(...) 的字符串；空串 = 没在编辑）
   let aiSaving = false;     // 正在把手改的整理存回服务端
   let aiMathTried = false;  // 已为文字里的数学懒加载过一次 KaTeX（失败也别反复试）
   let aiDraftRaf = 0;       // 流式重绘的 rAF 句柄（增量猛进来时每帧最多渲染一次）
   const aiBusy = () => aiBusyWhat !== "";
 
+  function positionAiCard() {
+    const pager = $("pageInd");
+    const page = $("pages").querySelector(".page");
+    const section = $("aiEnd");
+    if (!page || !section) return;
+    const zoom = page.offsetWidth ? page.getBoundingClientRect().width / page.offsetWidth : 1;
+    const pagerRect = pager ? pager.getBoundingClientRect() : null;
+    const viewW = document.documentElement.clientWidth;
+    const viewH = document.documentElement.clientHeight;
+    /* 阅读区底部给卡片留位置：展开时留出卡片高度 + 12px，
+       文末最后一段就能滚到卡片上方（到底部时不会被浮层盖住）；收起时恢复默认 90px。 */
+    const syncAiReserve = () => {
+      const main = $("readerMain");
+      if (!main) return;
+      const top = section.getBoundingClientRect().top;
+      const pad = aiCollapsed ? 0 : Math.max(0, Math.round(viewH - top / zoom) + 12);
+      main.style.paddingBottom = pad ? pad + "px" : "";
+    };
+    if (aiCollapsed && pagerRect) {
+      /* 收起态只有一行标题：贴在页码指示器左侧，底部与它对齐 */
+      const gap = 10 * zoom;
+      section.style.width = "auto";
+      section.style.maxWidth = Math.max(80, pagerRect.left - gap - 12) + "px";
+      section.style.left = "auto";
+      section.style.right = Math.max(0, viewW - pagerRect.left / zoom + gap) + "px";
+      section.style.bottom = Math.max(0, viewH - pagerRect.bottom / zoom) + "px";
+      syncAiReserve();
+      return;
+    }
+    section.style.maxWidth = "";
+    /* 展开态：宽度取窗口宽度的 95%，在“避开左右抽屉面板后的可用区间”里居中 */
+    const cls = document.body.classList;
+    const leftGap = (cls.contains("toc-open") ? 316 : 12) * zoom;
+    const rightGap = (cls.contains("side-open") ? 400 : 12) * zoom;
+    const availW = Math.max(240 * zoom, viewW * zoom - leftGap - rightGap);
+    const width = Math.min(viewW * 0.95 * zoom, availW);
+    const left = leftGap + (availW - width) / 2;
+    section.style.left = (left / zoom) + "px";
+    section.style.right = "auto";
+    section.style.width = (width / zoom) + "px";
+    /* 底边贴着页码指示器上方（留 8px），而不是固定 68px 的空当 */
+    section.style.bottom = pagerRect
+      ? Math.max(0, viewH - pagerRect.top / zoom + 8) + "px"
+      : "68px";
+    syncAiReserve();
+  }
+
+  function setAiCollapsed(collapsed, persist = true) {
+    aiCollapsed = !!collapsed;
+    const body = $("aiBody");
+    const toggle = $("aiToggle");
+    const section = $("aiEnd");
+    body.hidden = aiCollapsed;
+    toggle.setAttribute("aria-expanded", String(!aiCollapsed));
+    toggle.title = aiCollapsed ? "展开 AI 辅助阅读和笔记" : "收起 AI 辅助阅读和笔记";
+    toggle.setAttribute("aria-label", toggle.title);
+    section.classList.toggle("ai-collapsed", aiCollapsed);
+    positionAiCard();
+    if (!aiCollapsed) { env.layoutAi(); positionAiCard(); }   // 堆叠/两栏定下后卡片高度变了，预留重算一次
+    if (persist) {
+      try { localStorage.setItem(aiCollapsedKey, aiCollapsed ? "1" : "0"); }
+      catch (e) { /* storage unavailable */ }
+    }
+  }
+  setAiCollapsed(aiCollapsed, false);
+  window.addEventListener("resize", positionAiCard);
+  if (window.ResizeObserver) {
+    const pageResizeObserver = new ResizeObserver(positionAiCard);
+    const observePage = () => {
+      const page = $("pages").querySelector(".page");
+      if (page) pageResizeObserver.observe(page);
+      pageResizeObserver.observe($("pageInd"));
+    };
+    observePage();
+    new MutationObserver(observePage).observe($("pages"), { childList: true });
+    /* 目录 / 笔记抽屉开合（body 上的 toc-open / side-open）会改变可用宽度：
+       先按新宽度重新定位，再重新判断两栏还是堆叠，最后按新高度算底部预留 */
+    new MutationObserver(() => {
+      positionAiCard();
+      if (!aiCollapsed) env.layoutAi();
+      positionAiCard();
+    }).observe(document.body, { attributes: true, attributeFilter: ["class"] });
+    /* 堆叠与否会改变卡片高度（.ai-stacked 由 layout.js 加上/去掉）：跟着重算预留 */
+    new MutationObserver(positionAiCard).observe($("aiBody"), {
+      attributes: true, attributeFilter: ["class"],
+    });
+  }
+
   function aiNotes() {
-    return (env.anno.notes || []).map(n => {
+    const linked = (env.anno.notes || []).map(n => {
       const p = keyParts(n.block_id);
       const item = findItem(p.id);
       const sents = (item && item.sents) || [];
       const sent = (p.si >= 0 && sents[p.si]) ? sents[p.si].text : "";
-      return { sent: sent, note: (n.text || "").trim(), page: item ? pageOfItem(item) : 0 };
+      return { id: n.id, sent: sent, note: (n.text || "").trim(),
+        page: item ? pageOfItem(item) : 0 };
     }).filter(x => x.note);
+    const free = (env.anno.free_notes || []).map(n => ({
+      id: n.id, title: n.title || "", note: (n.text || "").trim(), page: 0,
+    })).filter(x => x.note);
+    return linked.concat(free);
   }
 
   function renderAiSub() {
@@ -66,7 +166,7 @@ window.R2Ai = function (env) {
     if (aiMeta.ready === false) bits.push("⚠️ 未配置 LLM，无法整理/对话");
     if (aiMeta.stale) bits.push("笔记有更新，可重新整理");
     $("aiSub").textContent = bits.join(" · ")
-      || "读到 95% 会自动把笔记整理成主题 / 关联 / 待想清楚的问题";
+      || "可让 AI 把内容写进右侧整理卡片或定位论文内容；读到 95% 会自动整理笔记";
   }
 
   /* 忙的时候或只读共享时把按钮置灰，避免重复触发 / 点了才报 403 */
@@ -85,11 +185,9 @@ window.R2Ai = function (env) {
 
   /* 目录侧栏里那一块“AI 辅助阅读”：与目录不是一体（靠分隔线隔开），
      只放状态 + 主题入口 + 跳转按钮，完整内容还在文末。 */
-  function jumpToAi(instant) {
-    const sec = $("aiEnd");
-    if (!sec) return;
-    window.scrollTo({ top: toScrollTop(scrolled() + sec.getBoundingClientRect().top - anchorProbe()),
-                      behavior: instant ? "auto" : "smooth" });
+  function jumpToAi() {
+    if (!$("aiEnd")) return;
+    if (aiCollapsed) setAiCollapsed(false);
   }
 
   function renderTocAi() {
@@ -114,6 +212,13 @@ window.R2Ai = function (env) {
         ? "还没整理。读到 95% 会自动整理这 " + n + " 条笔记。"
         : "先在正文里写几条笔记，读完后会自动整理。"));
     }
+  }
+
+  function markAiStale() {
+    if (!aiSummary) return;
+    aiStale = true;
+    renderAiSub();
+    renderTocAi();
   }
 
   /* ---------- AI 文字的 Markdown 渲染（对话气泡 + 整理条目） ----------
@@ -156,7 +261,7 @@ window.R2Ai = function (env) {
     if (!aiChat.length && !aiBusy()) {
       const d = el("div", "ai-empty-chat");
       d.innerHTML = aiSummary
-        ? "就这篇论文、或笔记里的疑问提问，<br>AI 会带着你的笔记一起理。"
+        ? "提问、要求记录内容，或让 AI 定位到论文/笔记。<br>AI 会带着全文和笔记一起处理。"
         : "先读到最后（或点右侧「生成整理」），<br>再就笔记里的疑问聊一聊。";
       box.appendChild(d);
       return;
@@ -183,14 +288,37 @@ window.R2Ai = function (env) {
       else dtxt.textContent = "⏳ 正在想…";
       aiDraftEl.appendChild(dtxt);
       box.appendChild(aiDraftEl);
+      if (aiToolStatus) {
+        const status = el("div", "ai-msg ai pending");
+        status.appendChild(el("div", "who", "Agent"));
+        status.appendChild(el("div", "txt", "⏳ " + aiToolStatus));
+        box.appendChild(status);
+      }
     } else if (aiBusy()) {
       // 还没开始回字（整理笔记 / 刚发出去）：工作状态就放聊天流末尾，
       // 不再用占位符把右边的整理内容顶掉
       const d = el("div", "ai-msg ai pending");
       d.appendChild(el("div", "who", "AI"));
       d.appendChild(el("div", "txt", aiBusyWhat === "summary"
-        ? "⏳ 正在读你的笔记…" : "⏳ 正在想…"));
+        ? "⏳ 正在读你的笔记…" : ("⏳ " + (aiToolStatus || "正在思考…"))));
       box.appendChild(d);
+    }
+    if (aiPendingNavigation) {
+      const card = el("div", "ai-nav-confirm");
+      const target = aiPendingNavigation.target === "paper"
+        ? "论文第 " + aiPendingNavigation.page + " 页"
+        : "指定笔记";
+      card.appendChild(el("div", "txt", "要定位到" + target + "吗？"));
+      const actions = el("div", "actions");
+      const yes = el("button", "btn primary", "是，定位");
+      yes.type = "button";
+      yes.addEventListener("click", () => sendAi("yes"));
+      const no = el("button", "btn ghost", "暂不");
+      no.type = "button";
+      no.addEventListener("click", () => sendAi("no"));
+      actions.append(yes, no);
+      card.appendChild(actions);
+      box.appendChild(card);
     }
     box.scrollTop = box.scrollHeight;      // 新消息 / 工作状态总在可见处
   }
@@ -218,18 +346,18 @@ window.R2Ai = function (env) {
      浏览器不支持流式读取（没有 body reader）时退化成“整段收完再一次解析”，
      至少不会报错。 */
   async function readAiStream(resp, onEvent) {
-    const handle = line => {
+    const handle = async line => {
       line = (line || "").trim();
       if (!line || line.startsWith(":")) return;
       if (line.startsWith("data:")) line = line.slice(5).trim();
       if (!line) return;
       let ev = null;
       try { ev = JSON.parse(line); } catch (e) { return; }
-      if (ev && typeof ev === "object") onEvent(ev);
+      if (ev && typeof ev === "object") await onEvent(ev);
     };
     const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
     if (!reader) {
-      (await resp.text()).split("\n").forEach(handle);
+      for (const line of (await resp.text()).split("\n")) await handle(line);
       return;
     }
     const dec = new TextDecoder();
@@ -240,11 +368,11 @@ window.R2Ai = function (env) {
       buf += dec.decode(value, { stream: true });
       let i;
       while ((i = buf.indexOf("\n")) >= 0) {   // 一行一个事件，拼够了再解析
-        handle(buf.slice(0, i));
+        await handle(buf.slice(0, i));
         buf = buf.slice(i + 1);
       }
     }
-    if (buf) handle(buf);
+    if (buf) await handle(buf);
   }
 
   function renderAiSummary() {
@@ -548,7 +676,7 @@ window.R2Ai = function (env) {
     if (aiBusy()) return;
     if (!needWrite("只读共享：不能生成/重新整理笔记")) return;
     const notes = aiNotes();
-    if (!notes.length) { toast("这篇还没有笔记：先在正文里选中句子写几条"); return; }
+    if (!notes.length) { toast("这篇还没有笔记：先添加一条笔记再整理"); return; }
     aiBusyWhat = "summary";
     renderAiSub();
     syncAiButtons();
@@ -570,22 +698,32 @@ window.R2Ai = function (env) {
     }
   }
 
-  async function sendAi() {
+  async function sendAi(navigationAnswer = null) {
     const ta = $("aiText");
-    const text = (ta.value || "").trim();
+    const pendingNavigation = aiPendingNavigation;
+    const text = navigationAnswer === "yes" ? "是的，请定位到刚才提到的位置。"
+      : navigationAnswer === "no" ? "暂时不用定位，谢谢。"
+        : (ta.value || "").trim();
     if (!needWrite("只读共享：不能发消息")) return;
     if (!text || aiBusy()) return;
+    aiPendingNavigation = null;
     aiBusyWhat = "chat";
+    aiToolStatus = "";
     ta.value = "";
     aiChat.push({ role: "user", content: text });
     aiDraft = null;               // 还没收到第一个字：先显示“⏳ 正在想…”
     renderAiChat();               // 只重画聊天框：右边的整理内容保持原样
     syncAiButtons();
     try {
+      const request = { message: text, notes: aiNotes() };
+      if (pendingNavigation) {
+        request.pending_navigation = pendingNavigation;
+        if (navigationAnswer) request.navigation_answer = navigationAnswer;
+      }
       const resp = await fetch("/api/doc/" + docId + "/ai/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, notes: aiNotes() }),
+        body: JSON.stringify(request),
       });
       if (!resp.ok) {
         let msg = "请求失败(" + resp.status + ")";
@@ -594,17 +732,56 @@ window.R2Ai = function (env) {
         throw new Error(msg);
       }
       let failure = "";
-      await readAiStream(resp, ev => {
+      let completed = false;
+      let proposedNavigation = null;
+      await readAiStream(resp, async ev => {
         if (ev.type === "delta") {
+          if (aiToolStatus) {
+            aiToolStatus = "";
+            renderAiChat();
+          }
           pushAiDelta(ev.text || "");          // 边收边显示
         } else if (ev.type === "done") {
+          completed = true;
           if (ev.chat) { aiChat = ev.chat; aiDraft = null; }
+          aiPendingNavigation = proposedNavigation;
         } else if (ev.type === "error") {
           failure = ev.message || "对话失败";
+        } else if (ev.type === "tool") {
+          const label = ev.name === "add_note_to_summary" ? "正在写入整理卡片…"
+            : "正在定位内容…";
+          aiToolStatus = ev.status === "running" ? label : (ev.message || "工具已执行");
+          renderAiChat();
+        } else if (ev.type === "action") {
+          const action = ev.action || {};
+          if (action.type === "summary_changed") {
+            if (action.summary) {          // 后端已经把新整理落库：直接换到卡片上
+              aiSummary = action.summary;
+              aiEdit = "";
+              renderAiSummary();
+              renderAiSub();
+            }
+          } else if (action.type === "notes_changed") {
+            await env.refreshNotes();
+            markAiStale();
+          } else if (action.type === "navigate") {
+            if (action.target === "paper" && Number.isInteger(action.page)) {
+              env.scrollToPage(action.page - 1);
+              if (action.block_id) env.flashRelatedBlock(action.block_id);
+            } else if (action.target === "note") {
+              if (!env.jumpToNoteId(action.note_id)) showNotice("没有找到要定位的笔记", true);
+            } else if (action.target === "notes_panel") {
+              env.openSidePanel();
+            }
+          }
+        } else if (ev.type === "confirm_navigation") {
+          proposedNavigation = ev.action || null;
         }
       });
       if (failure) throw new Error(failure);
+      if (!completed) throw new Error("对话未正常结束，请重试");
     } catch (e) {
+      if (pendingNavigation) aiPendingNavigation = pendingNavigation;
       if (aiDraft) {
         // 已经吐出来一部分：留下来当回复，别让用户看着字消失
         aiChat.push({ role: "assistant", content: aiDraft });
@@ -618,6 +795,9 @@ window.R2Ai = function (env) {
       aiBusyWhat = "";
       aiDraft = null;
       renderAiChat();
+      // 整理卡片也要重画：Agent 写卡片时是在忙碌中画的（canEdit=false），
+      // 那时「编辑 / 加主题 / 加要点 / 加一条」按设计不画；这一轮结束后要补回来
+      renderAiSummary();
       syncAiButtons();
     }
   }
@@ -627,12 +807,42 @@ window.R2Ai = function (env) {
     if (aiAutoTried || aiBusy() || !env.META || aiSummary) return;
     if (!canWrite()) return;                         // 只读共享：整理是共享内容，不能自动改
     if ((env.META.progress || 0) < AI_TRIGGER) return;
-    if (!env.anno.notes || !env.anno.notes.length) return;   // 没有笔记：等写了笔记再触发
+    if (!aiNotes().length) return;                          // 没有笔记：等写了笔记再触发
     aiAutoTried = true;
     toast("已读到结尾，正在用 AI 整理你的笔记…", 3600);
     genAiSummary(false);
   }
 
+  /* 这张卡片是**盖在论文上的独立浮层**：鼠标在卡片上时，滚轮只滚卡片里的内容
+     （对话 / 整理），滚到顶或到底也**不**把滚动传给论文页面（否则指针一落在卡片上，
+     论文就被“顺手”滚跑了）；只有指针离开卡片，滚轮才滚窗口 / 论文。 */
+  const aiScrollHost = (node) => {
+    let n = node;
+    while (n && n !== document.body) {
+      if (n.nodeType === 1) {
+        const oy = getComputedStyle(n).overflowY;
+        if ((oy === "auto" || oy === "scroll") && n.scrollHeight - n.clientHeight > 1) return n;
+      }
+      if (n.id === "aiEnd") return null;
+      n = n.parentElement;
+    }
+    return null;
+  };
+  $("aiEnd").addEventListener("wheel", (e) => {
+    if (e.ctrlKey || e.metaKey) return;                 // Ctrl+滚轮 = 浏览器缩放，别拦
+    if (!e.deltaY) return;                              // 纯横向手势交给浏览器
+    const host = aiScrollHost(e.target);
+    const dy = e.deltaMode === 1 ? e.deltaY * 16         // 行模式（Firefox）
+             : e.deltaMode === 2 ? e.deltaY * e.target.offsetHeight : e.deltaY;
+    const room = host
+      ? (dy > 0 ? host.scrollHeight - host.clientHeight - host.scrollTop   // 还能往下滚多少
+                : host.scrollTop)                                          // 还能往上滚多少
+      : 0;
+    if (room > 1) return;                               // 卡片里还有得滚 → 交给浏览器原生滚动
+    e.preventDefault();                                 // 到顶 / 到底 / 没得滚 → 只吞掉，不带动页面
+  }, { passive: false });
+
+  $("aiToggle").addEventListener("click", () => setAiCollapsed(!aiCollapsed));
   $("aiSend").addEventListener("click", sendAi);
   $("aiText").addEventListener("keydown", e => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendAi(); }
@@ -655,5 +865,5 @@ window.R2Ai = function (env) {
   });
 
   /* ============ 对外接口 ============ */
-  return { maybeAutoSummarize, syncAiButtons, jumpToAi, renderTocAi, loadAi };
+  return { maybeAutoSummarize, syncAiButtons, jumpToAi, renderTocAi, loadAi, markAiStale };
 };

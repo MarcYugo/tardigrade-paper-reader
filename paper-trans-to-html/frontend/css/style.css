@@ -420,6 +420,9 @@ a { color: var(--accent); text-decoration: none; }
   max-width: 100%;
   box-sizing: border-box;
   overflow-x: auto;
+  pointer-events: auto;
+  touch-action: pan-x;
+  -webkit-overflow-scrolling: touch;
 }
 .blk.ul .ultable caption {
   width: 100%;
@@ -505,7 +508,7 @@ a { color: var(--accent); text-decoration: none; }
 /* 本地解析方案的页面级公式框：位置/尺寸由 JS 按 bbox_norm 写成内联样式，
    这里只负责观感。.fbox / .katex-fit 的基础样式见下方（三个后端共用）。 */
 
-/* detection-service-group 公式框覆盖层：解析侧下发 pages[].formula_boxes（bbox_norm 为
+/* 公式框覆盖层：解析侧下发 pages[].formula_boxes（bbox_norm 为
    归一化中心 xywh），r2-math.js 按「bbox_norm × 页面显示宽高」定位这个盒子，
    再把内部 KaTeX 等比缩放到框内。实测检测框有时会覆盖尚未擦除的正文，使用页面底色
    遮住框内原字形，避免与公式重叠；公式内容仍可正常选取。 */
@@ -829,8 +832,15 @@ body.side-open .reader-main { padding-right: 384px; }
 .sp-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .sp-head b { flex: 1; font-size: 15px; }
 .sp-head .cnt { font-size: 12px; color: var(--mut); }
+.sp-head .btn { flex: none; padding: 6px 9px; font-size: 12px; white-space: nowrap; }
 .sp-close { border: 0; background: none; font-size: 20px; line-height: 1; cursor: pointer; color: var(--mut); }
 .sp-list { flex: 1; overflow-y: auto; padding: 12px 16px; }
+.free-note-editor { display: grid; gap: 8px; padding: 12px; margin-bottom: 12px; border: 1px solid var(--accent); border-radius: 10px; background: var(--card); }
+.free-note-editor input, .free-note-editor textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 7px; padding: 8px; background: var(--bg); color: var(--ink); font: inherit; }
+.free-note-editor textarea { min-height: 110px; resize: vertical; }
+.free-note-editor .row { display: flex; justify-content: flex-end; gap: 8px; }
+.free-note-card { scroll-margin: 48px; }
+.free-note-title { display: block; margin-bottom: 6px; font-size: 14px; }
 .note-card { border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: var(--card); }
 .note-card.cur { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .note-card .sent-src {
@@ -860,33 +870,91 @@ body.side-open .reader-main { padding-right: 384px; }
   .toc-panel { width: 86vw; }
 }
 
-/* ---------- 文末 · AI 辅助阅读（左：对话；右：笔记整理） ----------
-   它在 .reader-main **之外**：那一层会为右侧批注栏预留 --note-reserve（约 330px），
-   放在里面会把笔记整理框挤得很窄。侧栏（目录 / 全部笔记抽屉）展开时按同样的宽度让位。
-   字号基准与笔记卡保持一致：calc(13px * var(--page-scale))，内部一律用 em 跟着走。 */
+/* ---------- 随阅读视口悬浮的 AI 辅助阅读（左：对话；右：笔记整理） ---------- */
 .ai-end {
-  padding: 0 16px 72px; font-size: calc(13px * var(--page-scale, 1));
-  /* 两个框的**固定高度**：内容再多也不会把框撑长，超出的部分在框内滚动。
-     想改高低就改这一个值（也可写死成如 560px）。
-     底部留白 72px —— 要求 ≤ 面板高度的一半（--ai-panel-h 最小 320px，一半 160px，
-     恒成立）；这里是**文档最后一个区块**，后面不能再出现没有内容的空滚区。 */
-  --ai-panel-h: clamp(320px, 56vh, 620px);
+  position: fixed; right: 16px; bottom: 68px; z-index: 58;
+  width: min(940px, calc(100vw - 32px)); max-height: calc(100vh - 88px);
+  padding: 0; font-size: calc(13px * var(--page-scale, 1));
+  /* 两栏间距、卡片底部留白、到页码按钮的空当收紧后，省下的空间都加到面板高度上 */
+  --ai-panel-h: clamp(225px, 41.5vh, 405px);
+  pointer-events: none;
 }
-.ai-in { max-width: 1240px; margin: 26px auto 0; }
-body.toc-open .ai-end { padding-left: 316px; }    /* 避开左侧目录栏 */
-body.side-open .ai-end { padding-right: 400px; }  /* 避开右侧“全部笔记”抽屉 */
-@media (max-width: 720px) {                       /* 与正文一致：窄屏侧栏改成悬浮盖住，不再避让 */
-  body.toc-open .ai-end { padding-left: 16px; }
-  body.side-open .ai-end { padding-right: 16px; }
+.ai-in {
+  width: 100%; max-height: inherit; margin: 0 0 0 auto; padding: 12px 12px 8px;
+  display: flex; flex-direction: column; overflow: hidden; pointer-events: auto;
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+}
+body.toc-open .ai-end { left: 316px; right: 16px; width: auto; }
+body.side-open .ai-end { left: 16px; right: 346px; width: auto; }
+body.toc-open.side-open .ai-end { left: 316px; right: 346px; }
+body.toc-open .ai-end.ai-collapsed,
+body.side-open .ai-end.ai-collapsed,
+body.toc-open.side-open .ai-end.ai-collapsed {
+  width: min(390px, calc(100vw - 24px));
 }
 
-.ai-head { display: flex; align-items: center; gap: 10px; margin: 0 2px 10px; }
+/* 标题行固定单行：标题 + 状态文字 + 右侧按钮，空间不够时先截状态文字，
+   再极窄时截标题，按钮始终完整可见（不再让按钮掉到第二行） */
+.ai-head { display: flex; flex-wrap: nowrap; align-items: center; gap: 10px; margin: 0 2px 12px; }
 /* 「AI 辅助阅读」标题：文字 + 小图标用 inline-flex 对齐，两端（文末面板 / 目录侧栏）一致 */
 .ai-head b, .toc-ai-head b { display: inline-flex; align-items: center; gap: 6px; }
-.ai-head b { font-size: 1.16em; }
+.ai-collapse {
+  display: inline-flex; align-items: center; gap: 8px; padding: 4px 2px; min-width: 0;
+  border: 0; background: transparent; color: var(--ink); font: inherit;
+  font-size: 1.16em; font-weight: 700; cursor: pointer;
+}
+.ai-collapse > span:not(.ai-collapse-icon) {
+  min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.ai-collapse:hover { color: var(--accent); }
+.ai-collapse:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+.ai-collapse-icon {
+  width: 8px; height: 8px; margin-left: 2px;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(45deg) translateY(-2px); transition: transform .18s ease;
+}
+.ai-collapse[aria-expanded="false"] .ai-collapse-icon {
+  transform: rotate(-45deg) translateY(-2px);
+}
 .ai-head .grow { flex: 1; }
-.ai-sub { font-size: .95em; color: var(--mut); }
-.ai-head .btn { padding: 5px 10px; font-size: 13px; }
+/* 「整理于 … · 共 N 条笔记 …」按需截断：宽度不够时它先收缩出省略号，
+   保证标题和右侧按钮始终留在同一行，不会把按钮挤到第二行 */
+.ai-sub {
+  font-size: .95em; color: var(--mut); min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ai-head .btn { padding: 5px 10px; font-size: 13px; flex: none; }
+.ai-body[hidden] { display: none !important; }
+.ai-end.ai-collapsed #aiRegen,
+.ai-end.ai-collapsed #aiClear { display: none; }
+.ai-end.ai-collapsed { bottom: 52px; }
+/* 收起时只剩一行标题（+ 右侧按钮），卡片宽度按内容收缩，不再撑满整页 */
+.ai-end.ai-collapsed .ai-in {
+  width: fit-content; max-width: 100%; padding: 8px 12px;
+}
+.ai-end.ai-collapsed .ai-head { margin-bottom: 0; flex-wrap: nowrap; }
+.ai-end.ai-collapsed .ai-head .grow { display: none; }
+.ai-end.ai-collapsed .ai-sub { display: none; }
+
+@media (max-width: 720px) {
+  .ai-end {
+    left: 12px; right: 12px; bottom: 64px; width: auto;
+    max-height: calc(100vh - 80px); --ai-panel-h: clamp(150px, 24vh, 230px);
+  }
+  body.toc-open .ai-end,
+  body.side-open .ai-end,
+  body.toc-open.side-open .ai-end { left: 12px; right: 12px; }
+  .ai-end.ai-collapsed { bottom: 52px; }
+  body.toc-open .ai-end.ai-collapsed,
+  body.side-open .ai-end.ai-collapsed,
+  body.toc-open.side-open .ai-end.ai-collapsed { bottom: 52px; }
+}
+@media (min-width: 721px) and (max-width: 980px) {
+  body.toc-open .ai-end,
+  body.side-open .ai-end,
+  body.toc-open.side-open .ai-end { left: 16px; right: 16px; width: auto; }
+}
 
 /* AI 图标：SVG 只当遮罩，填色用渐变 —— 换主题只需改 --ai-1 / --ai-2 */
 .ai-mark {
@@ -903,15 +971,22 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
    两块高度都锁定为 --ai-panel-h：内容多了在框内滚动，不跟着内容长高。
 
    左右结构时宽度**恒为 2 : 3**（对话 : 整理）：
-   flex-basis 也按 2 : 3 写（300 / 450），grow 同样 2 / 3、shrink 按 basis 比例收缩，
+   flex-basis 也按 2 : 3 写（240 / 360），grow 同样 2 / 3、shrink 按 basis 比例收缩，
    所以每一档可用宽度下比例都不变 —— 不要给它们加 max-width，否则会打断比例。
-   换行阈值 = flex-basis 之和（300 + 450 + 14 间距 ≈ 764px）。 */
-.ai-body { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 14px; }
-.ai-chat { flex: 2 1 300px; min-width: 240px; height: var(--ai-panel-h); }
-.ai-sum { flex: 3 1 450px; min-width: 300px; height: var(--ai-panel-h); }
+   换行阈值 = flex-basis 之和（240 + 360 + 8 间距 ≈ 608px）。
+   卡片宽度取窗口宽度的 95%，内容区约 1000px，
+   刚好越过阈值，所以正常情况下就是左右两栏；窗口很小、内容区不足 608px
+   时才由 JS 加 .ai-stacked 换成上下堆叠。 */
+.ai-body { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; }
+.ai-body:not([hidden]) { min-height: 0; overflow-y: auto; }
+.ai-chat { flex: 2 1 240px; min-width: 200px; height: var(--ai-panel-h); }
+.ai-sum { flex: 3 1 360px; min-width: 260px; height: var(--ai-panel-h); }
 .ai-body.ai-stacked { flex-direction: column; align-items: stretch; }
 .ai-body.ai-stacked .ai-chat,
-.ai-body.ai-stacked .ai-sum { flex: none; width: 100%; max-width: none; min-width: 0; }
+.ai-body.ai-stacked .ai-sum {
+  flex: none; width: 100%; max-width: none; min-width: 0;
+  height: clamp(150px, 26vh, 260px);
+}
 
 /* 左：对话 */
 .ai-chat {
@@ -945,6 +1020,28 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
   animation: aiBlink .9s steps(2, start) infinite;
 }
 @keyframes aiBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+.blk.related-flash {
+  z-index: 20;
+  outline: 2px solid var(--accent);
+  border-radius: 3px;
+  animation: relatedTextFlash 1.8s ease-out;
+}
+@keyframes relatedTextFlash {
+  0%, 35% {
+    background-color: var(--accent-soft);
+    box-shadow: 0 0 0 5px var(--accent-soft);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+.ai-nav-confirm {
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: 9px; padding: 10px 12px; background: var(--bg-soft);
+}
+.ai-nav-confirm .actions { display: flex; gap: 8px; margin-top: 8px; }
+.ai-nav-confirm .btn { padding: 4px 10px; font-size: .92em; }
 .ai-send {
   display: flex; gap: 8px; align-items: flex-end; padding: 10px;
   border-top: 1px solid var(--line); background: var(--bg-soft);

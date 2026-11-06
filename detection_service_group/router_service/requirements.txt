@@ -1,8 +1,0 @@
-# Web 服务（router_service 只做 HTTP 转发与编排，不需要 torch / paddle）
-fastapi>=0.110,<0.116
-uvicorn[standard]>=0.27,<0.35
-python-multipart>=0.0.9
-pydantic>=2.5,<3
-
-# 调用下游三个服务
-httpx>=0.27,<0.29

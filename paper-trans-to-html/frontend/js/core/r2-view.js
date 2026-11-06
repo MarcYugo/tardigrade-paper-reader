@@ -50,8 +50,7 @@ window.R2View = function (env) {
     const probe = anchorProbe();
     const last = pages[pages.length - 1].el.getBoundingClientRect();
     if (last.bottom <= probe) {
-      // 视口已经在正文下方（正在看文末的 AI 面板）：按“离文档底部多远”记，
-      // 重排后照样停在 AI 面板那一段
+      // 视口已滚到正文末尾：按“离文档底部多远”记，重排后保持在正文末尾。
       return { pi: -1, fromBottom: (document.documentElement.scrollHeight - window.scrollY) / GZ() };
     }
     let pi = 0;
@@ -77,11 +76,10 @@ window.R2View = function (env) {
 
   /* ---- “上次停在哪儿”的精确定位（服务端 `META.last_pos`） ----
      以前只记 `last_page`（页码，而且还是 `Math.max` 只增不减的最远那页），
-     重进阅读器只能落在**页首**，往回翻过的还会被拽回最远处；
-     读完的文章则被直接甩到文末 AI 面板。现在滚动时把**当前这处内容**记下来，
-     重进按它原样还原：
+     重进阅读器只能落在**页首**，往回翻过的还会被拽回最远处。
+     现在滚动时把**当前这处内容**记下来，重进按它原样还原：
        · `{pi, ratio}`           第几页 + 页内比例（与窗口宽度 / 缩放无关）
-       · `{pi:-1, fromBottom}`   已经滚到文末 AI 面板，记“离文档底部多远” */
+       · `{pi:-1, fromBottom}`   已经滚到正文末尾，记“离文档底部多远” */
   function posValid(p) {
     if (!p || typeof p !== "object" || !pages.length) return false;
     if (typeof p.fromBottom === "number" && p.fromBottom >= 0) return true;
@@ -92,8 +90,7 @@ window.R2View = function (env) {
       || (typeof p.pi === "number" && p.pi < 0));
   }
   /* 还原到 `META.last_pos`；没有可用数据返回 false（调用方退回页码逻辑）。
-     onlyTail=true 只处理“停在文末 AI 面板”那种：文末面板的高度要等 loadAi()
-     之后才定型，而页内位置第一次 render 就已经摆准了，别再多滚一次。 */
+     onlyTail=true 只处理“停在正文末尾”那种位置。 */
   function restoreLastPos(onlyTail) {
     const p = env.META && env.META.last_pos;
     if (!posValid(p)) return false;
