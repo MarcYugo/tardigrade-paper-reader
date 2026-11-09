@@ -1,6 +1,6 @@
 import unittest
 
-from backend.pdf_parser.backend_surya import _block_metrics, _document_body_size
+from backend.pdf_parser.backend.backend_surya import _block_metrics, _document_body_size
 
 
 class SuryaFontMetricsTest(unittest.TestCase):

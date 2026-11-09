@@ -26,16 +26,20 @@ from . import converter
 from . import pdf_parser
 from . import records
 from . import pdf_refs as refs_mod
-from .ai_read import (add_summary_item, article_text, build_summary, clean_notes,
-                      clean_summary, locate_page, locate_text_block,
-                      notes_fingerprint, reply_agent_stream, summary_empty)
+from .ai_read import (article_text, build_summary, clean_notes, clean_summary,
+                      notes_fingerprint, summary_empty)
+from .agents.ai_read_agent import (add_summary_item, locate_page,
+                                   locate_text_block, reply_agent_stream)
+from .agents.llm import LlmClient, LlmUnavailable, probe_llm
 from .db import StorageUnavailable, mongo
+from .note_out import (export_filename as note_out_filename,
+                       export_paper as build_note_out_export,
+                       to_json as note_out_json)
 from .storage import build as build_storage
 from .storage import rebuild as rebuild_storage
-from .translate import (TranslationUnavailable, Translator, block_copy_text,
-                        cache_key, extract_outline, is_target_language,
-                        needs_translation, normalize_lang, page_formula_copies,
-                        probe_llm, resolve_lang)
+from .translate import (Translator, block_copy_text, cache_key, extract_outline,
+                        is_target_language, needs_translation, normalize_lang,
+                        page_formula_copies, resolve_lang)
 
 log = logging.getLogger("uvicorn.error")
 
@@ -72,6 +76,15 @@ def _translator_for(username: str) -> Translator:
 def _default_translator() -> Translator:
     """未登录场景（登录页提示）用的“安装级默认”翻译服务：只看环境变量/config.json。"""
     return Translator(config_file=settings.translator_config(""))
+
+
+def _llm_for(username: str) -> LlmClient:
+    """按账号装配 **LLM 客户端**（直接用 `agents/llm.py`，不经 `Translator`）。
+
+    配置解析与 `_translator_for()` 完全同源（`settings.translator_config`），
+    只是这里只取对话/工具调用需要的那一层，不包翻译业务。
+    """
+    return LlmClient(config_file=settings.translator_config(username))
 
 
 app = FastAPI(title="论文 PDF → HTML 阅读器", version="1.3")
@@ -621,9 +634,83 @@ async def api_test_llm(request: Request, payload: dict = Body(...)):
     model = (payload.get("model") or (prof or {}).get("model") or saved["model"]).strip()
     try:
         msg = await run_in_threadpool(probe_llm, base, key, model)
-    except TranslationUnavailable as exc:
+    except LlmUnavailable as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"ok": True, "message": msg}
+
+
+# ---------------- 设置：学术库检索（按账号） ----------------
+def _scholar_agent_config(conf: dict) -> dict:
+    """`settings.scholar_merged()` → `note_out_agent` 认识的配置键名。"""
+    conf = conf or {}
+    return {
+        "OPENALEX_API_KEY": str(conf.get("openalex_key") or "").strip(),
+        "SEMANTIC_SCHOLAR_API_KEY": str(conf.get("semantic_scholar_key") or "").strip(),
+        "SEMANTIC_SCHOLAR_BASE_URL": str(conf.get("s2_base_url") or "").strip(),
+        "SCHOLARLY_MAILTO": str(conf.get("mailto") or "").strip(),
+    }
+
+
+@app.get("/api/settings/scholar")
+def api_get_scholar(request: Request):
+    """返回**当前账号**的学术库（OpenAlex / Semantic Scholar）配置。
+
+    与 LLM 配置一样按账号隔离：Key 只回打码串，并标明每项生效来源
+    （本账号配置 / 环境变量 / `.env`）。
+    """
+    user = _require_user(request)
+    return settings.scholar_describe(user["username"])
+
+
+@app.post("/api/settings/scholar")
+def api_save_scholar(request: Request, payload: dict = Body(default=None)):
+    """保存**当前账号**的学术库配置（用于笔记导出时的参考文献核验）。
+
+    - 三个字段（`openalex_key` / `semantic_scholar_key` / `mailto`）都可选：
+      不传 = 不改，传空串 = 清空；
+    - `{"reset": true}` = 删掉本账号设置，回落到环境变量 / `.env`。
+    """
+    user = _require_user(request)
+    name = user["username"]
+    payload = payload or {}
+    if payload.get("reset"):
+        settings.clear_scholar(name)
+        return settings.scholar_describe(name)
+
+    def _field(key: str, limit: int = 300) -> str | None:
+        raw = payload.get(key)
+        if raw is None:
+            return None
+        value = str(raw).strip()
+        if len(value) > limit:
+            raise HTTPException(400, f"{key} 太长（最多 {limit} 个字符）")
+        return value
+
+    try:
+        settings.save_scholar(name, openalex_key=_field("openalex_key"),
+                              semantic_scholar_key=_field("semantic_scholar_key"),
+                              s2_base_url=_field("s2_base_url", 200),
+                              mailto=_field("mailto", 200), user=name)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return settings.scholar_describe(name)
+
+
+@app.post("/api/settings/scholar/test")
+def api_test_scholar(request: Request, payload: dict = Body(default=None)):
+    """用当前账号（或表单里还没保存的）Key 试一下各学术库能不能用。"""
+    user = _require_user(request)
+    conf = settings.scholar_merged(user["username"])
+    payload = payload or {}
+    for field in ("openalex_key", "semantic_scholar_key", "s2_base_url", "mailto"):
+        raw = payload.get(field)
+        if isinstance(raw, str) and raw.strip():
+            conf[field] = raw.strip()
+    from .agents.note_out_agent import probe_scholar
+    try:
+        return probe_scholar(_scholar_agent_config(conf))
+    except Exception as exc:                  # 网络异常不应 500，按“不可用”回前端
+        return {"ok": False, "message": f"⚠️ 测试失败：{exc}", "checks": []}
 
 
 # ---------------- 转换 ----------------
@@ -701,13 +788,94 @@ def api_docs(request: Request):
     return [_doc_view(rec, me) for rec in store.list_for_user(me)]
 
 
+_MATH_CMD_RE = re.compile(r"\\[A-Za-z]{2,}")
+
+
+def _doc_needs_math(doc: dict) -> bool:
+    """全文有没有需要 KaTeX 排版的东西（与前端 `r2-math.js::docNeedsMath` 同口径）。
+
+    逐页加载时前端只看得到首页那几页，靠它才知道要不要提前把 KaTeX 拉起来。
+    宁可多判（多加载一次 KaTeX 只是慢一点），不能漏判（漏了后加载的页里公式
+    会先显示成 LaTeX 源码，要等一次整篇重绘才出图）。
+    """
+    for pg in doc.get("pages") or []:
+        if not isinstance(pg, dict):
+            continue
+        for box in pg.get("formula_boxes") or []:
+            if isinstance(box, dict) and str(box.get("latex") or "").strip():
+                return True
+        for t in pg.get("texts") or []:
+            if not isinstance(t, dict):
+                continue
+            if str(t.get("latex") or "").strip():
+                return True
+            if t.get("math"):
+                return True
+            html = t.get("html") or ""
+            if "<math" in html:
+                return True
+            if "<table" in html and _MATH_CMD_RE.search(html):
+                return True
+            text = t.get("text") or ""
+            if "\\(" in text or "$$" in text or "$" in text:
+                return True
+    return False
+
+
+def _doc_slice(doc: dict, page_from: int | None, page_to: int | None) -> dict:
+    """把版式文档按页切片返回（阅读页逐页加载用）。
+
+    除 `pages` 之外的原字段（title / parser / parser_info / audit …）全部照旧下发，
+    另外补上：
+      · `page_total`  总页数（前端据此给还没到数据的页留占位高度）
+      · `page_from` / `page_to`  本次切片的半开区间 `[page_from, page_to)`
+      · `page_sizes`  所有页的 `{w, h}`（很轻，用来给占位页算宽高）
+      · `needs_math`  全文是否需要 KaTeX（只看首页会漏判，见 `_doc_needs_math`）
+    `page_from` 可以是负数，表示“从倒数第 |page_from| 页开始”（停在文末时用）。
+    """
+    pages = doc.get("pages") or []
+    total = len(pages)
+    if page_from is None:
+        start = 0
+    elif page_from < 0:
+        start = max(0, total + page_from)
+    else:
+        start = min(page_from, max(0, total - 1)) if total else 0
+    if page_to is None:
+        end = total
+    elif page_to < 0:
+        end = max(0, total + page_to)
+    else:
+        end = min(page_to, total)
+    end = max(start, end)
+    out = {k: v for k, v in doc.items() if k != "pages"}
+    out["pages"] = pages[start:end]
+    out["page_total"] = total
+    out["page_from"] = start
+    out["page_to"] = end
+    out["page_sizes"] = [{"w": p.get("w"), "h": p.get("h")}
+                         for p in pages if isinstance(p, dict)]
+    out["needs_math"] = _doc_needs_math(doc)
+    return out
+
+
 @app.get("/api/doc/{doc_id}")
-def api_doc(request: Request, doc_id: str):
+def api_doc(request: Request, doc_id: str,
+            page_from: int | None = None, page_to: int | None = None):
+    """版式文档。
+
+    不带 `page_from` / `page_to` 时与以前完全一致（整篇下发，老调用方不受影响）；
+    带参数时只下发这一段页（见 `_doc_slice`），供阅读页**逐页加载**：
+    首屏只要看得见的那几页，剩下的在后台一批批补，等待时间与论文总页数解耦。
+    """
     _doc_access(request, doc_id)
     try:
-        return store.read_doc(doc_id)
+        doc = store.read_doc(doc_id)
     except FileNotFoundError as exc:
         raise HTTPException(404, "文档数据缺失") from exc
+    if page_from is None and page_to is None:
+        return doc
+    return _doc_slice(doc, page_from, page_to)
 
 
 @app.post("/api/doc/{doc_id}/title")
@@ -750,6 +918,61 @@ def api_doc_refs(request: Request, doc_id: str):
     except FileNotFoundError as exc:
         raise HTTPException(404, "文档数据缺失") from exc
     return refs_mod.build_refs(doc)
+
+
+@app.post("/api/doc/{doc_id}/note-out")
+async def api_note_out(request: Request, doc_id: str, download: bool = False,
+                       payload: dict = Body(default=None)):
+    """笔记导出（JSON）：论文内容分节 + 笔记/高亮 + 分析报告。
+
+    `{"mode": "mechanical"}`（默认）= 机械导出，纯本地、零 LLM 成本；
+    `{"mode": "agent"}` = Agent 导出：核验参考文献、提取代码地址并形成报告
+    （需要当前账号配置了 OpenAI 兼容的 LLM）。`?download=1` 直接带回下载文件名。
+
+    只读操作，有「只读」权限就能导出；数据对接（transfer key）以后再做，
+    现在先把导出结构固定下来，后续接入时直接复用 `note_out.export_paper()`。
+    """
+    rec, _perm = _doc_access(request, doc_id)          # 导出只读，不被权限挡住
+    user = _require_user(request)
+    payload = payload or {}
+    mode = str(payload.get("mode") or "mechanical").strip().lower()
+    if mode not in ("mechanical", "agent"):
+        raise HTTPException(400, "导出模式只能是 mechanical 或 agent")
+    try:
+        doc = store.read_doc(doc_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "文档数据缺失") from exc
+    anno = store.get_annotations(doc_id)
+    llm = None
+    if mode == "agent":
+        llm = _llm_for(user["username"])
+        try:
+            # 先把「没配 LLM」这类问题变成 503，而不是等工具循环里才报错
+            llm.validate_chat([{"role": "user", "content": "导出笔记"}])
+        except LlmUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+    try:
+        export = await run_in_threadpool(
+            build_note_out_export, doc=doc, rec=rec, anno=anno, mode=mode,
+            llm=llm, username=user["username"],
+            instructions=str(payload.get("instructions") or ""),
+            scholar=_scholar_agent_config(
+                settings.scholar_merged(user["username"])))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except LlmUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+    body = note_out_json(export)
+    if not download:
+        return JSONResponse(export)
+    name = note_out_filename(export.get("paper") or {})
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name) or "note-export.json"
+    return Response(body, media_type="application/json; charset=utf-8", headers={
+        "Content-Disposition": (
+            f"attachment; filename=\"{ascii_name}\"; "
+            f"filename*=UTF-8''{quote(name)}"),
+    })
 
 
 _IMG_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -1054,7 +1277,7 @@ async def api_build_toc(request: Request, doc_id: str, payload: dict = Body(defa
         items = await run_in_threadpool(
             extract_outline, _translator_for(user["username"]),
             doc.get("title") or "", context)
-    except TranslationUnavailable as exc:
+    except LlmUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
     if not items:
         raise HTTPException(400, "没能从全文里识别出章节标题")
@@ -1158,7 +1381,7 @@ async def api_ai_summary(request: Request, doc_id: str, payload: dict = Body(def
             pages=int(rec.get("num_pages") or 0),
             progress=float(rec.get("progress") or 0),
             previous=ai.get("summary"), chat=ai.get("chat") or [])
-    except TranslationUnavailable as exc:
+    except LlmUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
     if summary_empty(summary):
         raise HTTPException(502, "模型没有返回可用的整理结果，请重试")
@@ -1217,7 +1440,7 @@ async def api_ai_chat(request: Request, doc_id: str, payload: dict = Body(...)):
     tr = _translator_for(user["username"])
     try:
         tr.validate_chat([{"role": "user", "content": message}])
-    except TranslationUnavailable as exc:
+    except LlmUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
     ai = dict(rec.get("ai") or {})
     notes = clean_notes(payload.get("notes")) or (ai.get("notes") or [])
@@ -1356,7 +1579,7 @@ async def api_ai_chat(request: Request, doc_id: str, payload: dict = Body(...)):
                                     execute_tool=execute_tool,
                                     pending_navigation=pending_navigation,
                                     navigation_answer=navigation_answer)
-    except TranslationUnavailable as exc:
+    except LlmUnavailable as exc:
         # 只给原因：前端会自己加上「对话失败：」前缀（不然会重复）
         raise HTTPException(503, str(exc)) from exc
 
@@ -1367,7 +1590,7 @@ async def api_ai_chat(request: Request, doc_id: str, payload: dict = Body(...)):
                 if event.get("type") == "delta":
                     parts.append(event.get("text") or "")
                 yield _sse(event)
-        except TranslationUnavailable as exc:
+        except LlmUnavailable as exc:
             yield _sse({"type": "error", "message": str(exc)})
             return
         except Exception as exc:                 # 客户端断开 / 上游抽风：别把连接吊死
@@ -1405,6 +1628,24 @@ def api_ai_chat_reset(request: Request, doc_id: str):
 
 
 # ---------------- 翻译 ----------------
+# 解析状态（`pdf_parser.status`）里含**真探测**：对 Surya / Unlimited-OCR 的服务
+# `GET /models`，服务没起时要一直等到超时（实测 4s+）。首页与阅读页每次打开都会调
+# `/api/config`，反复等超时会明显拖慢“打开就能看到内容” ── 这里加一个很短的缓存。
+_STATUS_CACHE: dict = {"key": None, "at": 0.0, "value": None}
+_STATUS_TTL = 15.0        # 秒：探测结果缓存时间（设置里点了“重试连接”最多等这么久才看到新结果）
+
+
+def _parser_status_cached(username: str) -> dict:
+    key = (username, str(CONFIG_FILE))
+    now = datetime.datetime.now().timestamp()
+    ent = _STATUS_CACHE
+    if ent.get("key") == key and ent.get("value") is not None and now - ent.get("at", 0) < _STATUS_TTL:
+        return ent["value"]
+    value = pdf_parser.status(CONFIG_FILE, account_options=_parser_options_for(username))
+    _STATUS_CACHE.update({"key": key, "at": now, "value": value})
+    return value
+
+
 @app.get("/api/config")
 def api_config(request: Request):
     """当前账号的翻译/解析/存储状态（翻译服务按账号隔离，所以必须登录后看）。"""
@@ -1420,8 +1661,7 @@ def api_config(request: Request):
         #     （PyMuPDF 版式 + texify 公式 + OXR 版面 / SLANet 表格，见 backend_pymupdf.py）
         #   surya → 整页 OCR：文字/公式/插图全用 Surya 数据
         #   unlimited_ocr → 整页 OCR：文字/公式/表格/插图全用 Unlimited-OCR 数据
-        "parser": pdf_parser.status(
-            CONFIG_FILE, account_options=_parser_options_for(user["username"])),
+        "parser": _parser_status_cached(user["username"]),
         # 数据存储后端：mongo(MongoDB) / json(本地文件回退)
         "storage": _storage_state(),
     }
@@ -1584,7 +1824,7 @@ async def api_translate(request: Request, payload: dict = Body(...)):
         try:
             translated = await run_in_threadpool(
                 tr.translate, [t["text"] for t in todo])
-        except TranslationUnavailable as exc:
+        except LlmUnavailable as exc:
             raise HTTPException(503, str(exc))
         updates = {}
         for t, zh in zip(todo, translated):

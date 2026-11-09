@@ -43,6 +43,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from .envfile import env_value
 from .translate import (DEFAULT_TARGET_LANG, TARGET_LANGS, lang_name,
                         normalize_lang, resolve_lang)
 
@@ -111,6 +112,27 @@ SRC_TEXT = {
     SRC_CONFIG: "config.json（安装级默认）",
     SRC_DEFAULT: "内置默认",
     SRC_NONE: "未配置",
+}
+
+# ---------------- 学术库检索（参考文献核验）配置 ----------------
+# 与 LLM 配置一样**按账号存**（`users.prefs.scholar`），没配就回落环境变量 / `.env`。
+SCHOLAR_FIELDS = ("openalex_key", "semantic_scholar_key", "s2_base_url", "mailto")
+# Semantic Scholar 默认走兼容代理（官方直连经常 429）：地址只到 `/s2`，
+# 后面接 `/graph/v1/…`，鉴权是 `Authorization: Bearer <令牌>`。
+S2_DEFAULT_BASE = "https://s2api.ominiai.cn/s2"
+SCHOLAR_DEFAULTS = {"openalex_key": "", "semantic_scholar_key": "",
+                    "s2_base_url": S2_DEFAULT_BASE, "mailto": ""}
+SCHOLAR_ENV = {
+    "openalex_key": "OPENALEX_API_KEY",
+    "semantic_scholar_key": "SEMANTIC_SCHOLAR_API_KEY",
+    "s2_base_url": "SEMANTIC_SCHOLAR_BASE_URL",
+    "mailto": "SCHOLARLY_MAILTO",
+}
+SCHOLAR_LABELS = {
+    "openalex_key": "OpenAlex API Key",
+    "semantic_scholar_key": "Semantic Scholar 令牌（Key）",
+    "s2_base_url": "Semantic Scholar 服务地址（官方 / 代理）",
+    "mailto": "联系邮箱（Crossref / OpenAlex polite pool）",
 }
 
 
@@ -562,3 +584,102 @@ class SettingsStore:
         data["updated_by"] = f"{username}（自旧版全局配置迁移）"
         self.prefs.set_prefs(username, {"llm": data})
         return True
+
+    # ---------------- 学术库检索（参考文献核验）配置 ----------------
+    #
+    # 存在 `users.prefs.scholar`，与 LLM 配置完全同构：按账号隔离、Key 一律打码回前端；
+    # 没配就回落环境变量 / `.env`（`OPENALEX_API_KEY` / `SEMANTIC_SCHOLAR_API_KEY` /
+    # `SCHOLARLY_MAILTO`）。Agent 导出时用 `scholar_merged()` 取明文传进去。
+    def _account_scholar(self, username: str) -> dict:
+        """本账号保存过的学术库字段（没写过的键不出现，便于逐字段回退）。"""
+        if not self.prefs or not username:
+            return {}
+        try:
+            data = (self.prefs.get_prefs(username) or {}).get("scholar") or {}
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: str(v) for k, v in data.items()
+                if k in SCHOLAR_DEFAULTS or k in ("updated_at", "updated_by")}
+
+    def scholar_merged(self, username: str) -> dict:
+        """该账号实际生效的学术库配置（**明文**，只给服务端用）。"""
+        account = self._account_scholar(username)
+        out: dict[str, str] = {}
+        for field in SCHOLAR_FIELDS:
+            # 1) 本账号写过就以它为准（写空 = 明确清空，不回落到环境变量）
+            if isinstance(account.get(field), str):
+                out[field] = account[field].strip()
+                continue
+            # 2) 环境变量 / .env
+            out[field] = (env_value(SCHOLAR_ENV[field])
+                          or SCHOLAR_DEFAULTS[field]).strip()
+        return out
+
+    def scholar_sources(self, username: str) -> dict:
+        """每个字段的生效来源（account / env / none）。"""
+        account = self._account_scholar(username)
+        out: dict[str, str] = {}
+        for field in SCHOLAR_FIELDS:
+            if isinstance(account.get(field), str):
+                out[field] = SRC_ACCOUNT if account[field].strip() else SRC_NONE
+            elif env_value(SCHOLAR_ENV[field]):
+                out[field] = SRC_ENV
+            else:
+                out[field] = SRC_NONE
+        return out
+
+    def scholar_describe(self, username: str) -> dict:
+        """接口返回：Key 打码 + 来源说明（前端「设置 → 学术检索」用）。"""
+        merged = self.scholar_merged(username)
+        account = self._account_scholar(username)
+        src = self.scholar_sources(username)
+        return {
+            "owner": username,
+            "openalex_key_set": bool(merged["openalex_key"]),
+            "openalex_key_masked": mask_key(merged["openalex_key"]),
+            "semantic_scholar_key_set": bool(merged["semantic_scholar_key"]),
+            "semantic_scholar_key_masked": mask_key(merged["semantic_scholar_key"]),
+            "s2_base_url": merged["s2_base_url"],
+            "mailto": merged["mailto"],
+            "fields": {f: {"label": SCHOLAR_LABELS[f], "env": SCHOLAR_ENV[f]}
+                       for f in SCHOLAR_FIELDS},
+            "sources": src,
+            "source_text": {k: SRC_TEXT.get(v, v) for k, v in src.items()},
+            "from_ui": bool(account),
+            "updated_at": account.get("updated_at"),
+            "updated_by": account.get("updated_by"),
+        }
+
+    def save_scholar(self, username: str, *, openalex_key: str | None = None,
+                     semantic_scholar_key: str | None = None,
+                     s2_base_url: str | None = None,
+                     mailto: str | None = None, user: str = "") -> dict:
+        """保存本账号的学术库配置。
+
+        `None` = 这项不改；`""` = 明确清空（服务地址清空则回到默认代理）。
+        """
+        if not self.prefs:
+            raise RuntimeError("没有配置存储后端（prefs），无法保存学术库设置")
+        if s2_base_url is not None and s2_base_url.strip() \
+                and not s2_base_url.strip().startswith(("http://", "https://")):
+            raise ValueError("Semantic Scholar 服务地址必须是 http(s):// 开头")
+        data = {k: v for k, v in self._account_scholar(username).items()
+                if k in SCHOLAR_FIELDS}
+        for field, value in (("openalex_key", openalex_key),
+                             ("semantic_scholar_key", semantic_scholar_key),
+                             ("s2_base_url", s2_base_url),
+                             ("mailto", mailto)):
+            if value is not None:
+                data[field] = str(value).strip()
+        data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        data["updated_by"] = user or username
+        self.prefs.set_prefs(username, {"scholar": data})
+        return data
+
+    def clear_scholar(self, username: str) -> None:
+        """删掉本账号的学术库设置，回落到环境变量 / `.env`。"""
+        if not self.prefs:
+            raise RuntimeError("没有配置存储后端（prefs），无法修改学术库设置")
+        self.prefs.set_prefs(username, {"scholar": {}})

@@ -86,7 +86,12 @@
   let relatedFlashTimer = 0;
   function flashRelatedBlock(id) {
     const item = findItem(id);
-    if (!item || !item.el) return false;
+    if (!item || !item.el) {
+      // 逐页加载：关联块可能还在没建出来的页里 —— 先把那一页补上，再闪
+      const pi = pageOfBlockId(id);
+      if (pi >= 0) { ensurePage(pi).then(() => flashRelatedBlock(id)); return true; }
+      return false;
+    }
     if (relatedFlashTimer) clearTimeout(relatedFlashTimer);
     document.querySelectorAll(".blk.related-flash").forEach(block =>
       block.classList.remove("related-flash"));
@@ -242,6 +247,309 @@
 
   /* 视觉锚点 / 滚动位置还原：实现在 r2-view.js（装配见上方 R2View） */
 
+  /* ================= 逐页加载 =================
+     打开论文时不再一次把整篇的 DOM 建完，也不再等整份 doc.json 下载完：
+       ① 先给每一页建一个“页壳”（宽高按 PDF 尺寸留好）—— 页码、滚动条、翻页、
+          “上次读到哪儿”的还原立刻都可用；
+       ② 再把**已经有数据的页**同步建出来（首次进入 = 后端给的第一批，只含
+          用户要看的那几页；缩放/窗口变化后的整体重排 = 之前已加载的全部页）；
+       ③ 其余页在后台按「离当前阅读位置最近优先」一批批补齐（每批 PAGE_CHUNK 页），
+          数据也是分片取的（`GET /api/doc/{id}?page_from=&page_to=`）。
+     约定：`DOC.pages` 始终是**按页号索引、长度 = 总页数**的数组，还没到的页是 null；
+           `pages[pi]` 是渲染状态 `{el, items, loaded, …}`，页壳一开始就存在。 */
+  const PAGE_CHUNK = 3;              // 后台每批补齐的页数
+  const FIRST_PAGES = 3;             // 首次进入先取几页
+  let loadToken = 0;                 // render() 重建时自增：旧的后台任务据此作废
+  let pumping = false;               // 后台补齐任务是否在跑
+  let pageTotal = 0;                 // 总页数（含数据还没到的页）
+  let pageSizes = [];                // [{w,h}]：所有页的 PDF 尺寸（给还没到数据的页占位）
+  const pageFailed = new Set();      // 取不到数据的页（服务端缺数据/网络生错）：别反复重试
+
+  function pageDataAt(pi) {
+    const arr = (DOC && DOC.pages) || [];
+    return arr[pi] || null;
+  }
+  function pageCount() {
+    return pageTotal || ((DOC && DOC.pages && DOC.pages.length) || 0);
+  }
+
+  /* 首屏要取哪一段页：优先“上次离开时的阅读位置”，没有就从头开始；
+     停在文末（`last_pos.fromBottom`）时取最后几页（`page_from` 为负数 = 从倒数第几页开始）。 */
+  function firstPageQuery() {
+    const p = META && META.last_pos;
+    if (p && typeof p.fromBottom === "number" && p.fromBottom >= 0) {
+      return "?page_from=-" + FIRST_PAGES;
+    }
+    if (p && typeof p.pi === "number" && p.pi >= 0) {
+      return "?page_from=" + p.pi + "&page_to=" + (p.pi + FIRST_PAGES);
+    }
+    const lp = Number(META && META.last_page) || 0;
+    if (lp > 1) return "?page_from=" + (lp - 1) + "&page_to=" + (lp + FIRST_PAGES - 1);
+    return "?page_from=0&page_to=" + FIRST_PAGES;
+  }
+
+  /* 后端按页切片下发：把 `pages` 还原成「按页号索引、长度 = 总页数」的完整数组
+     （还没到的页是 null），后面的代码照旧按 `DOC.pages[pi]` 取值。
+     老后端没有 page_total / page_from 时与以前完全一样（整篇一次下发）。 */
+  function normalizeDocPages() {
+    const total = Number(DOC.page_total) || ((DOC.pages || []).length);
+    const from = Number(DOC.page_from) || 0;
+    const arr = new Array(total).fill(null);
+    (DOC.pages || []).forEach((pg, i) => { if (from + i < total) arr[from + i] = pg; });
+    DOC.pages = arr;
+    pageTotal = total;
+    pageSizes = Array.isArray(DOC.page_sizes) ? DOC.page_sizes : [];
+    pageFailed.clear();
+  }
+
+  /* 建页壳：给每一页先在 DOM 里占好位置，数据到了原地填进去，位置不跳。 */
+  function buildPageShells(pageW) {
+    pageTotal = pageCount();
+    for (let pi = 0; pi < pageTotal; pi++) {
+      const data = pageDataAt(pi);
+      const known = (data && Number(data.w) > 0 && Number(data.h) > 0)
+        ? data : (pageSizes[pi] || pageSizes[0] || null);
+      const w = (known && Number(known.w) > 0) ? Number(known.w) : 595;
+      const h = (known && Number(known.h) > 0) ? Number(known.h) : 842;
+      const S = pageW / w;
+      const pageEl = el("div", "page");
+      pageEl.style.width = w * S + "px";
+      pageEl.style.height = h * S + "px";
+      // 页码先放上：还没到数据的页看起来是“空白的一页 + 页码”，不像排版坏了
+      pageEl.appendChild(el("div", "pagenum", "Page " + (pi + 1)));
+      pagesEl.appendChild(pageEl);
+      pages.push({ el: pageEl, w: w * S, h: h * S,
+                   items: [], formula_boxes: [], loaded: false });
+    }
+  }
+
+  /* 把一页的真实内容建进它的页壳里（幂等：已经建过的页直接返回 false）。 */
+  function mountPage(pi) {
+    const pg = pageDataAt(pi);
+    const holder = pages[pi];
+    if (!pg || !holder || holder.loaded) return false;
+    const S = (curPageW || holder.w) / (Number(pg.w) || 1);
+    const pageEl = holder.el;
+    pageEl.textContent = "";
+    pageEl.style.width = (Number(pg.w) || 0) * S + "px";
+    pageEl.style.height = (Number(pg.h) || 0) * S + "px";
+    pageEl.appendChild(el("div", "pagenum", "Page " + (pi + 1)));
+    // 三条渲染分支：
+    //   · surya / unlimited_ocr：块级数据（bbox + 文本/html），各自流式渲染；
+    //     Unlimited-OCR 的本地 / 在线两条数据来源**共用**一套渲染路径
+    //     （解析后端已把在线回包转成同构结构，`parser_info.unlimited_ocr_route` 可区分）；
+    //     `unlimited_ocr_online` 只是兼容取值（旧数据 / 以后单独标记时也不落空）。
+    //   · 本地解析方案（parser=pymupdf）：逐行几何 + 页面级公式框，走 buildTextItem；
+    //     旧 doc.json（parser=pymupdf）同样是这套结构，一并兼容。
+    const surya = DOC.parser === "surya";
+    const unlimited = DOC.parser === "unlimited_ocr"
+                   || DOC.parser === "unlimited_ocr_online";
+    const items = [];
+
+    for (const im of pg.images || []) {
+      const div = el("div", "img");
+      Object.assign(div.style, {
+        left: im.x * S + "px", top: im.y * S + "px",
+        width: im.w * S + "px", height: im.h * S + "px",
+      });
+      const img = el("img");
+      const imageUrl = "/api/doc/" + docId + "/img/" + im.file;
+      img.src = im.cache_key ? imageUrl + "?v=" + encodeURIComponent(im.cache_key) : imageUrl;
+      img.alt = im.class_name || "Figure";
+      div.appendChild(img);
+      pageEl.appendChild(div);
+      items.push({
+        kind: "img", el: div, x: im.x * S, y: im.y * S,
+        w: im.w * S, h: im.h * S,
+        surya, syShift: surya ? 0 : undefined,
+        unlimited, ulShift: unlimited ? 0 : undefined,
+      });
+    }
+
+    for (const t of pg.texts || []) {
+      const item = surya ? buildSuryaItem(t, S, pageEl, pi)
+                 : unlimited ? buildUnlimitedItem(t, S, pageEl, pi)
+                 : buildTextItem(t, S, pageEl, pi);
+      if (item) items.push(item);
+    }
+
+    // 本地解析方案：页面级公式框（KaTeX / 裁图兜底）
+    buildFormulaBoxes(pg, pageEl, S, pi);
+
+    holder.items = items;
+    holder.formula_boxes = pg.formula_boxes || [];
+    holder.w = (Number(pg.w) || 0) * S;
+    holder.h = (Number(pg.h) || 0) * S;
+    holder.loaded = true;
+    delete holder.placeholder;
+
+    // 套用已有标注并重画（原来是全篇建完后统一套，现在每页建好就套）
+    for (const it of items) { setAnnoRanges(it); rebuildItem(it); }
+    attachFormulaBoxes(holder, pageEl);   // 公式框 → 文字块段落/字符区间
+    renumberItems();
+    return true;
+  }
+
+  /* 块序号 = 阅读顺序（页 → 块）。逐页加载会把建立顺序打乱（可能先建第 20 页），
+     所以每挂上一页就按页号重排一遍（纯数字，很便宜）。拖拽多选按它比先后。 */
+  function renumberItems() {
+    let n = 0;
+    for (let pi = 0; pi < pages.length; pi++) {
+      const pg = pages[pi];
+      if (!pg) continue;
+      for (const it of pg.items) if (it.kind === "blk") it.ord = n++;
+    }
+    ordSeq = n;
+  }
+
+  /* 一批新页的收尾：量高度 / 摆行 / 对齐公式 / 避让。只处理这一批 ——
+     已经排好的页不再重复量（每次量都会触发一次布局，页多了会越补越卡）。 */
+  function finalizePages(pis) {
+    const only = new Set(pis);
+    finalizeDisplayMath();         // 公式覆盖层已挂到文档上 → 量真实高度并回填块高
+    finalizeInlineMath();          // 旧「行内公式覆盖层」接口（本地方案用页面级 .fbox）
+    finalizeFormulaBoxes(only);    // 页面级公式框：按框尺寸等比缩放 KaTeX
+    finalizeSuryaBlocks(only);     // surya 块：量流式内容的真实高度 → 回填 contentH
+    settleSuryaVertical(only);     // surya 块：算内容纵向避让量 syShift（relayoutPage 应用）
+    finalizeUnlimitedBlocks(only); // unlimited-ocr 块：同上的收尾（独立一套）
+    settleUnlimitedLayout(only);   // unlimited-ocr 内容块与图片：计算二维避让
+    finalizeLocalBlocks(only);     // 本地解析方案：按基线摆行 + 压缩行宽 + 回填表格高度
+    attachExistingCards(pis);      // 后到的页也要带上“早就存在的”译文 / 笔记
+  }
+
+  /* 后加载的页也要显示已有的译文与笔记（首屏那批由 render 里原有流程处理）。 */
+  function attachExistingCards(pis) {
+    const paraMode = !selTransList.length;    // 有“所选句译文”时不展开整段译文(两者互斥)
+    let notes = false;
+    for (const pi of pis) {
+      const pg = pages[pi];
+      if (!pg) continue;
+      for (const it of pg.items) {
+        if (it.kind !== "blk") continue;
+        if (notesOfBlock(it).length) notes = true;
+        if (paraMode && showZhOn && zh[it.id]) openTrans(it);
+      }
+    }
+    if (notes) renderAllNotes();              // 没笔记的页不用重建整份笔记 DOM
+  }
+
+  /* 挂上新页 + 重排（页面高度、卡片位置、避让量都会跟着变） */
+  function commitPages(pis) {
+    if (!pis.length) return;
+    finalizePages(pis);
+    relayoutAll(new Set(pis));
+    paintFormulaMarks();
+    updatePageInd();
+  }
+
+  function idleYield() {
+    return new Promise(resolve => {
+      if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(() => resolve(), { timeout: 400 });
+      } else {
+        requestAnimationFrame(() => setTimeout(resolve, 0));
+      }
+    });
+  }
+
+  /* 下一批要补的页：**先往后补**（阅读通常往前走），后面没有待补的再往回补；
+     起点取离当前阅读位置最近的那一页，然后顺着同一方向连取几页。 */
+  function pendingPageBatch() {
+    if (pageTotal <= 0) return null;
+    const focus = clamp(currentPageIndex(), 0, pageTotal - 1);
+    const isPending = pi => !(pages[pi] && pages[pi].loaded) && !pageFailed.has(pi);
+    let start = -1, step = 1;
+    for (let pi = focus; pi < pageTotal; pi++) if (isPending(pi)) { start = pi; break; }
+    if (start < 0) {
+      // 往后都补齐了：往前补（用户往回翻，或者整体收尾）
+      for (let pi = focus - 1; pi >= 0; pi--) if (isPending(pi)) { start = pi; break; }
+      step = -1;
+    }
+    if (start < 0) return null;
+    const batch = [start];
+    for (let k = 1; k < PAGE_CHUNK; k++) {
+      const pi = start + step * k;
+      if (pi < 0 || pi >= pageTotal || !isPending(pi)) break;
+      batch.push(pi);
+    }
+    batch.sort((a, b) => a - b);
+    return batch;
+  }
+
+  /* 取某段页的数据（`[from, to)` 闭开区间）：已经有的页不重复取。 */
+  async function fetchPages(from, to) {
+    let need = false;
+    for (let pi = from; pi < to; pi++) if (!pageDataAt(pi)) { need = true; break; }
+    if (!need) return;
+    const j = await api("/api/doc/" + docId + "?page_from=" + from + "&page_to=" + to);
+    const base = Number(j.page_from) || 0;
+    const arr = DOC.pages;
+    (j.pages || []).forEach((pg, i) => {
+      const pi = base + i;
+      if (arr && pi >= 0 && pi < arr.length) arr[pi] = pg;
+    });
+    if (!pageSizes.length && j.page_sizes) pageSizes = j.page_sizes;
+  }
+
+  /* 后台补齐：每批「取数据 → 建 DOM → 收尾」，批与批之间让出主线程，
+     所以首屏建完就能看、能点、能滚，后面的页在用户阅读时陆续就位。 */
+  async function pumpPages() {
+    if (pumping || !DOC) return;
+    pumping = true;
+    try {
+      while (true) {
+        const batch = pendingPageBatch();
+        if (!batch) break;
+        const token = loadToken;
+        await idleYield();
+        if (token !== loadToken) continue;     // 期间重排过：页壳重建了，重新算批次
+        try {
+          await fetchPages(batch[0], batch[batch.length - 1] + 1);
+        } catch (err) {
+          console.warn("逐页加载失败：", err);
+          break;                               // 网络/服务异常：别在这里死循环重试
+        }
+        if (token !== loadToken) continue;     // 期间用户缩放/换窗口 → 整体重建过了
+        // 服务端没给到的页（版式被截断等）只能记下来跳过，否则会反复取同一批
+        for (const pi of batch) if (!pageDataAt(pi)) pageFailed.add(pi);
+        const mounted = batch.filter(pi => mountPage(pi));
+        if (!mounted.length) break;
+        commitPages(mounted);
+      }
+    } finally {
+      pumping = false;
+    }
+  }
+
+  /* 按需加载某一页（跳页 / 目录 / 笔记跳转用）：数据没到就立刻取，取回就地建。 */
+  async function ensurePage(pi) {
+    const idx = clamp(Number(pi) || 0, 0, Math.max(0, pageCount() - 1));
+    if (!pages[idx]) return false;
+    if (pages[idx].loaded) return true;
+    try { await fetchPages(idx, idx + 1); } catch (e) { return false; }
+    if (!mountPage(idx)) return false;
+    commitPages([idx]);
+    return true;
+  }
+
+  /* 某个文字块在哪一页（数据层面查，不要求那一页已经建好） */
+  function pageOfBlockId(blockId) {
+    const arr = (DOC && DOC.pages) || [];
+    for (let pi = 0; pi < arr.length; pi++) {
+      const pg = arr[pi];
+      if (!pg) continue;
+      for (const t of pg.texts || []) if (t && t.id === blockId) return pi;
+    }
+    return -1;
+  }
+
+  /* 笔记 / AI 关联块跳转用：目标块所在的页还没建就把那一页补上 */
+  async function ensureBlockLoaded(blockId) {
+    const pi = pageOfBlockId(blockId);
+    if (pi < 0) return false;
+    return ensurePage(pi);
+  }
+
   function render(preAnchor) {
     if (!DOC) return;              // 文档还没到（缺 ?id= / 数据未加载）：别让缩放之类把这里点到抛错
     // 首次进入还没按 last_pos 定位过时，**预先量到的锚点不可信**：正文刚建好、屏幕还停在
@@ -262,74 +570,15 @@
     ordSeq = 0;
     sel = null; hideBar();
 
-    // 三条渲染分支：
-    //   · surya / unlimited_ocr：块级数据（bbox + 文本/html），各自流式渲染；
-    //     Unlimited-OCR 的本地 / 在线两条数据来源**共用**一套渲染路径
-    //     （解析后端已把在线回包转成同构结构，`parser_info.unlimited_ocr_route` 可区分）；
-    //     `unlimited_ocr_online` 只是兼容取值（旧数据 / 以后单独标记时也不落空）。
-    //   · 本地解析方案（parser=pymupdf）：逐行几何 + 页面级公式框，走 buildTextItem；
-    //     旧 doc.json（parser=pymupdf）同样是这套结构，一并兼容。
-    const surya = DOC.parser === "surya";
-    const unlimited = DOC.parser === "unlimited_ocr"
-                   || DOC.parser === "unlimited_ocr_online";
-    DOC.pages.forEach((pg, pi) => {
-      const S = t.pageW / pg.w;
-      const pageEl = el("div", "page");
-      pageEl.style.width = pg.w * S + "px";
-      pageEl.style.height = pg.h * S + "px";
-      pageEl.appendChild(el("div", "pagenum", "Page " + (pi + 1)));
-      // `formula_boxes` 必须留在渲染状态里：attachFormulaBoxes 会按它把 .fbox 与
-      // 文字块的 copy 区间接上（选句高亮、复制还原 LaTeX、基线对齐都依赖这一步）。
-      const pgObj = {
-        el: pageEl, w: pg.w * S, h: pg.h * S, items: [],
-        formula_boxes: pg.formula_boxes || [],
-      };
+    // ① 先把每一页的位置占好（页壳）：页码/滚动条/翻页/位置还原立刻都能用
+    buildPageShells(t.pageW);
+    // ② 已经有数据的页立即建出来（首次进入 = 后端给的那一批；重排 = 之前已加载的全部页）。
+    //    没数据的页先留空壳，由后台的 pumpPages() 一批批补齐。
+    const ready = [];
+    for (let pi = 0; pi < pageTotal; pi++) if (mountPage(pi)) ready.push(pi);
 
-      for (const im of pg.images || []) {
-        const div = el("div", "img");
-        Object.assign(div.style, {
-          left: im.x * S + "px", top: im.y * S + "px",
-          width: im.w * S + "px", height: im.h * S + "px",
-        });
-        const img = el("img");
-        const imageUrl = "/api/doc/" + docId + "/img/" + im.file;
-        img.src = im.cache_key ? imageUrl + "?v=" + encodeURIComponent(im.cache_key) : imageUrl;
-        img.alt = im.class_name || "Figure";
-        div.appendChild(img);
-        pageEl.appendChild(div);
-        pgObj.items.push({
-          kind: "img", el: div, x: im.x * S, y: im.y * S,
-          w: im.w * S, h: im.h * S,
-          surya, syShift: surya ? 0 : undefined,
-          unlimited, ulShift: unlimited ? 0 : undefined,
-        });
-      }
-
-      for (const t of pg.texts || []) {
-        const item = surya ? buildSuryaItem(t, S, pageEl, pi)
-                   : unlimited ? buildUnlimitedItem(t, S, pageEl, pi)
-                   : buildTextItem(t, S, pageEl, pi);
-        if (item) pgObj.items.push(item);
-      }
-
-      // 本地解析方案：页面级公式框（KaTeX / 裁图兜底）
-      buildFormulaBoxes(pg, pageEl, S, pi);
-
-      pagesEl.appendChild(pageEl);
-      pages.push(pgObj);
-    });
-
-    // 套用标注并重画
-    for (const id in itemById) { const it = itemById[id]; setAnnoRanges(it); rebuildItem(it); }
-    for (const page of pages) attachFormulaBoxes(page, page.el);   // 公式框 → 文字块段落/字符区间
-    finalizeDisplayMath();     // 公式覆盖层已挂到文档上 → 量真实高度并回填块高
-    finalizeInlineMath();      // 旧「行内公式覆盖层」接口（本地方案用页面级 .fbox）
-    finalizeFormulaBoxes();    // 页面级公式框：按框尺寸等比缩放 KaTeX
-    finalizeSuryaBlocks();     // surya 块：量流式内容的真实高度 → 回填 contentH / 卡片位置
-    settleSuryaVertical();     // surya 块：算内容纵向避让量 syShift（relayoutPage 应用）
-    finalizeUnlimitedBlocks(); // unlimited-ocr 块：同上的收尾（独立一套）
-    settleUnlimitedLayout(); // unlimited-ocr 内容块与图片：计算二维避让
-    finalizeLocalBlocks();     // 本地解析方案：按基线摆行 + 压缩行宽 + 回填表格高度
+    // 这一批新页的收尾（量高度 / 摆行 / 对齐公式 / 避让）
+    if (ready.length) finalizePages(ready);
     // 字体晚到会改变字体的 ascent/descent（行内基线）与 KaTeX 的缩放：就绪后再摆一次。
     // finalizeLocalBlocks 是幂等的（top 绝对值、公式先回中再量）。
     if (document.fonts && document.fonts.ready && !_fontsHook) {
@@ -351,8 +600,11 @@
       const refs = keepSel.map(k => ({ item: findItem(k.id), si: k.si })).filter(r => r.item);
       if (refs.length) setSelection(refs, true);
     }
-    relayoutAll();
+    relayoutAll(ready.length ? new Set(ready) : null);
     refreshZoomLabel();
+    // ③ 其余页交给后台补齐（旧任务由 loadToken 作废）
+    loadToken++;
+    pumpPages();
     requestAnimationFrame(() => {
       if (anchor) {
         restoreAnchor(anchor);      // 重排：停在原来那处内容上，不跳页
@@ -603,6 +855,8 @@
           runAllTrans } = R2Trans({
     $, docId, itemById, pages, findItem, itemCopyText, normTrans,
     renderInlineMath, renderKnownLatex, loadSelTrans, savePrefs,
+    // 逐页加载：“翻译本页 / 翻译全文”要先把目标页取回来（函数声明，已提升）
+    ensurePage: (...a) => ensurePage(...a),
     updateBar, placeBar, renderSelTrans, enterParaTransMode, currentPageIndex: (...a) => currentPageIndex(...a),
     relayoutAll: (...a) => relayoutAll(...a),
     zh, noZh,
@@ -617,7 +871,7 @@
      · curPageW / noteSide / noteW / noteLeft 本段既读又写 → getter + setter；
      · notesCount / notesOfBlock / tocPanelOpen 来自更后面的 r2-notes、r2-nav 装配 →
        包一层转发；TOC_W 是常量，用 getter 延后取值。 */
-  const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, basePageW } = R2Layout({
+  const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, syncReadCenter, basePageW } = R2Layout({
     $, CSS_W, ZOOM, ZOOM_OK, vpW, NOTE_GAP, pages,
     keyParts, lineOfChar, sentRange, render, paintFormulaMarks,
     get DOC() { return DOC; },
@@ -648,6 +902,8 @@
     sentKey, sentenceText, noteOf, selCount, selAnchor, isSelRef, pageOfItem,
     render, renderHmenuSwatches, setAnnoRanges, rebuildItem, selectSentence, syncExp,
     canWrite: (...a) => canWrite(...a),
+    // 逐页加载：笔记所在页还没建时，先把那一页补上再跳（函数声明，已提升）
+    ensureBlockLoaded: (...a) => ensureBlockLoaded(...a),
     renderTocAi: (...a) => renderTocAi(...a),
     markAiStale: (...a) => markAiStale(...a),
     get anno() { return anno; }, set anno(v) { anno = v; },
@@ -672,6 +928,8 @@
     $, pages, docId, CSS_W, vpH, ZOOMS, pagesEl, ZOOM, GZ, toScrollDelta,
     baseW: (...a) => basePageW(...a),
     relayoutAll, applyZoom, pageAnchor, render,
+    // 逐页加载：跳页/目录跳转时目标页只有页壳，先请求这一页的数据（函数声明，已提升）
+    ensurePage: (...a) => ensurePage(...a),
     canWrite: (...a) => canWrite(...a),
     maybeAutoSummarize: (...a) => maybeAutoSummarize(...a),
     get META() { return META; },
@@ -695,6 +953,7 @@
     $, docId, findItem, keyParts, pageOfItem, needWrite,
     canWrite: (...a) => canWrite(...a),
     scrollToPage, flashRelatedBlock, jumpToNoteId, openSidePanel, refreshSideList, layoutAi,
+    syncReadCenter,          // 页面列中线：AI 收起胶囊与页码胶囊都要以它为横向锚点
     refreshNotes: async () => {
       anno = await api("/api/doc/" + docId + "/anno");
       renderAllNotes();
@@ -888,13 +1147,16 @@
     renderHmenuSwatches();
     try {
       let refsData = null;
-      [META, DOC, anno, refsData] = await Promise.all([
-        api("/api/doc/" + docId + "/progress"),
-        api("/api/doc/" + docId),
+      // 阅读进度先到：它决定首屏从哪一页开始（上次停在哪一页），之后只取那一段页的
+      // 版式数据（逐页加载的第一批，见上面《逐页加载》）。不再是“等整篇 doc.json”。
+      META = await api("/api/doc/" + docId + "/progress");
+      [DOC, anno, refsData] = await Promise.all([
+        api("/api/doc/" + docId + firstPageQuery()),
         api("/api/doc/" + docId + "/anno"),
         // 引用跳转数据（PDF 内部链接 → 参考文献条目）：旧数据/无链接时为空映射，静默
         api("/api/doc/" + docId + "/refs").catch(() => null),
       ]);
+      normalizeDocPages();
       refsUi.set(refsData);
       perm = META.perm || "owner";
       docOwner = META.owner || "";
@@ -911,44 +1173,50 @@
       setupDocTitle();              // 顶栏标题：点一下就地改名（同步回首页列表）
       updateFinishBtn();
       $("notesCount").textContent = (anno.notes || []).length + (anno.free_notes || []).length;
-      const cfg = await appConfig();
+      const cfgP = appConfig();
       applyPerm();
-      const tips = [];
-      if (perm !== "owner") tips.push(shareNoteText());
-      if (!cfg.ready) {
-        tips.push("⚠️ 未配置翻译服务：译文功能不可用。点右上角「⚙ 设置 → LLM 服务」填写服务地址与 API Key（也可在 config.json 里配），或安装 deep-translator 用免费兜底。");
-      }
-      // 解析后端就绪状态：本地解析方案/两条整页 OCR 链都是“全有或全无”，
-      // 不满足条件时上传与重解析会失败，这里提前提示。
-      const pr = cfg && cfg.parser;
-      const localBackends = ["pymupdf", "auto"];
-      if (pr && pr.backend === "surya" && pr.surya_ready !== true) {
-        tips.push("⚠️ 解析后端现为 surya，但 Surya 2 还未就绪：" + (pr.surya_message || "") +
-          "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
-      } else if (pr && pr.backend === "unlimited_ocr"
-                 && pr.unlimited_ocr_ready !== true
-                 && pr.unlimited_ocr_online_ready !== true) {
-        // 本地推理服务不可用时会自动改用在线解析（百度智能云 Unlimited-OCR）；
-        // 两者都不行才算“全有或全无”的失败。
-        tips.push("⚠️ 解析后端现为 unlimited_ocr，但本地 Unlimited-OCR 服务与在线解析都不可用：" +
-          (pr.unlimited_ocr_message || "") +
-          "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
-      } else if (pr && localBackends.indexOf(pr.backend) >= 0 && pr.local_ready !== true) {
-        tips.push("⚠️ 解析后端现为「本地解析方案」，但本机还不具备条件：" +
-          (pr.local_message || "缺少本地模型或依赖") +
-          "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
-      }
-      // 旧解析数据没有链接注释时，编号引用已尝试回退匹配；仍无映射才提示可重解析。
-      if (refsData && refsData.scan === "no-links-data"
-          && refsData.section_page !== null
-          && !(refsData.links || []).length
-          && ((refsData.counts || {}).entries || 0) > 0) {
-        tips.push("📎 这篇论文的版式数据还没有采集引用链接（旧版数据）：在顶栏点「🔄 重解析」选择同一份 PDF 后，可尝试启用正文引用跳转。");
-      }
-      showNotice(tips.join("　"), !!tips.length);
+      /* 提示文案要等 `/api/config` 回来，而它里面带着各 OCR 服务的**真探测**
+         （服务没起时要一直等到超时，实测 4s+）。它只影响这几行提示文字，
+         绝不能挡着正文先出来 —— 放后台等，回来了再补提示。 */
+      cfgP.then((cfg) => {
+        const tips = [];
+        if (perm !== "owner") tips.push(shareNoteText());
+        if (!(cfg && cfg.ready)) {
+          tips.push("⚠️ 未配置翻译服务：译文功能不可用。点右上角「⚙ 设置 → LLM 服务」填写服务地址与 API Key（也可在 config.json 里配），或安装 deep-translator 用免费兜底。");
+        }
+        // 解析后端就绪状态：本地解析方案/两条整页 OCR 链都是“全有或全无”，
+        // 不满足条件时上传与重解析会失败，这里提前提示。
+        const pr = cfg && cfg.parser;
+        const localBackends = ["pymupdf", "auto"];
+        if (pr && pr.backend === "surya" && pr.surya_ready !== true) {
+          tips.push("⚠️ 解析后端现为 surya，但 Surya 2 还未就绪：" + (pr.surya_message || "") +
+            "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
+        } else if (pr && pr.backend === "unlimited_ocr"
+                   && pr.unlimited_ocr_ready !== true
+                   && pr.unlimited_ocr_online_ready !== true) {
+          // 本地推理服务不可用时会自动改用在线解析（百度智能云 Unlimited-OCR）；
+          // 两者都不行才算“全有或全无”的失败。
+          tips.push("⚠️ 解析后端现为 unlimited_ocr，但本地 Unlimited-OCR 服务与在线解析都不可用：" +
+            (pr.unlimited_ocr_message || "") +
+            "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
+        } else if (pr && localBackends.indexOf(pr.backend) >= 0 && pr.local_ready !== true) {
+          tips.push("⚠️ 解析后端现为「本地解析方案」，但本机还不具备条件：" +
+            (pr.local_message || "缺少本地模型或依赖") +
+            "（上传 / 重解析会失败；点右上角「⚙ 设置 → 存储 / OCR」查看）");
+        }
+        // 旧解析数据没有链接注释时，编号引用已尝试回退匹配；仍无映射才提示可重解析。
+        if (refsData && refsData.scan === "no-links-data"
+            && refsData.section_page !== null
+            && !(refsData.links || []).length
+            && ((refsData.counts || {}).entries || 0) > 0) {
+          tips.push("📎 这篇论文的版式数据还没有采集引用链接（旧版数据）：在顶栏点「🔄 重解析」选择同一份 PDF 后，可尝试启用正文引用跳转。");
+        }
+        showNotice(tips.join("　"), !!tips.length);
+      }).catch(() => {});
       // 公式用 KaTeX 渲染：脚本懒加载，先画一次(公式先按 PDF 原文字显示)，
       // 加载完再按当前阅读位置重画一遍把公式换成真渲染；加载失败就保持原文字。
-      if (docNeedsMath(DOC) && !katexReady()) {
+      // 逐页加载时只看得到首页那几页 → 用后端给的 `needs_math`（全文口径）判断。
+      if ((DOC.needs_math || docNeedsMath(DOC)) && !katexReady()) {
         ensureKatex().then(ok => { if (ok) render(pageAnchor()); });
       }
       render();

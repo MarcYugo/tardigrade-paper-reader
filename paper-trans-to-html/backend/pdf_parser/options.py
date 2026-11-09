@@ -4,16 +4,16 @@
 
 「文字版式后端」当前有三个实现：
 
-  * **本地解析方案**（`backend_pymupdf.py` + `local_parse_pipeline/`）：PyMuPDF
+  * **本地解析方案**（`backend/backend_pymupdf.py` + `local_parse_pipeline/`）：PyMuPDF
     文字层 + texify 公式识别 + OXR 版面分析（D-FINE）/ SLANet 表格识别 + 插图提取；后端取值
     `pymupdf` / `auto` 都对应这一条链路，前端逐行绝对定位渲染；
-  * **Surya 2**（`../surya_parser.py` + `backend_surya.py`）：整页 OCR，文字 /
+  * **Surya 2**（`surya_parser.py` + `backend/backend_surya.py`）：整页 OCR，文字 /
     公式 / 插图全部来自 Surya，前端按 `parser === "surya"` 独立渲染；
-  * **Unlimited-OCR**（`../unlimited_ocr.py` + `backend_unlimited_ocr.py`）：整页
+  * **Unlimited-OCR**（`unlimited_ocr.py` + `backend/backend_unlimited_ocr.py`）：整页
     OCR，文字 / 公式（LaTeX）/ 表格（HTML）/ 插图全部来自 Unlimited-OCR，
     前端按 `parser === "unlimited_ocr"` 独立渲染（与 Surya 那套各自维护）。
     数据来源有两条（前端渲染路径相同）：本地推理服务
-    （`../unlimited_ocr.py`）与在线解析（`../unlimited_ocr_online.py`，百度智能云
+    （`unlimited_ocr.py`）与在线解析（`unlimited_ocr_online.py`，百度智能云
     「文档解析（Unlimited-OCR）」）。**网页设置面板不新增项**（只改 `config.json`）：
     `unlimited_ocr_route`（默认 `auto` = 本地没配置就自动切在线，`local`/`online` 可强制）
     与在线凭据 `unlimited_ocr_online_api_key` / `unlimited_ocr_online_secret_key`
@@ -28,7 +28,7 @@
 旧 PaddleOCR 链路的配置项（`paddle_*`）**已随解析/渲染代码一起删除**，
 不再被读取也不再识别（旧值 `backend="paddle"` 会走“未知后端”分支按 auto 处理）。
 
-默认常量的家在各客户端模块：Surya 在 `../surya_parser.py`、Unlimited-OCR 在 `../unlimited_ocr.py` —— config.json 里
+默认常量的家在各客户端模块：Surya 在 `surya_parser.py`、Unlimited-OCR 在 `unlimited_ocr.py` —— config.json 里
 `parser` 段的键与这里一一对应，改动作时两边一起对齐。
 """
 
@@ -39,21 +39,21 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from ..surya_parser import (
+from .surya_parser import (
     DEFAULT_BACKEND as DEFAULT_SURYA_BACKEND,
     DEFAULT_IMAGE_LABELS,
     DEFAULT_URL as DEFAULT_SURYA_URL,
     PROBE_TIMEOUT as SURYA_PROBE_TIMEOUT,
     check_server as surya_check,
     client_ready as surya_client_ready)
-from ..unlimited_ocr import (
+from .unlimited_ocr import (
     DEFAULT_MODEL as DEFAULT_UNLIMITED_OCR_MODEL,
     DEFAULT_TIMEOUT as DEFAULT_UNLIMITED_OCR_TIMEOUT,
     DEFAULT_URL as DEFAULT_UNLIMITED_OCR_URL,
     PROBE_TIMEOUT as UNLIMITED_OCR_PROBE_TIMEOUT,
     check_server as unlimited_ocr_check)
-from ..unlimited_ocr_online import available as unlimited_ocr_online_available
-from .backend_pymupdf import local_status as local_parse_status
+from .unlimited_ocr_online import available as unlimited_ocr_online_available
+from .backend.backend_pymupdf import local_status as local_parse_status
 
 
 # =====================================================================
@@ -74,8 +74,8 @@ PARSER_MODES = ("auto", "surya", "unlimited_ocr", "pymupdf")
 
 # ---- 两条整页 OCR 链的默认参数 ----
 # 默认常量住在各自的客户端模块（导入见文件头）：
-#   surya                   -> ../surya_parser.py（默认地址与 surya_doc_parse_service 端口一致）
-#   unlimited_ocr           -> ../unlimited_ocr.py（默认地址与 unlimited_ocr_service 端口一致）
+#   surya                   -> surya_parser.py（默认地址与 surya_doc_parse_service 端口一致）
+#   unlimited_ocr           -> unlimited_ocr.py（默认地址与 unlimited_ocr_service 端口一致）
 
 DEFAULT_OPTIONS: dict = {
     # auto / pymupdf → 本地解析方案（PyMuPDF + 本地模型）

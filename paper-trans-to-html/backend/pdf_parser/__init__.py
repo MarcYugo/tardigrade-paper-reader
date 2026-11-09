@@ -6,22 +6,22 @@
 
 当前可用的文字版式后端有三个：
 
-  * **本地解析方案**（`backend_pymupdf.py` + `local_parse_pipeline/`，`backend` =
+  * **本地解析方案**（`backend/backend_pymupdf.py` + `local_parse_pipeline/`，`backend` =
     `pymupdf` / `auto`）：PyMuPDF 文字层 + texify
     公式识别 + OXR 版面分析（D-FINE）/ SLANet 表格识别 + 插图提取；页面下发逐行几何与页面级公式框，
     前端按 `doc.parser === "pymupdf"` 走逐行绝对定位渲染
     （`frontend/js/reader2.js::buildTextItem`）。依赖/模型缺失时直接报错
-    （`backend_pymupdf.LocalParseUnavailable`）。
-  * **Surya 2**（`backend_surya.py` + 客户端 `../surya_parser.py`，`backend` = `surya`）：
+    （`backend/backend_pymupdf.LocalParseUnavailable`）。
+  * **Surya 2**（`backend/backend_surya.py` + 客户端 `surya_parser.py`，`backend` = `surya`）：
     文字 / 公式（`<math>`→LaTeX）/ 插图裁图 / 阅读顺序全部来自 Surya 的版面 block；
     前端按 `doc.parser === "surya"` 走独立的块级流式渲染
     （`frontend/js/reader2.js::buildSuryaItem`）。Surya 不可用时直接报错。
-  * **Unlimited-OCR**（`backend_unlimited_ocr.py` + 客户端 `../unlimited_ocr.py`，
+  * **Unlimited-OCR**（`backend/backend_unlimited_ocr.py` + 客户端 `unlimited_ocr.py`，
     `backend` = `unlimited_ocr`）：文字 / 公式（LaTeX）/ 表格（HTML）/ 插图裁图 /
     阅读顺序全部来自 Unlimited-OCR 回包；前端按 `doc.parser === "unlimited_ocr"`
     走它**自己那套**独立块级渲染（`frontend/js/reader2.js::buildUnlimitedItem`）。
     数据来源两条（**设置项不变**）：本地推理服务 → **没配置 / 没起来时自动切在线解析**
-    （`../unlimited_ocr_online.py`，百度智能云「文档解析（Unlimited-OCR）」）；
+    （`unlimited_ocr_online.py`，百度智能云「文档解析（Unlimited-OCR）」）；
     两条都不可用时直接报错。走了哪条看 `parser_info["unlimited_ocr_route"]`。
 
 对外接口：`parse_pdf(...)`(见 `entry.py`)与 `status(...)`(见 `options.py`)。
@@ -56,10 +56,14 @@ Unlimited-OCR 多两个**配置文件中才有的**键（不上设置面板）�
 #    images.py           [历史空壳] 早期插图检测/去重影
 #    math_text.py        [历史空壳] 早期公式文本工具
 #    math_font.py        公式字体判据（供补间距/探针文本用；字形擦除链路已停用）
-#    backend_pymupdf.py  版式后端 · 本地解析方案（PyMuPDF + local_parse_pipeline）
-#    backend_surya.py    版式后端 · Surya 2 整页 OCR（块级数据）
-#    backend_unlimited_ocr.py 版式后端 · Unlimited-OCR 整页 OCR（块级数据）
-#        本地推理 / 在线解析两条来源（见 ../unlimited_ocr_online.py），前端同一套渲染
+#    backend/            三条版式后端（同一份 parse_pdf 契约）
+#      backend_pymupdf.py  版式后端 · 本地解析方案（PyMuPDF + local_parse_pipeline）
+#      backend_surya.py    版式后端 · Surya 2 整页 OCR（块级数据）
+#      backend_unlimited_ocr.py 版式后端 · Unlimited-OCR 整页 OCR（块级数据）
+#        本地推理 / 在线解析两条来源（见 surya_parser.py / unlimited_ocr*.py），前端同一套渲染
+#    surya_parser.py     Surya 2 推理服务客户端（被 backend/backend_surya.py 使用）
+#    unlimited_ocr.py    Unlimited-OCR 本地推理服务客户端
+#    unlimited_ocr_online.py  Unlimited-OCR 在线解析客户端（本地不可用时自动启用）
 #    links.py            PDF 链接注释采集（引用跳转的数据源）
 #    entry.py            入口 parse_pdf(+ pop_private)
 #  下面仍把内部名字再导出一次，保证 `pdf_parser.<原名字>` 照旧可用
@@ -80,11 +84,11 @@ from .images import (_FIG_GAP, _FIG_MIN_H, _FIG_MIN_PARTS, _FIG_MIN_W, _FIG_PAD,
                      _render_region_png, _suppress_ghost_text)
 from .options import (CONFIG_FILE, DEFAULT_IMAGE_LABELS, DEFAULT_OPTIONS,
                       PARSER_MODES, _ENV_KEYS, _to_bool, load_options, status)
-from .backend_pymupdf import (_blank_math_and_prune, _local_page,
-                              _parse_with_pymupdf, _pdf_outline,
-                              _strip_font_keys)
-from .backend_surya import _parse_with_surya
-from .backend_unlimited_ocr import _parse_with_unlimited_ocr
+from .backend.backend_pymupdf import (_blank_math_and_prune, _local_page,
+                                      _parse_with_pymupdf, _pdf_outline,
+                                      _strip_font_keys)
+from .backend.backend_surya import _parse_with_surya
+from .backend.backend_unlimited_ocr import _parse_with_unlimited_ocr
 from .math_text import (_ANCHOR_LENS, _ANCHOR_MIN_TOTAL, _ANCHOR_RANK_GAP,
                         _ANCHOR_RANK_MIN, _ANCHOR_SPAN_MAX, _DISPLAY_MATH_RE,
                         _GLYPH_CLS, _GLYPH_RE, _LIG_EXPAND,

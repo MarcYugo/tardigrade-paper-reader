@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from backend.pdf_parser import backend_pymupdf as bp
+from backend.pdf_parser.backend import backend_pymupdf as bp
 
 SAMPLE = (Path(__file__).resolve().parent.parent
           / "backend" / "pdf_parser" / "local_parse_pipeline"

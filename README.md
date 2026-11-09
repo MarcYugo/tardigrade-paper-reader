@@ -32,6 +32,8 @@
 
 7. [26/11/7] a. Unlimited-OCR增加官网api调用；b. 增加ai辅助阅读时的agent功能，可以通过聊天找到论文相关内容/笔记位置 和 帮助写入笔记内容；c. 更换logo（水熊虫三角立体艺术拼接风格）
 
+8. [26/11/9] a. agent功能拆分 b. 增加笔记导出功能（agent分析总结；校验参考文献需要到设置里配置检索api key） c. ai辅助阅读形式更改为底部胶囊卡片（打开收起方式详见功能5）。 
+
 ## Pdf 解析模块
 
 把论文 PDF 解析成**可还原原版式的数据**（文字块 + 插图，保留原坐标、字号、字体）。提供三种解析方式，输出结构一致，前端无需改动。
@@ -43,7 +45,7 @@
 - 文字按 PDF 原始行框、字号、字体、颜色还原；
 - 自动提取插图（内嵌图片与矢量图表），过滤整页背景、过小贴图；
 - 数学公式（独立公式和行内公式）提取靠字体识别+texify转换。
-- 使用前需要下载，详情查看该模块中的 [README.md](./paper-trans-to-html/backend/pdf_parser/local_parse_pipeline/README.md)
+- 使用前需要下载，详情查看该模块中的 [local_parse_pipeline/README.md](./paper-trans-to-html/backend/pdf_parser/local_parse_pipeline/README.md)
 
 ### 2. Surya
 
@@ -80,37 +82,25 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 ## 使用功能
 
-### 1. 多用户
+### 1. 多用户和设置
 
-<img src="./function_display/1.log-in-switch-out.gif">
+<img src="./function_display/1.log-in-switch-out.gif" width=400px>
+<img src="./function_display/2.config.gif" width=400px>
 
-### 2. 设置
+### 3. 论文载入和删除、标注、笔记和翻译
 
-<img src="./function_display/2.config.gif">
+<img src="./function_display/3.paper-load-del.gif" width=400px>
+<img src="./function_display/4.highlight-mark-translate.gif" width=400px>
 
-### 3. 论文载入和删除
+### 4. 笔记整理和AI辅助、笔记共享
 
-<img src="./function_display/3.paper-load-del.gif">
+<img src="./function_display/5.note-ai-assitant.gif" width=400px>
+<img src="./function_display/6.note-share.gif" width=400px>
 
-### 4. 标注、笔记和翻译
+### 5. 笔记和内容定位、笔记添加
 
-<img src="./function_display/4.highlight-mark-translate.gif">
-
-### 5. 笔记整理和AI辅助
-
-<img src="./function_display/5.note-ai-assitant.gif">
-
-### 6. 笔记共享
-
-<img src="./function_display/6.note-share.gif">
-
-### 7. 笔记和内容定位
-
-<img src="./function_display/7.agent-location.gif">
-
-### 8. 笔记添加
-
-<img src="./function_display/8.agent-write-notes.gif">
+<img src="./function_display/7.agent-location.gif" width=400px>
+<img src="./function_display/8.agent-write-notes.gif" width=400px>
 
 ## TODO
 
@@ -119,9 +109,8 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 - [x] ~~pymupdf 本地解析优化~~
 - [x] ~~unlimited ocr 解析和渲染路径实现~~
 - [x] ~~引用链接显示功能优化~~
-- [ ] Agent功能优化
 - [x] ~~unlimited-ocr解析后端优化~~
-- [ ] 笔记导出功能
+- [x] ~~笔记导出功能~~
+- [ ] Agent功能优化
 
-
-<!-- https://github.com/MarcYugo/crockroach-paper-reader -->
+<!-- https://github.com/MarcYugo/tardigrade-paper-reader -->

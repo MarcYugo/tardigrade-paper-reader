@@ -19,6 +19,7 @@
   --bar-bg: rgba(255, 255, 255, .92);   /* 顶栏（半透明 + 毛玻璃） */
   --field-bg: #ffffff;       /* 输入框/下拉框底色 */
   --line-hover: #c9d4e4;     /* 边框 hover */
+  --line-strong: #b8c4d6;    /* 需要看得清轮廓的描边（比 --line-hover 再硬一档） */
   --page-bg: #ffffff;        /* 论文页面底色 */
   --page-num: #9aa4b2;
   /* 译文卡（琥珀系） */
@@ -37,6 +38,9 @@
   --taghl-bg: #fff4d6; --taghl-ink: #9a7300;
   --tagnote-bg: #fdeef1; --tagnote-ink: #e04b5c;
   --tagshare-bg: #ece9fd; --tagshare-ink: #5a48c9;
+  /* 顶栏实际高度：顶栏会换行撑高，由 common.js 的 syncTopbarHeight() 实测写入。
+     左目录 / 右笔记栏等 position: fixed 面板都用它当 top，别写死 54px（会钻到顶栏底下）。 */
+  --topbar-h: 54px;
   font-size: 15px;
 }
 
@@ -62,6 +66,7 @@ html.dark {
   --bar-bg: rgba(34, 38, 45, .94);
   --field-bg: #22262d;
   --line-hover: #4a525e;
+  --line-strong: #5d6673;
   --page-bg: #262b32;
   --page-num: #7b8593;
   --ti-bg: #322f28; --ti-line: #4b4436; --ti-bar: #d8a63a; --ti-ink: #e9dcb8;
@@ -86,6 +91,9 @@ body {
   color: var(--ink);
   font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* 页面比例：等版式算完由 layout.js 覆盖（clamp 到 0.78~1.2）。先给下限，
+     否则文档还没加载时按 1 铺的字号偏大，加载完才跳成小字号（AI 卡片最明显）。 */
+  --page-scale: .78;
 }
 a { color: var(--accent); text-decoration: none; }
 
@@ -685,7 +693,7 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 }
 .notes-toggle .c { background: var(--red); color: #fff; border-radius: 10px; font-size: 11px; padding: 1px 6px; }
 .notes-drawer {
-  position: fixed; top: 54px; right: 0; bottom: 0; width: 330px; z-index: 65;
+  position: fixed; top: var(--topbar-h); right: 0; bottom: 0; width: 330px; z-index: 65;
   background: var(--card); border-left: 1px solid var(--line); box-shadow: -8px 0 30px rgba(0,0,0,.18);
   transform: translateX(100%); transition: .25s; display: flex; flex-direction: column;
 }
@@ -710,15 +718,24 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
 .pageind {
-  position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 55;
+  position: fixed; bottom: 14px;
+  /* 横向锚点 = **页面列的中线**（--page-cx，layout.js::syncReadCenter 实测写入），
+     再加上让开左侧 AI 小胶囊的一半宽度（--pager-shift，r2-ai.js 写入）。
+     目录（左 300px）/ 笔记抽屉（右 384px）打开时正文整体平移，中线也跟着变，
+     页码胶囊与 AI 小胶囊就会跟着页面一起右/左移，而不是死盯窗口中线。 */
+  left: calc(var(--page-cx, 50%) + var(--pager-shift, 0px));
+  transform: translateX(-50%); z-index: 55;
   background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 5px 14px;
   font-size: 12.5px; color: var(--mut); box-shadow: var(--shadow);
   display: flex; align-items: center; gap: 3px;
 }
-/* 页码输入框：静息时看着就是普通文字，悬停/聚焦才显出可编辑 */
+/* 页码输入框：静息时看着就是普通文字，悬停/聚焦才显出可编辑。
+   宽度改成跟着内容走（field-sizing）：页码几位就多宽，「/ 15 页」紧贴着数字，
+   不会像固定宽度那样在左边空出一大块；文字居中，整枚胶囊也跟着变窄并保持居中 */
 .pageind .pagein {
-  width: 3.4em; padding: 0; border: 0; background: transparent; outline: none;
-  font: inherit; color: var(--ink); text-align: right; cursor: text;
+  width: auto; min-width: 1.3em; max-width: 5em; field-sizing: content;
+  padding: 0 2px; border: 0; background: transparent; outline: none;
+  font: inherit; color: var(--ink); text-align: center; cursor: text;
   border-bottom: 1px dashed transparent; border-radius: 0;
   -moz-appearance: textfield;
 }
@@ -760,7 +777,8 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 /* 展开时给正文让出左侧空间：宽度 300px 要与 reader2.js 里的 TOC_W 一致 */
 body.toc-open .reader-main { padding-left: 300px; }
 .toc-panel {
-  position: fixed; top: 54px; left: 0; bottom: 0; width: 300px; max-width: 86vw;
+  /* top 跟着顶栏实际高度走：窄窗口顶栏会换行撑高，写死 54px 会让目录头被顶栏压住 */
+  position: fixed; top: var(--topbar-h); left: 0; bottom: 0; width: 300px; max-width: 86vw;
   background: var(--card); border-right: 1px solid var(--line);
   box-shadow: 10px 0 34px rgba(15, 25, 50, .18); z-index: 64;
   transform: translateX(-105%); transition: transform .22s ease;
@@ -822,7 +840,7 @@ body.toc-open .reader-main { padding-left: 300px; }
 body.notes-side .reader-main { padding-right: var(--note-reserve, 330px); }
 body.side-open .reader-main { padding-right: 384px; }
 .side-panel {
-  position: fixed; top: 54px; right: 0; bottom: 0; width: 384px; max-width: 94vw;
+  position: fixed; top: var(--topbar-h); right: 0; bottom: 0; width: 384px; max-width: 94vw;
   background: var(--card); border-left: 1px solid var(--line);
   box-shadow: -10px 0 34px rgba(15, 25, 50, .18); z-index: 64;
   transform: translateX(105%); transition: transform .22s ease;
@@ -875,12 +893,13 @@ body.side-open .reader-main { padding-right: 384px; }
   position: fixed; right: 16px; bottom: 68px; z-index: 58;
   width: min(940px, calc(100vw - 32px)); max-height: calc(100vh - 88px);
   padding: 0; font-size: calc(13px * var(--page-scale, 1));
-  /* 两栏间距、卡片底部留白、到页码按钮的空当收紧后，省下的空间都加到面板高度上 */
-  --ai-panel-h: clamp(225px, 41.5vh, 405px);
+  /* 两栏间距、卡片顶部留白、到页码按钮的空当收紧后，省下的空间都加到面板高度上 */
+  --ai-panel-h: clamp(260px, 47vh, 470px);
   pointer-events: none;
 }
 .ai-in {
-  width: 100%; max-height: inherit; margin: 0 0 0 auto; padding: 12px 12px 8px;
+  /* 顶部留白收紧：标题行距离卡片上边界更近（底部保持原有留白） */
+  width: 100%; max-height: inherit; margin: 0 0 0 auto; padding: 4px 12px 8px;
   display: flex; flex-direction: column; overflow: hidden; pointer-events: auto;
   background: var(--card); border: 1px solid var(--line);
   border-radius: var(--radius); box-shadow: var(--shadow);
@@ -896,7 +915,7 @@ body.toc-open.side-open .ai-end.ai-collapsed {
 
 /* 标题行固定单行：标题 + 状态文字 + 右侧按钮，空间不够时先截状态文字，
    再极窄时截标题，按钮始终完整可见（不再让按钮掉到第二行） */
-.ai-head { display: flex; flex-wrap: nowrap; align-items: center; gap: 10px; margin: 0 2px 12px; }
+.ai-head { display: flex; flex-wrap: nowrap; align-items: center; gap: 10px; margin: 0 2px 8px; }
 /* 「AI 辅助阅读」标题：文字 + 小图标用 inline-flex 对齐，两端（文末面板 / 目录侧栏）一致 */
 .ai-head b, .toc-ai-head b { display: inline-flex; align-items: center; gap: 6px; }
 .ai-collapse {
@@ -914,8 +933,9 @@ body.toc-open.side-open .ai-end.ai-collapsed {
   border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
   transform: rotate(45deg) translateY(-2px); transition: transform .18s ease;
 }
+/* 收起时箭头朝上：提示卡片会向上展开（与展开态的向下箭头正好相差 180°） */
 .ai-collapse[aria-expanded="false"] .ai-collapse-icon {
-  transform: rotate(-45deg) translateY(-2px);
+  transform: rotate(-135deg) translateY(-2px);
 }
 .ai-head .grow { flex: 1; }
 /* 「整理于 … · 共 N 条笔记 …」按需截断：宽度不够时它先收缩出省略号，
@@ -924,18 +944,51 @@ body.toc-open.side-open .ai-end.ai-collapsed {
   font-size: .95em; color: var(--mut); min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ai-head .btn { padding: 5px 10px; font-size: 13px; flex: none; }
+/* 卡片里的按钮不写死 13px：用 em 跟随 .ai-end 的 --page-scale，和笔记正文同样大小，
+   缩放页面时按钮文字与内边距一起放大/缩小 */
+.ai-head .btn { padding: .385em .77em; font-size: 1em; flex: none; }
+/* 标题行两个次要按钮：`.btn.ghost` 的边框是透明色，在卡片底色上完全看不出轮廓，
+   这里换成比卡片底色明显更亮的描边（hover 再提亮一档），保证按钮边界清晰 */
+.ai-head .btn.ghost { border-color: var(--line-strong); }
+.ai-head .btn.ghost:hover { border-color: var(--mut); background: var(--bg-soft); color: var(--ink); }
 .ai-body[hidden] { display: none !important; }
 .ai-end.ai-collapsed #aiRegen,
 .ai-end.ai-collapsed #aiClear { display: none; }
 .ai-end.ai-collapsed { bottom: 52px; }
-/* 收起时只剩一行标题（+ 右侧按钮），卡片宽度按内容收缩，不再撑满整页 */
+/* 收起时只剩一行标题（+ 右侧按钮），卡片宽度按内容收缩，不再撑满整页；
+   高度跟页码卡片（#pageInd）齐平 —— 实测值由 positionAiCard() 写进 --ai-chip-h */
 .ai-end.ai-collapsed .ai-in {
-  width: fit-content; max-width: 100%; padding: 8px 12px;
+  width: fit-content; max-width: 100%; padding: 0 12px;
+  height: var(--ai-chip-h, 30px); justify-content: center;
 }
 .ai-end.ai-collapsed .ai-head { margin-bottom: 0; flex-wrap: nowrap; }
 .ai-end.ai-collapsed .ai-head .grow { display: none; }
 .ai-end.ai-collapsed .ai-sub { display: none; }
+
+/* ---------- 展开 / 收起的「液体泼出」动效 ----------
+   JS 用 WAAPI 在 .ai-in 上做 clip-path 圆形遮罩：展开时从标题按钮处向外扩散，
+   收起时沿同一位置回吸。这里补两件事：
+   ① clip-path 会把 box-shadow 一起裁掉，动画期间换成 drop-shadow 让阴影跟着液体形状走；
+   ② 内容跟着淡入 / 淡出（轻微位移 + 模糊），扩散感更连贯。 */
+.ai-end.ai-splashing .ai-in {
+  box-shadow: none;
+  filter: drop-shadow(0 10px 22px rgba(0, 0, 0, .3));
+  will-change: clip-path, transform;
+}
+.ai-end.ai-splashing:not(.ai-splashing-out) .ai-body {
+  animation: aiSplashBodyIn .5s cubic-bezier(.2, .66, .26, 1) both;
+}
+.ai-end.ai-splashing-out .ai-body { animation: aiSplashBodyOut .36s ease-in both; }
+/* 收起时面板已经缩成一个点，别让看不见的区域还能点到 */
+.ai-end.ai-splashing-out .ai-in { pointer-events: none; }
+@keyframes aiSplashBodyIn {
+  from { opacity: 0; transform: translateY(8px); filter: blur(6px); }
+  to { opacity: 1; transform: none; filter: none; }
+}
+@keyframes aiSplashBodyOut {
+  from { opacity: 1; transform: none; filter: none; }
+  to { opacity: .3; transform: translateY(6px); filter: blur(4px); }
+}
 
 @media (max-width: 720px) {
   .ai-end {
@@ -1052,6 +1105,7 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
   border: 1px solid var(--line); border-radius: 9px; background: var(--field-bg); outline: none;
 }
 .ai-send textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ai-send .btn { font-size: 1em; padding: .46em .92em; }   /* 同 .ai-head：跟随卡片字号缩放 */
 .ai-empty-chat {
   height: 100%; display: flex; flex-direction: column;
   align-items: center; justify-content: center;
@@ -1080,11 +1134,13 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 .ai-theme .ai-text h4 { margin: 0; }
 .ai-none { font-size: .96em; color: var(--mut); }
 
-/* 列表：圆点在 ::before、文字旁边挂「编辑 / 删除」，两者都是 flex 项 */
+/* 列表：圆点在 ::before、文字旁边挂「编辑 / 删除」，两者都是 flex 项。
+   注意只能用**子选择器**：条目正文里渲染出来的 Markdown 列表（ul.md-ul > li）
+   也是 .ai-list 的后代，用后代选择器会把它变成 flex 行，每段文字被挤成竖排。 */
 .ai-list { margin: 0; padding-left: 0; list-style: none; }
-.ai-list li { display: flex; align-items: flex-start; gap: 6px; font-size: 1em; line-height: 1.8; }
-.ai-list li::before { content: "•"; color: var(--mut); flex: none; }
-.ai-list-add::before { content: none; }
+.ai-list > li { display: flex; align-items: flex-start; gap: 6px; font-size: 1em; line-height: 1.8; }
+.ai-list > li::before { content: "•"; color: var(--mut); flex: none; }
+.ai-list > li.ai-list-add::before { content: none; }
 
 /* 一段可编辑文字：平时“文字 + 小工具”一行，编辑时换成输入框 + 按钮 */
 .ai-text { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; flex: 1; min-width: 0; }
@@ -1276,6 +1332,8 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 .modal-mask { position: absolute; inset: 0; background: rgba(30, 40, 60, .45); }
 .modal-card {
   position: relative; width: 100%; max-width: 440px; max-height: 88vh; overflow: auto;
+  /* 卡片自己滚：滚到两端不要把滚动“传染”给背后的页面（JS 里另有一道兜底） */
+  overscroll-behavior: contain;
   background: var(--card); border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.25);
   display: flex; flex-direction: column;
 }
@@ -1392,6 +1450,24 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 .sh-permseg button { flex: 1; justify-content: center; padding: 9px 10px; font-size: 13px; }
 .row-actions .btn#shAdd { flex: 1; justify-content: center; }
 .sh-empty { padding: 14px; text-align: center; font-size: 12.5px; color: var(--mut); }
+
+/* ---------- 笔记导出弹窗（顶栏「📤 导出」） ---------- */
+.modal-card.no-card { max-width: 600px; }
+.no-seg { display: flex; width: 100%; }
+.no-seg button { flex: 1; justify-content: center; padding: 8px 10px; font-size: 13px; }
+.no-instr {
+  width: 100%; box-sizing: border-box; min-height: 92px; resize: vertical;
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  background: var(--field-bg); color: var(--ink); font: inherit; font-size: 13px;
+  line-height: 1.7; outline: none;
+}
+.no-instr:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.no-list {
+  margin: 12px 0 0; padding-left: 18px; color: var(--mut);
+  font-size: 12px; line-height: 1.75;
+}
+.no-list li { margin: 2px 0; }
+.no-list b { color: var(--ink); font-weight: 600; }
 /* 已共享名单里的小号分段按钮（就地改权限） */
 .sh-mini {
   flex: none; display: inline-flex; gap: 2px; padding: 2px;

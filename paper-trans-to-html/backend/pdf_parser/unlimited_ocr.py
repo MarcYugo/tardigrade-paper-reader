@@ -21,10 +21,10 @@ OpenAI 兼容接口，默认 http://127.0.0.1:9010/v1）；本模块是**客户�
 逐条验证：`pt = 归一化值 / 1000 × 页面边长`）。所以渲染 dpi 只影响 OCR 清晰度，
 不影响坐标换算；换 dpi 后回包坐标不用重新标定。
 
-⚠️ 失败一律抛 `UnlimitedOcrUnavailable`；调用方（`pdf_parser/backend_unlimited_ocr.py`）
+⚠️ 失败一律抛 `UnlimitedOcrUnavailable`；调用方（`pdf_parser/backend/backend_unlimited_ocr.py`）
 **不回退 PyMuPDF**，直接让整次解析失败（免得用户以为看到了 OCR 的效果）。
 
-对外接口（`pdf_parser/backend_unlimited_ocr.py` 与 `pdf_parser/options.py::status()` 在用）：
+对外接口（`pdf_parser/backend/backend_unlimited_ocr.py` 与 `pdf_parser/options.py::status()` 在用）：
 
   * `check_server` / `ocr_pdf` / `parse_layout_items` / `UnlimitedOcrUnavailable`；
   * `DEFAULT_URL` / `DEFAULT_MODEL` / `DEFAULT_TIMEOUT` / `PROBE_TIMEOUT`

@@ -47,9 +47,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
 
-from .math_font import _accumulate_stats, _math_font_flags
-from .sentences import cut_blocks_by_sentence
-from .text_layer import (_CHAR_X, _CX_KEYS, _GAP_KEYS, _fill_gap_geom,
+from ..math_font import _accumulate_stats, _math_font_flags
+from ..sentences import cut_blocks_by_sentence
+from ..text_layer import (_CHAR_X, _CX_KEYS, _GAP_KEYS, _fill_gap_geom,
                          _insert_gap_spaces, _is_super, _join_lines,
                          _line_baseline, _line_char_x, _line_rot,
                          _merge_line_runs, _row_top, _span_char_x, _span_text,
@@ -59,7 +59,7 @@ from .text_layer import (_CHAR_X, _CX_KEYS, _GAP_KEYS, _fill_gap_geom,
 # =====================================================================
 #  本地流水线与模型位置
 # =====================================================================
-_LOCAL_DIR = Path(__file__).resolve().parent / "local_parse_pipeline"
+_LOCAL_DIR = Path(__file__).resolve().parents[1] / "local_parse_pipeline"
 _MODEL_DIR = _LOCAL_DIR / "models"
 _TEXIFY_DIR = _MODEL_DIR / "texify-quantized-onnx"
 # 公式引擎已改为 ONNX Runtime 版（`utils/load_texify.py`），权重是两个量化图

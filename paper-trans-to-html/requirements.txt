@@ -11,7 +11,7 @@ PyMuPDF>=1.24
 # 数据存储：论文/标注/笔记/译文/账号/LLM 配置都存在 MongoDB（见 mongo_configuration/）
 pymongo==4.18.0
 # 可选：未配置 DeepSeek Key 时，可安装此包作为免费兜底翻译源
-# deep-translator>=1.11
+deep-translator>=1.11
 
 # ---- 可选：PDF 解析走 Surya 2 推理服务(版面分析 / 整页 OCR) ----
 # 先用 doc_parse_service/ 把推理服务跑起来(默认 http://127.0.0.1:8060/v1)，

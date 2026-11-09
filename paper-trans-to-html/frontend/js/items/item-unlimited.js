@@ -1,5 +1,5 @@
 /* ============ Unlimited-OCR 的块级渲染：从 reader2.js 拆出来的模块 ============
-   unlimited_ocr 后端（backend/pdf_parser/backend_unlimited_ocr.py）下发的版面数据是
+   unlimited_ocr 后端（backend/pdf_parser/backend/backend_unlimited_ocr.py）下发的版面数据是
    **块级**的（每块只有 bbox / kind / 文本，块内没有行几何）。思路与 Surya 那套相同
    （绝对定位的 .blk + 块内流式排版），但代码**刻意独立成一整套**（buildUnlimitedItem /
    ulInlineMath / ulTableEl / finalizeUnlimitedBlocks / settleUnlimitedLayout，
@@ -26,7 +26,7 @@ window.R2ItemUl = function (env) {
 
   /* 旧数据兼容：老 doc.json 里定界符没摘（文本还留着 `$ x(t) \\in \\mathbb{R}^N $`），
      解析侧没下发 `t.math`，公式就只能看见 LaTeX 源码。这里按与后端
-     `backend_unlimited_ocr._text_with_math` 同样的判据**就地补一遍**：摘掉定界符、
+     `backend/backend_unlimited_ocr._text_with_math` 同样的判据**就地补一遍**：摘掉定界符、
      把字符区间写回 `t.math`，后面 ulInlineMath 就会把它换成 KaTeX。
      · 老数据可能**部分**提取过（旧判据漏掉 `$A$` 这类单字母），所以即使 `t.math`
        非空也要再扫一遍，并把老区间按同一份「旧下标 → 新下标」映射搬过来；
@@ -399,10 +399,11 @@ window.R2ItemUl = function (env) {
      **只放大不缩小**：文本量比原框多时按实际高度长出去（解析侧已按块框做过
      缩字适配，溢出很小）。表格和公式按实际渲染高度量取，避免内容溢出 OCR 框后
      与后续块重叠。 */
-  function finalizeUnlimitedBlocks() {
+  function finalizeUnlimitedBlocks(only) {
     for (const id in itemById) {
       const it = itemById[id];
       if (!it.unlimited || it.kind !== "blk") continue;
+      if (only && !only.has(it.pi)) continue;
       if (it.ulHeading) {
         // 标题优先保持单行并适度扩宽，但不能越过页面右边缘；超长时由块内文本自动换行。
         const lineEl = it.linesData[0].el;
@@ -472,8 +473,10 @@ window.R2ItemUl = function (env) {
     return matches;
   }
 
-  function settleUnlimitedLayout() {
-    for (const page of pages) {
+  function settleUnlimitedLayout(only) {
+    for (let pi = 0; pi < pages.length; pi++) {
+      if (only && !only.has(pi)) continue;
+      const page = pages[pi];
       const equationTags = unlimitedEquationTagMatches(page);
       const equationTagSet = new Set(equationTags.map(match => match.tag));
       const list = page.items.filter(it => it.unlimited &&

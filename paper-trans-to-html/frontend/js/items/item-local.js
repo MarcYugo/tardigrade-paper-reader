@@ -362,12 +362,15 @@ window.R2ItemLocal = function (env) {
     }
   }
 
-  /* 本地解析方案的收尾：按基线摆好正文行，再把公式对齐到同一视觉行，最后回填块高。 */
-  function finalizeLocalBlocks() {
+  /* 本地解析方案的收尾：按基线摆好正文行，再把公式对齐到同一视觉行，最后回填块高。
+     `only` = 本轮刚挂上的页号集合（Set）：逐页加载时只处理新页，不把已经排好的页
+     重新量一遍（每次量都会触发一次布局，页多了会很卡）；不传 = 全部（整体重排）。 */
+  function finalizeLocalBlocks(only) {
     const items = [];
     for (const id in itemById) {
       const it = itemById[id];
       if (!it.local || it.kind !== "blk" || !it.el.isConnected) continue;
+      if (only && !only.has(it.pi)) continue;
       items.push(it);
     }
     if (!items.length) return;
@@ -381,7 +384,7 @@ window.R2ItemLocal = function (env) {
       if (it.el.parentElement) pageEls.add(it.el.parentElement);
     }
     // ② 公式框宽度变了 → 重新等比缩放 KaTeX；再按缩放后的真实基线对齐到正文行
-    refitFormulaBoxes();
+    refitFormulaBoxes(only);
     for (const pageEl of pageEls) _alignPageFormulas(pageEl);
 
     for (const it of items) {

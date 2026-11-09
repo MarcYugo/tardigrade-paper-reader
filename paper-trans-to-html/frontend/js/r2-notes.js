@@ -331,7 +331,13 @@ window.R2Notes = function (env) {
   }
   function jumpToNote(p, scroll = true) {
     const item = findItem(p.id);
-    if (!item) return;
+    if (!item) {
+      // 逐页加载：笔记所在的页可能还没建出来 → 先把那一页取回来再跳
+      if (env.ensureBlockLoaded) {
+        env.ensureBlockLoaded(p.id).then(ok => { if (ok) jumpToNote(p, scroll); });
+      }
+      return;
+    }
     selectSentence(item, p.si >= 0 ? p.si : 0);
     if (scroll) {
       const r = item.el.getBoundingClientRect();
@@ -342,7 +348,7 @@ window.R2Notes = function (env) {
     const anchored = (env.anno.notes || []).find(n => n.id === noteId);
     if (anchored) {
       const p = keyParts(anchored.block_id);
-      if (!findItem(p.id)) return false;
+      if (!findItem(p.id) && !env.ensureBlockLoaded) return false;
       jumpToNote(p);
       return true;
     }

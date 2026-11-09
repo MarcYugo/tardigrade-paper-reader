@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>笔记导出弹窗自检</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<!-- 只用来预览「阅读页顶栏 📤 导出」弹窗：打开本页会自动弹出导出卡片。 -->
+<header class="topbar">
+  <a class="brand" href="../index.html">← 论文列表</a>
+  <h1 class="doc-title" id="docTitle">示例论文：A Sample Paper</h1>
+</header>
+
+<script>
+/* 自检页没有后端：把 common.js 会用到的那几个接口 mock 掉，
+   这样顶栏用户区（含「⚙ 设置 / 📤 导出」）也能正常渲染出来。 */
+window.fetch = function (url) {
+  const u = String(url);
+  let body = {};
+  if (u.includes("/api/auth/status")) {
+    body = { authenticated: true, initialized: true, username: "alice" };
+  } else if (u.includes("/api/prefs")) {
+    body = { theme: "light" };
+  } else if (u.includes("/api/config")) {
+    body = { storage: { backend: "mongo", preferred: "auto" } };
+  } else if (u.includes("/note-out")) {
+    body = {
+      format: "tardigrade-note-export", mode: "mechanical",
+      paper: { title: "示例论文：A Sample Paper" },
+      sections: {}, notes: {}, report: { summary: "示例导出完成。" },
+    };
+  }
+  return Promise.resolve(new Response(JSON.stringify(body), {
+    status: 200, headers: { "Content-Type": "application/json" },
+  }));
+};
+</script>
+<script src="../js/common.js"></script>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  openNoteExportModal("demo-doc");
+});
+</script>
+</body>
+</html>

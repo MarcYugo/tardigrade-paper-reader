@@ -3,26 +3,26 @@
 见包文档 `backend/pdf_parser/__init__.py`。三类解析链并列：
 
   * `backend` = `pymupdf` / `auto`：**本地解析方案**
-    （`backend_pymupdf._parse_with_pymupdf`）—— PyMuPDF 文字层 + `local_parse_pipeline`
+    （`backend/backend_pymupdf._parse_with_pymupdf`）—— PyMuPDF 文字层 + `local_parse_pipeline`
     的 texify 公式识别、OXR 版面分析（D-FINE）定位表格/插图、SLANet_plus 表格结构识别与插图提取。
     页面下发**逐行几何**（`pages[].texts[].lines[].runs[]`）与页面级公式框
     （`pages[].formula_boxes[]`，LaTeX + 裁图），前端走逐行绝对定位渲染
     （见 `frontend/js/reader2.js::buildTextItem` 与 `r2-math.js::buildFormulaBoxes`）。
-    依赖/模型缺失时直接报错（`backend_pymupdf.LocalParseUnavailable`）。
-  * `backend` = `surya`：整页 OCR 走 Surya 2（`backend_surya._parse_with_surya`），
+    依赖/模型缺失时直接报错（`backend/backend_pymupdf.LocalParseUnavailable`）。
+  * `backend` = `surya`：整页 OCR 走 Surya 2（`backend/backend_surya._parse_with_surya`），
     文字/公式（`<math>`→LaTeX）/插图裁图/阅读顺序全部来自 Surya 的版面 block，
     前端按 `DOC.parser === "surya"` 走独立的块级渲染
     （见 `frontend/js/reader2.js::buildSuryaItem`）。Surya 不可用时直接报错
-    （`backend/surya_parser.SuryaUnavailable`，经转换接口映成页面上的失败提示）。
+    （`surya_parser.SuryaUnavailable`，经转换接口映成页面上的失败提示）。
   * `backend` = `unlimited_ocr`：整页 OCR 走 Unlimited-OCR
-    （`backend_unlimited_ocr._parse_with_unlimited_ocr`），与 `surya` 同级：文字/公式
+    （`backend/backend_unlimited_ocr._parse_with_unlimited_ocr`），与 `surya` 同级：文字/公式
     （LaTeX）/表格（HTML）/插图裁图/阅读顺序全部来自 Unlimited-OCR 回包，前端按
     `DOC.parser === "unlimited_ocr"` 走它**自己那套**独立的块级渲染
     （见 `frontend/js/reader2.js::buildUnlimitedItem`，与 Surya 那套各自维护）。
-    数据来源有两条，**设置项不变**：本地推理服务（`backend/unlimited_ocr.py`）
-    → 本地服务没配置 / 没起来时自动切到在线解析（`backend/unlimited_ocr_online.py`，
+    数据来源有两条，**设置项不变**：本地推理服务（`unlimited_ocr.py`）
+    → 本地服务没配置 / 没起来时自动切到在线解析（`unlimited_ocr_online.py`，
     百度智能云「文档解析（Unlimited-OCR）」）；两条都不可用时抛
-    `backend/unlimited_ocr.UnlimitedOcrUnavailable`。实际走了哪条记在
+    `unlimited_ocr.UnlimitedOcrUnavailable`。实际走了哪条记在
     `parser_info["unlimited_ocr_route"]`（`local` / `online`）。
 
 对外签名与返回结构**保持不变**(仍是 `parser` / `parser_info` / `toc` /
@@ -36,9 +36,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from .backend_pymupdf import (_parse_with_pymupdf)
-from .backend_surya import (_parse_with_surya)
-from .backend_unlimited_ocr import (_parse_with_unlimited_ocr)
+from .backend.backend_pymupdf import (_parse_with_pymupdf)
+from .backend.backend_surya import (_parse_with_surya)
+from .backend.backend_unlimited_ocr import (_parse_with_unlimited_ocr)
 from .links import collect_links
 from .options import (load_options)
 from ..pdf_refs.refs_surya import split_surya_reference_blocks
@@ -106,8 +106,8 @@ def parse_pdf(pdf_path: Path, images_dir: Optional[Path] = None, *,
         （不会悄悄回退，免得看起来像解析成功了）；
       * `unlimited_ocr`：整页 OCR 走 Unlimited-OCR —— 文字、公式（LaTeX）、表格
         （HTML）、插图都来自它的回包，**不使用 PyMuPDF 版式**；**本地推理服务**
-        （`../unlimited_ocr.py`）没有配置 / 未就绪时自动改用**在线解析**
-        （`../unlimited_ocr_online.py`），本地解析中途失败也会兜底切在线；
+        （`unlimited_ocr.py`）没有配置 / 未就绪时自动改用**在线解析**
+        （`unlimited_ocr_online.py`），本地解析中途失败也会兜底切在线；
         两条都不可用时抛 `UnlimitedOcrUnavailable`（同样不回退 PyMuPDF）。
 
     返回值：

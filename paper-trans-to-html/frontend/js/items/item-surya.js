@@ -323,10 +323,11 @@ window.R2ItemSurya = function (env) {
      表格（及 HTML 解析失败时的纯文本兜底）按**实际渲染高度**回填 —— Surya 的
      检测框高常小于表格真实高度（字体/内距差异），不回填的话下面的文字会按
      变矮的框算避让、压到表格上（见 settleSuryaVertical）。 */
-  function finalizeSuryaBlocks() {
+  function finalizeSuryaBlocks(only) {
     for (const id in itemById) {
       const it = itemById[id];
       if (!it.surya || it.kind !== "blk") continue;
+      if (only && !only.has(it.pi)) continue;
       if (it.syHeading && it.linesData.length) {
         // 标题不折行：量内容自然宽度，需要时把块放宽（最多到原框的 2.4 倍，长标题
         // 顶多折一行）。⚠️ CSS 的 `min(max-content, X)` 不合法（关键词不能进 min()），
@@ -378,8 +379,10 @@ window.R2ItemSurya = function (env) {
      的位移链（syShift 是它的起点，与“卡片顶开”量叠加，transform / 页面高度 /
      笔记卡位置因此都自动跟随）。 */
   const SY_VGAP = 2;      // px：避让后相邻块内容之间至少保留的空隙
-  function settleSuryaVertical() {
-    for (const page of pages) {
+  function settleSuryaVertical(only) {
+    for (let pi = 0; pi < pages.length; pi++) {
+      if (only && !only.has(pi)) continue;
+      const page = pages[pi];
       const list = page.items.filter(it =>
         it.surya && !(it.kind === "blk" && it.el.classList.contains("sy-vertical")));
       list.sort((a, b) => (a.y - b.y) || (a.x - b.x));

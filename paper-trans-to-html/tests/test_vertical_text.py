@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.pdf_parser.backend_pymupdf import (  # noqa: E402
+from backend.pdf_parser.backend.backend_pymupdf import (  # noqa: E402
     _build_text_items, _local_text_blocks)
 from backend.pdf_parser.text_layer import _line_rot  # noqa: E402
 

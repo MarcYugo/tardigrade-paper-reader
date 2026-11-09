@@ -22,7 +22,7 @@
   2. 图片类 block 一定是 `skipped=True` / `html=""` —— 模型本就不对图做 OCR，
      **绝不能拿 `skipped` / 空 html 当过滤条件**，否则要提取的图会被全部丢掉。
 
-对外接口（`pdf_parser/backend_surya.py` 与 `pdf_parser/options.py::status()` 在用）：
+对外接口（`pdf_parser/backend/backend_surya.py` 与 `pdf_parser/options.py::status()` 在用）：
 
   * `check_server` / `client_ready` / `ocr_pdf` / `SuryaUnavailable`；
   * `html_to_text_runs`：块 HTML →（纯文本, runs, 数学区间），翻译 / 句子 / 渲染共用；

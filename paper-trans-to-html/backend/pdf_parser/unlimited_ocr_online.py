@@ -5,7 +5,7 @@
 * 本地：`./unlimited_ocr.py` → 仓库根 `unlimited_ocr_service/`（vLLM，逐页
   `chat/completions`，坐标 0–1000 归一化）。
 * 在线：本模块 → 百度智能云**异步**接口（提交任务 → 轮询 → 下载结果 JSON）。
-* `pdf_parser/backend_unlimited_ocr.py` 在**本地服务没有配置 / 未就绪**时自动切到在线链路
+* `pdf_parser/backend/backend_unlimited_ocr.py` 在**本地服务没有配置 / 未就绪**时自动切到在线链路
   （`UNLIMITED_OCR_ROUTE` = `auto`(默认) / `local` / `online` 可强制）。
   **网页设置面板不新增项**：在线凭据写在 `config.json` 的 `parser` 段
   （`unlimited_ocr_online_api_key` / `unlimited_ocr_online_secret_key`），

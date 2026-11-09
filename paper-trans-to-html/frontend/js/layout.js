@@ -16,6 +16,16 @@ window.R2Layout = function (env) {
   "use strict";
   const $ = env.$;          // #id 查询（reader2 的局部简写）
 
+  /* 页面比例（--page-scale）先按上次算出来的值铺上：文档没加载完时它还没人写，
+     底部 AI 卡片这类浮层就会先按大字号出现、等版式算完才跳成小字号。
+     页面实际的字体尺寸在 render() 里由 applyNoteChrome() 重新算，这里只影响"加载中"那一瞬。 */
+  const PAGE_SCALE_KEY = "paperReader.pageScale";
+  let pageScaleSaved = "";      // 上次写进 localStorage 的值：一样就不重复写（缩放时会反复调用）
+  try {
+    const savedScale = localStorage.getItem(PAGE_SCALE_KEY);
+    if (savedScale) document.body.style.setProperty("--page-scale", savedScale);
+  } catch (e) { /* storage unavailable */ }
+
   /* ================= 布局 =================
      两种展开形式：
        1) 译文卡：留在句子下方，把后续版式内容顶开(“顶开版式”)；
@@ -125,19 +135,30 @@ window.R2Layout = function (env) {
     document.body.style.setProperty("--note-reserve", t.reserve + "px");
     // 卡片(译文/笔记)字号跟着页面的实际渲染比例走，和正文一起缩放
     // (夹紧到 0.78~1.2，避免页面很小时字小到看不清)
-    document.body.style.setProperty(
-      "--page-scale", clamp(t.pageW / env.CSS_W, 0.78, 1.2).toFixed(3));
+    const scale = clamp(t.pageW / env.CSS_W, 0.78, 1.2).toFixed(3);
+    document.body.style.setProperty("--page-scale", scale);
+    // 记下来给下次进来时用（见上面的 PAGE_SCALE_KEY）：刷新后首帧就是对的字号
+    if (scale !== pageScaleSaved) {
+      pageScaleSaved = scale;
+      try { localStorage.setItem(PAGE_SCALE_KEY, scale); } catch (e) { /* storage unavailable */ }
+    }
     env.noteSide = t.side;
     env.noteW = t.noteW;
     env.noteLeft = t.pageW + 14;                            // 页面坐标：贴着页面右边线外侧
   }
-  function relayoutAll() {
+  /* `only` = 只重排这几页（Set，逐页加载时空口令：每次只排刚挂上的页，
+     其余页的 DOM 一动没动，没必要重新量）。不传 = 全部页。 */
+  function relayoutAll(only) {
+    syncReadCenter();                                // 目录/抽屉开合会改预留宽度 → 中线先更新
     if (!env.DOC || !env.pages.length) return;      // 论文还没加载好（或加载失败）：别去碰 DOM
     const t = computePageTarget();
     if (Math.abs(t.pageW - env.curPageW) > 0.5) { env.render(); return; }   // 页面尺寸变了 → 整体重排
     applyNoteChrome(t);
     layoutAi();
-    env.pages.forEach((pg, pi) => relayoutPage(pi));
+    env.pages.forEach((pg, pi) => {
+      if (only && !only.has(pi)) return;
+      relayoutPage(pi);
+    });
     // 版式（含公式框位移）刚定下来：高亮公式框的“命中”是按几何算的，要重新对一遍
     env.paintFormulaMarks();
   }
@@ -152,6 +173,44 @@ window.R2Layout = function (env) {
     box.classList.remove("ai-stacked");
     const wrapped = Math.abs(chat.offsetTop - sum.offsetTop) > 2;
     if (wrapped) box.classList.add("ai-stacked");
+  }
+
+  /* ---------- 页面列中线：浮动胶囊（页码 / AI 收起胶囊）的横向锚点 ----------
+     这两个胶囊是 position: fixed，之前以**窗口**中线居中：目录（左 300px）或
+     笔记抽屉（右 384px）一打开，正文整体平移，胶囊却留在原处 → 视觉错位。
+     这里量出正文列（#pages 的内容盒，页面用 margin:auto 在它里面居中）的中线，
+     写进 CSS 变量 --page-cx，CSS 里用 left: calc(var(--page-cx) + …) 定位。
+     ⚠️ getBoundingClientRect() 是**布局坐标**（不乘 <html> 的 zoom），而 CSS 的
+     left/bottom 也是布局坐标 → 直接用，不要除/乘缩放比。 */
+  let lastCenterX = null;                 // 上次写入的值：一样就不重复写（滚动时会被反复调用）
+  function readCenterX() {
+    const pagesEl = $("pages");
+    if (!pagesEl) return null;
+    const r = pagesEl.getBoundingClientRect();
+    return r.width ? r.left + r.width / 2 : null;
+  }
+  function syncReadCenter() {
+    const cx = readCenterX();
+    if (cx == null) return null;
+    const v = Math.round(cx * 100) / 100;
+    if (v !== lastCenterX) {
+      lastCenterX = v;
+      document.documentElement.style.setProperty("--page-cx", v + "px");
+    }
+    return cx;
+  }
+  syncReadCenter();
+  if ($("pages")) {
+    // 预留宽度（目录 / 批注栏）变化会改变 #pages 的宽度；窗口缩放同理
+    if (window.ResizeObserver) new ResizeObserver(syncReadCenter).observe($("pages"));
+    window.addEventListener("resize", syncReadCenter);
+    // 页面比可视区宽时会出现横向滚动，中线要跟着内容走（竖向滚动不受影响，别每次滚动都量）
+    let lastScrollX = window.scrollX;
+    window.addEventListener("scroll", () => {
+      if (window.scrollX === lastScrollX) return;
+      lastScrollX = window.scrollX;
+      syncReadCenter();
+    }, { passive: true });
   }
   // 右侧模式：把笔记容器绝对定位到页面右侧；否则清掉定位、回到句子下方内嵌
   function applyNoteSide(it) {
@@ -385,5 +444,5 @@ window.R2Layout = function (env) {
 
   /* ============ 对外接口 ============ */
   return { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, xOverlap, pageColumns,
-           basePageW };
+           syncReadCenter, readCenterX, basePageW };
 };

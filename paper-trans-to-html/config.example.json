@@ -5,7 +5,7 @@
   "deepseek_model": "deepseek-flash",
 
   "parser": {
-    "backend": "auto",
+    "backend": "surya",
     "local_device": "",
     "local_dpi": 300,
     "local_padding": 2.0,

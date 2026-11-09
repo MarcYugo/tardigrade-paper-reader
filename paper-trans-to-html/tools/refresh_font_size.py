@@ -26,7 +26,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
-from backend import unlimited_ocr_online as uo        # noqa: E402
+from backend.pdf_parser import unlimited_ocr_online as uo        # noqa: E402
 from backend.storage import build as build_storage    # noqa: E402
 
 DATA_DIR = BASE_DIR / "data"

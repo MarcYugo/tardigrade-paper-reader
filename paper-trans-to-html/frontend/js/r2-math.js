@@ -74,7 +74,10 @@ window.R2Math = function (env) {
   /* 文档里有没有需要数学排版的东西：独立公式(latex)、Surya 块的行内数学区间/
      表格 <math>，或文本里的数学定界符。 */
   function docNeedsMath(doc) {
+    // 逐页加载时 `doc.pages` 里未到达的页是 null（按页号占位），跳过即可；
+    // 整篇是否需要 KaTeX 由后端 `needs_math` 一并给出（见 reader2.js::init）。
     for (const pg of ((doc && doc.pages) || [])) {
+      if (!pg) continue;
       // 本地解析方案：页面级公式框（LaTeX + 裁图）
       if ((pg.formula_boxes || []).some(b => b && b.latex)) return true;
       for (const t of (pg.texts || [])) {
@@ -633,6 +636,8 @@ window.R2Math = function (env) {
       const fb = document.createElement("div");
       fb.className = "fbox";
       fb.dataset.boxId = String(meta.id);
+      // 记下所属页号：逐页加载时 finalizeFormulaBoxes(only) 只重量本轮新挂上的页
+      fb.dataset.pi = String(pi);
       fb.dataset.cls = meta.cls || (meta.role === "inline"
         ? "InlineFormula" : "DisplayedFormulaBlock");
       fb.dataset.latex = latex;
@@ -700,20 +705,29 @@ window.R2Math = function (env) {
     fit.style.transform = "translate(-50%, -50%) scale(" + k.toFixed(4) + ")";
   }
 
-  function finalizeFormulaBoxes() {
+  /* `only` = 本轮刚挂上的页号集合（Set）。逐页加载时每批只量新页的框；
+     不传 = 全量（缩放 / 窗口变化后的整体重排）。 */
+  function _fboxIn(only, fb) {
+    if (!only) return true;
+    const pi = Number(fb.dataset.pi);
+    return only.has(isNaN(pi) ? -1 : pi);
+  }
+  function finalizeFormulaBoxes(only) {
     if (!_fboxSet.size) return;
     for (const fb of [..._fboxSet]) {
       if (!fb.isConnected) { _fboxSet.delete(fb); continue; }
+      if (!_fboxIn(only, fb)) continue;
       sizeFormulaBox(fb);
     }
     // 字体晚到会让第一次量的宽度偏小/偏大：字体就绪后再量一次（幂等）
     if (document.fonts && document.fonts.ready)
-      document.fonts.ready.then(refitFormulaBoxes).catch(() => {});
+      document.fonts.ready.then(() => refitFormulaBoxes()).catch(() => {});
   }
 
-  function refitFormulaBoxes() {
+  function refitFormulaBoxes(only) {
     for (const fb of [..._fboxSet]) {
       if (!fb.isConnected) { _fboxSet.delete(fb); continue; }
+      if (!_fboxIn(only, fb)) continue;
       sizeFormulaBox(fb);
     }
   }

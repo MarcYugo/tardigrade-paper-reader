@@ -81,12 +81,12 @@ def _print_summary(summary: dict) -> None:
           f"{info.get('formula_chars', 0)} 字 / {info.get('formula_lines', 0)} 行"
           + (f"；带 latex 的块 {latex[0]} → {latex[1]}" if latex[1] else ""))
     if info.get("surya_dpi") or info.get("surya_blocks"):
-        # Surya 整页 OCR 后端（见 pdf_parser/backend_surya.py）：块/图片/耗时
+        # Surya 整页 OCR 后端（见 pdf_parser/backend/backend_surya.py）：块/图片/耗时
         print(f"Surya 2   ：{info.get('surya_blocks', 0)} 块（插图 "
               f"{info.get('surya_images', 0)} 张），dpi {info.get('surya_dpi')}，"
               f"{info.get('surya_ms', 0)} ms")
     if info.get("unlimited_ocr_dpi") or info.get("unlimited_ocr_blocks"):
-        # Unlimited-OCR 整页 OCR 后端（见 pdf_parser/backend_unlimited_ocr.py）：
+        # Unlimited-OCR 整页 OCR 后端（见 pdf_parser/backend/backend_unlimited_ocr.py）：
         # route=local 本地推理服务 / route=online 百度智能云在线解析
         print(f"Unlimited ：{info.get('unlimited_ocr_blocks', 0)} 块（插图 "
               f"{info.get('unlimited_ocr_images', 0)} 张），route "

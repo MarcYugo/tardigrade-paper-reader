@@ -40,8 +40,16 @@ window.R2Nav = function (env) {
     syncTocActive();          // 目录里跟着高亮当前所在小节
   }
   function scrollToPage(i, mode) {
-    const r = pages[i].el.getBoundingClientRect();
-    window.scrollBy({ top: toScrollDelta(r.top - 70), behavior: mode === "instant" ? "auto" : "smooth" });
+    const go = () => {
+      const pg = pages[i];
+      if (!pg) return;
+      const r = pg.el.getBoundingClientRect();
+      window.scrollBy({ top: toScrollDelta(r.top - 70), behavior: mode === "instant" ? "auto" : "smooth" });
+    };
+    // 逐页加载：目标页可能还没建（只有占位页壳）。先滚过去让用户看到进度，
+    // 同时请求这一页的数据，建好后原地填进页壳（位置不变，不用再滚一次）。
+    if (env.ensurePage && pages[i] && !pages[i].loaded) env.ensurePage(i);
+    go();
   }
   /* ---- 页码跳转：底部“1 / 12 页”里直接输入页号回车 ---- */
   function jumpToPage(raw) {

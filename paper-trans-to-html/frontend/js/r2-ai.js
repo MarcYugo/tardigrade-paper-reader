@@ -56,10 +56,14 @@ window.R2Ai = function (env) {
 
   function positionAiCard() {
     const pager = $("pageInd");
-    const page = $("pages").querySelector(".page");
     const section = $("aiEnd");
-    if (!page || !section) return;
-    const zoom = page.offsetWidth ? page.getBoundingClientRect().width / page.offsetWidth : 1;
+    const pagesBox = $("pages");
+    if (!section || !pagesBox) return;
+    /* 页面还没渲染出来时没有 `.page`，量不出缩放比：先按 1 定位。
+       否则这里直接 return，卡片会一直停在 CSS 默认的「贴着右边」，
+       要等第一页渲染完才有机会跳回页码指示器旁边。 */
+    const page = pagesBox.querySelector(".page");
+    const zoom = page && page.offsetWidth ? page.getBoundingClientRect().width / page.offsetWidth : 1;
     const pagerRect = pager ? pager.getBoundingClientRect() : null;
     const viewW = document.documentElement.clientWidth;
     const viewH = document.documentElement.clientHeight;
@@ -73,17 +77,40 @@ window.R2Ai = function (env) {
       main.style.paddingBottom = pad ? pad + "px" : "";
     };
     if (aiCollapsed && pagerRect) {
-      /* 收起态只有一行标题：贴在页码指示器左侧，底部与它对齐 */
-      const gap = 10 * zoom;
+      /* 收起态：页码胶囊 + 这枚小胶囊当**一个整体**，横向以页面列中线（--page-cx）为轴居中。
+         目录（左 300px）/ 笔记抽屉（右 384px）打开时正文整体平移，两个胶囊要跟着页面走，
+         而不是死盯窗口中线（那样会与页面错位）。
+         口径：getBoundingClientRect() 是**布局坐标**（不乘 <html> zoom），clientWidth/Height 是
+         视觉坐标 → 先 /zoom 换回布局坐标，而 CSS 的 left/right/bottom 也是布局坐标。 */
+      /* 真正的整体缩放比：上面那个 zoom 是「页面渲染宽 / offsetWidth」，两者都是布局坐标
+         → 恒等于 1，量不出 <html> 的 zoom。这里直接读计算值（实测 1.2 就是 "1.2"）。 */
+      const zoomL = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
+      const vw = viewW / zoomL;                      // 布局坐标下的视口宽
+      const vh = viewH / zoomL;                      // 布局坐标下的视口高
+      const gap = 10;                                // 两个胶囊之间的间距（布局 px）
+      const pagerW = pagerRect.width;
+      const cx = typeof env.syncReadCenter === "function"
+        ? (env.syncReadCenter() || vw / 2)           // 顺手把 --page-cx 刷新到最新
+        : vw / 2;
+      /* 胶囊宽度是 fit-content：先给一个“整组居中后不超出左边界”的宽度上限，再量实际宽 */
       section.style.width = "auto";
-      section.style.maxWidth = Math.max(80, pagerRect.left - gap - 12) + "px";
       section.style.left = "auto";
-      section.style.right = Math.max(0, viewW - pagerRect.left / zoom + gap) + "px";
-      section.style.bottom = Math.max(0, viewH - pagerRect.bottom / zoom) + "px";
+      section.style.maxWidth = Math.max(120, 2 * (cx - 10) - gap - pagerW) + "px";
+      const inner = section.querySelector(".ai-in");
+      const chipW = inner ? inner.getBoundingClientRect().width : 0;
+      const groupW = chipW + gap + pagerW;
+      const groupLeft = Math.max(10, cx - groupW / 2);
+      /* 页码胶囊让开左侧小胶囊的一半（+半个间距），整组才能以页面中线对称 */
+      document.documentElement.style.setProperty("--pager-shift", ((chipW + gap) / 2).toFixed(2) + "px");
+      section.style.right = Math.max(0, vw - groupLeft - chipW) + "px";
+      section.style.bottom = Math.max(0, vh - pagerRect.bottom) + "px";
+      section.style.setProperty("--ai-chip-h", pagerRect.height + "px");
       syncAiReserve();
       return;
     }
+    document.documentElement.style.setProperty("--pager-shift", "0px");   // 展开：页码胶囊独占页面中线
     section.style.maxWidth = "";
+    section.style.removeProperty("--ai-chip-h");
     /* 展开态：宽度取窗口宽度的 95%，在“避开左右抽屉面板后的可用区间”里居中 */
     const cls = document.body.classList;
     const leftGap = (cls.contains("toc-open") ? 316 : 12) * zoom;
@@ -101,7 +128,7 @@ window.R2Ai = function (env) {
     syncAiReserve();
   }
 
-  function setAiCollapsed(collapsed, persist = true) {
+  function applyAiCollapsed(collapsed, persist) {
     aiCollapsed = !!collapsed;
     const body = $("aiBody");
     const toggle = $("aiToggle");
@@ -118,6 +145,109 @@ window.R2Ai = function (env) {
       catch (e) { /* storage unavailable */ }
     }
   }
+
+  /* ---------- 展开 / 收起的「液体泼出」动效 ----------
+     以标题按钮为中心，用 clip-path 圆形遮罩向外扩散（展开）或向内回吸（收起），
+     再叠一点过冲缩放和内容模糊淡入，看起来像液体从按钮处泼开、又被吸回去。
+     只动绘制层：位置仍由 positionAiCard() 算，动画结束把 clip-path / transform 全部撤掉；
+     收起要等动画跑完才真正切回小胶囊，否则面板会先"跳"没了再播放。 */
+  let aiSplashSink = null;   // 液体起点 = 收起时的回吸终点（视口坐标）
+  let aiSplashAnim = null;   // 正在跑的动画；非空时忽略重复点击
+  const aiMotionReduced = () =>
+    !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+  function aiSplashSetup(point) {
+    const inner = $("aiEnd") && $("aiEnd").querySelector(".ai-in");
+    if (!inner || typeof inner.animate !== "function") return null;
+    const r = inner.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    /* 圆心投到卡片内部（留 10px 余量），半径取到最远角落 + 16px，保证能完全露出 */
+    const ox = Math.min(Math.max(point.x - r.left, 10), r.width - 10);
+    const oy = Math.min(Math.max(point.y - r.top, 10), r.height - 10);
+    const radius = Math.hypot(Math.max(ox, r.width - ox), Math.max(oy, r.height - oy)) + 16;
+    return { inner, ox, oy, radius, at: ox + "px " + oy + "px" };
+  }
+
+  function aiSplashOpen(point) {
+    const g = aiSplashSetup(point);
+    if (!g) return;
+    const card = $("aiEnd");
+    const radiusCss = getComputedStyle(g.inner).borderRadius || "12px";
+    g.inner.getAnimations().forEach(a => a.cancel());   // 清掉上一次没跑完的（别把 clip-path 留在卡片上）
+    card.classList.add("ai-splashing");
+    const anim = g.inner.animate([
+      { clipPath: "circle(10px at " + g.at + ")",
+        transform: "translateY(12px) scale(.985)", opacity: .55, borderRadius: "24px" },
+      { clipPath: "circle(" + (g.radius * .74).toFixed(1) + "px at " + g.at + ")",
+        transform: "translateY(-2px) scale(1.004)", opacity: 1, offset: .62, borderRadius: "16px" },
+      { clipPath: "circle(" + g.radius.toFixed(1) + "px at " + g.at + ")",
+        transform: "none", opacity: 1, borderRadius: radiusCss }
+    ], { duration: 480, easing: "cubic-bezier(.25, .12, .25, 1)" });
+    aiSplashAnim = anim;
+    let cleared = false;
+    const clear = () => {
+      if (cleared) return;
+      cleared = true;
+      if (aiSplashAnim === anim) aiSplashAnim = null;
+      card.classList.remove("ai-splashing");
+      /* 必须 cancel：只摘 class 的话动画效果还挂在元素上，角落会被圆形遮罩一直切着 */
+      try { anim.cancel(); } catch (e) { /* ignore */ }
+    };
+    anim.addEventListener("finish", clear);
+    anim.addEventListener("cancel", clear);
+    setTimeout(clear, 900);            // 兜底：动画被暂停 / 事件没来也要把 clip-path 撤干净
+  }
+
+  function aiSplashClose(point, done) {
+    const g = aiSplashSetup(point);
+    if (!g) { done(); return; }
+    const card = $("aiEnd");
+    const radiusCss = getComputedStyle(g.inner).borderRadius || "12px";
+    g.inner.getAnimations().forEach(a => a.cancel());
+    card.classList.add("ai-splashing", "ai-splashing-out");
+    const anim = g.inner.animate([
+      { clipPath: "circle(" + g.radius.toFixed(1) + "px at " + g.at + ")",
+        transform: "none", opacity: 1, borderRadius: radiusCss },
+      { clipPath: "circle(" + (g.radius * .48).toFixed(1) + "px at " + g.at + ")",
+        opacity: 1, offset: .42, borderRadius: "16px" },
+      { clipPath: "circle(10px at " + g.at + ")",
+        transform: "translateY(8px) scale(.985)", opacity: .5, borderRadius: "24px" }
+    ], { duration: 360, easing: "cubic-bezier(.45, 0, .7, .5)" });
+    aiSplashAnim = anim;
+    let finished = false;
+    const end = () => {
+      if (finished) return;
+      finished = true;
+      if (aiSplashAnim === anim) aiSplashAnim = null;
+      card.classList.remove("ai-splashing", "ai-splashing-out");
+      try { anim.cancel(); } catch (e) { /* ignore */ }
+      done();
+    };
+    anim.addEventListener("finish", end);
+    anim.addEventListener("cancel", end);
+    setTimeout(end, 600);              // 兜底：动画被暂停 / 事件没来也照样收起来
+  }
+
+  function setAiCollapsed(collapsed, persist = true) {
+    collapsed = !!collapsed;
+    if (aiSplashAnim) return;                       // 动效还没跑完，忽略连点，避免两段动画叠在一起
+    if (collapsed === aiCollapsed) { applyAiCollapsed(collapsed, persist); return; }
+    if (aiMotionReduced()) { applyAiCollapsed(collapsed, persist); return; }
+
+    const rect = $("aiToggle").getBoundingClientRect();
+    const toggleCenter = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    if (!collapsed) {
+      aiSplashSink = toggleCenter;                  // 从小胶囊的位置泼出去
+      applyAiCollapsed(false, persist);             // 先摆好最终布局，再在这个盒子上做遮罩动画
+      aiSplashOpen(toggleCenter);
+      return;
+    }
+    /* 收起：先按上一次展开时记下的胶囊中心回吸，动画跑完再真正切到收起态 */
+    const inner = $("aiEnd").querySelector(".ai-in");
+    const r = inner.getBoundingClientRect();
+    const sink = aiSplashSink || { x: r.left + 24, y: r.bottom - 16 };
+    aiSplashClose(sink, () => applyAiCollapsed(true, persist));
+  }
   setAiCollapsed(aiCollapsed, false);
   window.addEventListener("resize", positionAiCard);
   if (window.ResizeObserver) {
@@ -128,7 +258,10 @@ window.R2Ai = function (env) {
       pageResizeObserver.observe($("pageInd"));
     };
     observePage();
-    new MutationObserver(observePage).observe($("pages"), { childList: true });
+    /* 页面（重新）渲染出来以后缩放比才真正可量：跟着重新定位一次，
+       别让卡片按「还没页面」时的估算位置停着 */
+    new MutationObserver(() => { observePage(); positionAiCard(); })
+      .observe($("pages"), { childList: true });
     /* 目录 / 笔记抽屉开合（body 上的 toc-open / side-open）会改变可用宽度：
        先按新宽度重新定位，再重新判断两栏还是堆叠，最后按新高度算底部预留 */
     new MutationObserver(() => {
@@ -241,10 +374,12 @@ window.R2Ai = function (env) {
   }
   function aiMdMath(host, text) {
     if (!renderInlineMath || !window.R2Md || !window.R2Md.hasMath(text)) return;
-    if (!katexReady || katexReady()) {          // 已就绪（或没给判断函数）：直接就地渲染
-      try { renderInlineMath(host); } catch (e) { /* ignore */ }
-      return;
-    }
+    // AI 面板里的 $…$ 是模型按提示写的，走 loose：否则 `$h=8$`、`$d_k$` 这种
+    // 不含 `\ _ ^ { }` 的会被「防货币」启发式跳过，同一条消息里有的渲染有的不渲染。
+    const paint = () => {
+      try { renderInlineMath(host, { loose: true }); } catch (e) { /* ignore */ }
+    };
+    if (!katexReady || katexReady()) { paint(); return; }
     if (!ensureKatex || aiMathTried) return;    // 只懒加载一次；失败也不反复试
     aiMathTried = true;
     ensureKatex().then(ok => {
@@ -585,8 +720,16 @@ window.R2Ai = function (env) {
       return holder;
     }
     const tx = el("div", "ai-txt");
-    if (String(text || "").trim()) aiMd(tx, text);
-    else tx.textContent = "（空）";
+    const raw = String(text || "");
+    if (!raw.trim()) {
+      tx.textContent = "（空）";
+    } else {
+      // 整条只有一个「- xxx」时：外层 li 已有圆点，去掉标记按行内渲染，免得出现双圆点 / 嵌套列表
+      const lines = raw.split("\n").filter(l => l.trim());
+      const bullet = raw.match(/^\s*[-*+]\s+([\s\S]*)$/);
+      if (lines.length === 1 && bullet) aiMdInline(tx, bullet[1]);
+      else aiMd(tx, raw);
+    }
     holder.appendChild(tx);
     if (canWrite() && !aiBusy() && !aiSaving) holder.appendChild(aiTools(kind, a, b, onDel));
     return holder;

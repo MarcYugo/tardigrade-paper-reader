@@ -3,10 +3,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from backend.ai_read import (add_summary_item, locate_page, locate_text_block,
-                             notes_fingerprint, reply_agent_stream)
+from backend.agents.ai_read_agent import (add_summary_item, locate_page,
+                                          locate_text_block, reply_agent_stream)
+from backend.ai_read import notes_fingerprint
 from backend.records import Store, anno_with_authors
-from backend.translate import Translator, probe_llm
+from backend.agents.llm import probe_llm
+from backend.translate import Translator
 
 
 class AiAgentNotesTest(unittest.TestCase):
@@ -258,7 +260,7 @@ class AiAgentNotesTest(unittest.TestCase):
             requests.append(body)
             return {"choices": [{"message": {"content": "Done"}}]}
 
-        translator._post_chat_payload = fake_post
+        translator.llm.post_chat_payload = fake_post
         translator.chat_completion("system", [
             {"role": "user", "content": "save a note"},
             {"role": "assistant", "content": None, "tool_calls": [
@@ -286,8 +288,8 @@ class AiAgentNotesTest(unittest.TestCase):
             def json():
                 return {"choices": [{"message": {"content": "ok"}}]}
 
-        with patch("backend.translate.httpx.post", return_value=FakeResponse()) as post:
-            translator._post_chat_payload({"model": "test"})
+        with patch("backend.agents.llm.httpx.post", return_value=FakeResponse()) as post:
+            translator.llm.post_chat_payload({"model": "test"})
 
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"],
                          "Bearer test-key")
@@ -296,7 +298,7 @@ class AiAgentNotesTest(unittest.TestCase):
         class FakeResponse:
             status_code = 200
 
-        with patch("backend.translate.httpx.post", return_value=FakeResponse()) as post:
+        with patch("backend.agents.llm.httpx.post", return_value=FakeResponse()) as post:
             self.assertIn("连接成功", probe_llm("https://llm.example", "test-key", "test-model"))
 
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"],
@@ -324,7 +326,7 @@ class AiAgentNotesTest(unittest.TestCase):
             stream_calls.append(kwargs)
             return FakeResponse()
 
-        with patch("backend.translate.httpx.stream", side_effect=fake_stream):
+        with patch("backend.agents.llm.httpx.stream", side_effect=fake_stream):
             events = list(translator.chat_completion_stream(
                 "system", [{"role": "user", "content": "save"}], tools=[{"type": "function"}]))
 

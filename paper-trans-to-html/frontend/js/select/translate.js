@@ -154,6 +154,8 @@ window.R2Trans = function (env) {
   });
   $("btnPageTrans").addEventListener("click", async () => {
     const pi = env.currentPageIndex();
+    // 逐页加载：当前页可能只有页壳 —— 先把这一页取回来，否则会误报“没有可翻译段落”
+    if (env.ensurePage && env.pages[pi] && !env.pages[pi].loaded) await env.ensurePage(pi);
     const items = env.pages[pi] ? env.pages[pi].items.filter(i => i.kind === "blk") : [];
     env.enterParaTransMode();                       // 与“所选句译文”互斥
     try {
@@ -173,6 +175,17 @@ window.R2Trans = function (env) {
     btn.disabled = true;
     const prog = $("transProgress"), bar = $("tpBar"), txt = $("tpText");
     prog.hidden = false;
+    // 逐页加载：“全文翻译”要按**整篇**收集段落，所以先把还没建出来的页补齐
+    // （已加载的页不重复取；每补一页都会顺手把已缓存的译文渲染出来）。
+    if (env.ensurePage) {
+      for (let pi = 0; pi < env.pages.length; pi++) {
+        if (cancelAll) break;
+        if (!env.pages[pi].loaded) {
+          txt.textContent = "正在加载全文… 第 " + (pi + 1) + " / " + env.pages.length + " 页";
+          await env.ensurePage(pi);
+        }
+      }
+    }
     const all = [];
     // 表格/纯公式块没有可翻译正文（text 为空）：别把空串送去翻译
     env.pages.forEach(p => p.items.forEach(it => {

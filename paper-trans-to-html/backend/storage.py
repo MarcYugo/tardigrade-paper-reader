@@ -62,9 +62,9 @@ def build(data_dir: Path | str, config_file: Path | str | None = None) -> tuple:
     }
     if backend_name == "json" and want != "json":
         warning = (
-            "未连接 MongoDB，已回退到本地 JSON 存储。"
-            "启动 mongo_configuration/docker-compose.yml 后可点“重试连接”切回数据库。"
-            f"原因：{mongo.error or '未知'}")
+            "未连接 MongoDB，已退回本地 JSON。"
+            f"原因：{mongo.error or '未知'}。"
+            "启动 mongo_configuration 后点“重试连接”即可切回数据库。")
         # 认证失败很常见（账号没建出来/口令不符），把“怎么修”一并写进日志与前端提示
         hint = auth_hint(mongo.error, mongo.cfg)
         info["warning"] = f"{warning} {hint}" if hint else warning
