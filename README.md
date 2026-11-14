@@ -34,6 +34,9 @@
 
 8. [26/11/9] a. agent功能拆分 b. 增加笔记导出功能（agent分析总结；校验参考文献需要到设置里配置检索api key） c. ai辅助阅读形式更改为底部胶囊卡片（打开收起方式详见功能5）。 
 
+9. [26/11/12] 前端页面显示和元素排布调整，阅读界面缩放改为5%间隔的滑轮缩放/拖动缩放。
+
+ 
 ## Pdf 解析模块
 
 把论文 PDF 解析成**可还原原版式的数据**（文字块 + 插图，保留原坐标、字号、字体）。提供三种解析方式，输出结构一致，前端无需改动。
@@ -84,19 +87,23 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 ### 1. 多用户和设置
 
-<img src="./function_display/1.log-in-switch-out.gif" width=400px><img src="./function_display/2.config.gif" width=400px>
+<img src="./function_display/1.log-in-switch-out.gif" width=400px>
+<img src="./function_display/2.config.gif" width=400px>
 
 ### 3. 论文载入和删除、标注、笔记和翻译
 
-<img src="./function_display/3.paper-load-del.gif" width=400px><img src="./function_display/4.highlight-mark-translate.gif" width=400px>
+<img src="./function_display/3.paper-load-del.gif" width=400px>
+<img src="./function_display/4.highlight-mark-translate.gif" width=400px>
 
 ### 4. 笔记整理和AI辅助、笔记共享
 
-<img src="./function_display/5.note-ai-assitant.gif" width=400px><img src="./function_display/6.note-share.gif" width=400px>
+<img src="./function_display/5.note-ai-assitant.gif" width=400px>
+<img src="./function_display/6.note-share.gif" width=400px>
 
 ### 5. 笔记和内容定位、笔记添加
 
-<img src="./function_display/7.agent-location.gif" width=400px><img src="./function_display/8.agent-write-notes.gif" width=400px>
+<img src="./function_display/7.agent-location.gif" width=400px>
+<img src="./function_display/8.agent-write-notes.gif" width=400px>
 
 ## TODO
 

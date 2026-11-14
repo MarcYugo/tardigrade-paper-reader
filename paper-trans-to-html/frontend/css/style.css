@@ -41,6 +41,11 @@
   /* 顶栏实际高度：顶栏会换行撑高，由 common.js 的 syncTopbarHeight() 实测写入。
      左目录 / 右笔记栏等 position: fixed 面板都用它当 top，别写死 54px（会钻到顶栏底下）。 */
   --topbar-h: 54px;
+  /* 底部两枚胶囊（页码 #pageInd / 收起的 AI 小胶囊）的**统一高度**。
+     两枚必须同高、同底边，才在视觉上成一组；高度一律走这个变量，
+     不要再用内容撑开（line-height: normal 的行盒在不同浏览器/字体下差 1~3px），
+     也不要用 JS 量出来再写回（getBoundingClientRect 的坐标口径各浏览器不一致）。 */
+  --chip-h: 30px;
   font-size: 15px;
 }
 
@@ -116,6 +121,27 @@ a { color: var(--accent); text-decoration: none; }
 }
 .brand { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; color: var(--ink); white-space: nowrap; }
 .brand .logo { width: 26px; height: 26px; flex: none; display: block; border-radius: 6px; object-fit: contain; }
+/* ---------- 阅读页顶栏：固定两行（.topbar-2row） ----------
+   ① 论文列表 + 论文名（+ 分享角标）；② 操作/设置区（按钮组 + 用户区）。
+   以前全挤在一行：.top-actions 内容一多、又不收缩，标题（flex:1 min-width:0）
+   就会被压到只剩几十 px（显示成「atten…」）。拆成两行后标题独占一整行。 */
+.topbar-2row {
+  flex-direction: column; align-items: stretch; gap: 6px;
+  /* ⚠️ 必须关掉换行：column + wrap 时每条 flex line 的交叉尺寸取「内容宽度」
+     （= 一整行按钮的 max-content），align-items:stretch 就按这个撑，
+     两行都会撑到 1000px+ 把整页顶出横向滚动条。nowrap 时 line = 容器宽。 */
+  flex-wrap: nowrap;
+  /* 顶栏宽度**定死**：下限 = 设置栏排成一行的自然宽度（≈1146px 布局 px）。
+     它不随窗口宽度变，只随 <html> zoom 整体放大/缩小；窗口比它窄就和正文一样横滚。
+     （曾经让设置栏回行，顶栏高度会随宽度在 80~120px 之间跳 → 目录/笔记面板
+     的 top: var(--topbar-h)、AI 卡片与滚动锚点会跟着错位，所以改成不回行。） */
+  min-width: max-content;
+}
+/* 标题行不参与“定死宽度”的撑大：万一标题很长，也不会把整个顶栏拉宽 */
+.tb-titlebar { contain: inline-size; }
+.tb-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+/* 工具行：设置栏宽度 = 内容自然宽度（定死，不随窗口变） */
+.tb-toolbar > .top-actions { flex: none; min-width: 0; order: 0; }
 .doc-title {
   font-size: 15px; font-weight: 600; margin: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
@@ -132,7 +158,80 @@ a { color: var(--accent); text-decoration: none; }
   background: var(--card); border: 1px solid var(--accent); border-radius: 6px;
   padding: 1px 6px; outline: none;
 }
-.top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.top-actions {
+  display: flex; align-items: center; gap: 8px;
+  /* 阅读页里它在工具的**第二行**（见 .topbar-2row / .tb-toolbar），和用户区同一行。
+     **永不回行**：宽度就是所有按钮排成一行的自然宽，整体随 <html> zoom 缩放。
+     回行会让顶栏在 80~120px 之间变高，目录/笔记面板（top: var(--topbar-h)）、
+     AI 卡片、滚动锚点都会跟着错位 —— 所以宁可让窗口横滚，也不折行。 */
+  flex-wrap: nowrap; min-width: 0;
+}
+.top-actions > * { flex: none; }
+/* 子项一律不收缩：不写 flex:none 的话，浏览器会把「显示译文」这类带文字的
+   .chk 压窄，里面的字折成两行，行高会从 33px 涨到 70px。 */
+/* 缩放：**上排数值、下排滑轮条**（80% ~ 150%，每格 5%，带刻度）。
+   整组一起走，不会被拆开。原生 range 的轨道 / 滑块要分别写 WebKit 与 Firefox 两套伪元素。
+   高度 ≈ 13(数值) + 18(滑杆) + 3(刻度) = 34px，比同排按钮（30px）略高一点点，
+   顶栏高由 common.js 的 ResizeObserver 实测写进 --topbar-h，面板会自动跟着下移。 */
+.zoom-group {
+  display: inline-flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0; width: 118px;
+}
+/* 数值（上排）：等宽数字，宽度由整组固定，滑动时不会左右跳 */
+.zoom-val {
+  font-size: 12px; line-height: 13px; color: var(--mut);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.zoom-range {
+  /* --zoom-fill：滑块左侧「已滑过」的比例，refreshZoomLabel() 每次更新时写入 */
+  --zoom-fill: 29%;
+  --zoom-thumb: 12px;              /* 滑块宽 —— 刻度条要按它左右各让出半个滑块 */
+  width: 118px; height: 18px; margin: 0; padding: 0;
+  appearance: none; -webkit-appearance: none;
+  background: transparent; cursor: pointer;
+}
+.zoom-range:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+/* 轨道：WebKit 没有「已滑过」伪元素，用渐变切一刀；Firefox 用 ::-moz-range-progress */
+.zoom-range::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px;
+  background: linear-gradient(to right,
+    var(--accent) var(--zoom-fill), var(--line) var(--zoom-fill));
+}
+.zoom-range::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line); }
+.zoom-range::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent); }
+/* 滑块 = **钝角矩形**（12 × 16，圆角 3）：竖直的小扁块，压在轨道上比圆点更好点。
+   Firefox 的 thumb 尺寸不含 border，所以那边不写 border，靠 box-shadow 出层次 */
+.zoom-range::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: var(--zoom-thumb); height: 16px; margin-top: -6px; border-radius: 3px;
+  background: var(--accent);
+  box-shadow: 0 1px 3px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.22);
+}
+.zoom-range::-moz-range-thumb {
+  width: var(--zoom-thumb); height: 16px; border: 0; border-radius: 3px;
+  background: var(--accent);
+  box-shadow: 0 1px 3px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.22);
+}
+.zoom-range:hover::-webkit-slider-thumb,
+.zoom-range:active::-webkit-slider-thumb { filter: brightness(1.15); }
+.zoom-range:hover::-moz-range-thumb,
+.zoom-range:active::-moz-range-thumb { filter: brightness(1.15); }
+/* 刻度：15 根（80/85/…/150）。
+   滑块行程两端各内缩半个滑块宽（6px），所以刻度条比轨道窄 12px 并居中，刻度才对得上滑块中心。
+   ⚠️ 周期必须写**像素**（106px / 14 格 = 7.5714px）。若写成 `calc(100% / 14)`，一旦再配
+   background-size 平铺，百分号就变成「每块瓦片内部」的长度 → 每 0.5px 一根，糊成一条实线。
+   三层背景：① 最右那根（平铺会在右边缘被裁掉，单独钉在右边）
+             ② 100% 那一根用主色加重  ③ 其余 14 根 */
+.zoom-ticks {
+  width: 106px; height: 3px;
+  background-image:
+    linear-gradient(to right, var(--line-hover) 0 1px, transparent 1px),
+    linear-gradient(to right, var(--accent) 0 1px, transparent 1px),
+    repeating-linear-gradient(to right, var(--line-hover) 0 1px, transparent 1px 7.5714px);
+  background-repeat: no-repeat, no-repeat, repeat-x;
+  background-size: 1px 100%, 1px 100%, 100% 100%;
+  background-position: 100% 0, 28.6% 0, 0 0;
+}
 
 /* ---------- 按钮 ---------- */
 .btn {
@@ -695,7 +794,9 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 .notes-drawer {
   position: fixed; top: var(--topbar-h); right: 0; bottom: 0; width: 330px; z-index: 65;
   background: var(--card); border-left: 1px solid var(--line); box-shadow: -8px 0 30px rgba(0,0,0,.18);
-  transform: translateX(100%); transition: .25s; display: flex; flex-direction: column;
+  /* 只过渡 transform：以前写的是 transition: .25s（= all），顶栏高度一变 top 也会被
+     动画拉过去，抽屉就像从顶栏下方“浮”出来一道缝；也避免与 top 的重算互相打架 */
+  transform: translateX(100%); transition: transform .25s; display: flex; flex-direction: column;
 }
 .notes-drawer.open { transform: none; }
 .drawer-head { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); }
@@ -710,8 +811,11 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 .note-item .row button { border: 0; background: none; color: var(--accent); cursor: pointer; font-size: 12px; }
 
 /* toast */
+/* 底部提示抬到两枚胶囊（页码 #pageInd / AI 小胶囊）之上：
+   胶囊底距 14px、高 --chip-h（30px），顶部在 44px；这里再留 10px 间隙 */
 #toast {
-  position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%) translateY(20px);
+  position: fixed; left: 50%; bottom: calc(14px + var(--chip-h, 30px) + 10px);
+  transform: translateX(-50%) translateY(20px);
   background: #26303f; color: #fff; padding: 10px 18px; border-radius: 10px; font-size: 13px;
   opacity: 0; pointer-events: none; transition: .25s; z-index: 100; box-shadow: 0 10px 30px rgba(0,0,0,.3);
 }
@@ -719,13 +823,18 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
 
 .pageind {
   position: fixed; bottom: 14px;
-  /* 横向锚点 = **页面列的中线**（--page-cx，layout.js::syncReadCenter 实测写入），
-     再加上让开左侧 AI 小胶囊的一半宽度（--pager-shift，r2-ai.js 写入）。
-     目录（左 300px）/ 笔记抽屉（右 384px）打开时正文整体平移，中线也跟着变，
-     页码胶囊与 AI 小胶囊就会跟着页面一起右/左移，而不是死盯窗口中线。 */
+  /* 横向锚点 = **页面卡片（.page）的中线**（--page-cx，layout.js::syncReadCenter 实测写入）。
+     注意它和左侧 AI 小胶囊是**一整个组**：组中心对齐这条线，所以下面还要加
+     --pager-shift（组内让开左侧小胶囊的一半宽度），页码自己不是中心。 */
   left: calc(var(--page-cx, 50%) + var(--pager-shift, 0px));
   transform: translateX(-50%); z-index: 55;
-  background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 5px 14px;
+  /* width 写 max-content：fixed + left 超出布局视口时（放大到页面比视口宽），
+     shrink-to-fit 会把胶囊压成 min-content（实测 150% 时 85 → 70px，两枚胶囊间距跟着变大） */
+  width: max-content;
+  background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 0 14px;
+  /* 高度写死为 --chip-h（与 AI 小胶囊同源），不再靠 5px 上下内边距 + 行盒撑开：
+     行高是 line-height: normal，随字体栈/浏览器变化，量出来各浏览器差 1~3px */
+  height: var(--chip-h);
   font-size: 12.5px; color: var(--mut); box-shadow: var(--shadow);
   display: flex; align-items: center; gap: 3px;
 }
@@ -736,6 +845,9 @@ html.dark .fbox.failed > .katex-fit { color: #d7a95b; }
   width: auto; min-width: 1.3em; max-width: 5em; field-sizing: content;
   padding: 0 2px; border: 0; background: transparent; outline: none;
   font: inherit; color: var(--ink); text-align: center; cursor: text;
+  /* input 的行盒是各浏览器差异最大的一处（Chrome 17.5px / Firefox、Safari 各不相同），
+     写死高度与行高，免得它把胶囊撑高或撑破固定高度 */
+  height: 1.4em; line-height: 1.4;
   border-bottom: 1px dashed transparent; border-radius: 0;
   -moz-appearance: textfield;
 }
@@ -904,6 +1016,9 @@ body.side-open .reader-main { padding-right: 384px; }
   background: var(--card); border: 1px solid var(--line);
   border-radius: var(--radius); box-shadow: var(--shadow);
 }
+/* 展开态底边：贴在页码胶囊上方 8px（= 胶囊高 + 距底 14px + 8px），全由 CSS 算。
+   以前由 positionAiCard() 写 `vh - pagerRect.top + 8`，同样依赖 rect/zoom 的坐标口径。 */
+.ai-end:not(.ai-collapsed) { bottom: calc(var(--chip-h) + 22px); }
 body.toc-open .ai-end { left: 316px; right: 16px; width: auto; }
 body.side-open .ai-end { left: 16px; right: 346px; width: auto; }
 body.toc-open.side-open .ai-end { left: 316px; right: 346px; }
@@ -954,12 +1069,15 @@ body.toc-open.side-open .ai-end.ai-collapsed {
 .ai-body[hidden] { display: none !important; }
 .ai-end.ai-collapsed #aiRegen,
 .ai-end.ai-collapsed #aiClear { display: none; }
-.ai-end.ai-collapsed { bottom: 52px; }
+/* 底边与页码胶囊用**同一条 CSS 基准**（视口底 + 14px），不要再由 JS 按
+   rect 反推 bottom：那套换算依赖「rect 是布局坐标、zoom 能从计算值读回」，
+   只对 Chrome 成立，Firefox / Safari 上有缩放时底边会算歪。 */
+.ai-end.ai-collapsed { bottom: 14px; }
 /* 收起时只剩一行标题（+ 右侧按钮），卡片宽度按内容收缩，不再撑满整页；
-   高度跟页码卡片（#pageInd）齐平 —— 实测值由 positionAiCard() 写进 --ai-chip-h */
+   高度与页码卡片（#pageInd）同源，都取 --chip-h，不再依赖 JS 实测快照 */
 .ai-end.ai-collapsed .ai-in {
   width: fit-content; max-width: 100%; padding: 0 12px;
-  height: var(--ai-chip-h, 30px); justify-content: center;
+  height: var(--chip-h); justify-content: center;
 }
 .ai-end.ai-collapsed .ai-head { margin-bottom: 0; flex-wrap: nowrap; }
 .ai-end.ai-collapsed .ai-head .grow { display: none; }
@@ -998,10 +1116,11 @@ body.toc-open.side-open .ai-end.ai-collapsed {
   body.toc-open .ai-end,
   body.side-open .ai-end,
   body.toc-open.side-open .ai-end { left: 12px; right: 12px; }
-  .ai-end.ai-collapsed { bottom: 52px; }
+  /* 收起态底边跟页码胶囊一样是「视口底 + 14px」，别在这里又改回 52px（会与页码错开） */
+  .ai-end.ai-collapsed { bottom: 14px; }
   body.toc-open .ai-end.ai-collapsed,
   body.side-open .ai-end.ai-collapsed,
-  body.toc-open.side-open .ai-end.ai-collapsed { bottom: 52px; }
+  body.toc-open.side-open .ai-end.ai-collapsed { bottom: 14px; }
 }
 @media (min-width: 721px) and (max-width: 980px) {
   body.toc-open .ai-end,
@@ -1247,7 +1366,11 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
    登录 / 认证 / LLM 设置
    ============================================================ */
 /* ---------- 顶栏用户区 ---------- */
-.user-wrap { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/* margin-left:auto：首页/登录页里它是 .topbar 的直接子项，靠它顶到自己那一行最右。
+   阅读页（r2 顶栏）里用户区被挂进 .top-actions，和按钮同一条折行流 → 要清掉 auto，
+   否则它会主动“抢到”当前行的最右端（挤不下时也不跟着按钮一起回行）。 */
+.user-wrap { display: flex; align-items: center; gap: 6px; margin-left: auto; order: 3; }
+.top-actions > .user-wrap { margin-left: 0; order: 0; flex: none; }
 .user-wrap .btn { padding: 5px 9px; }
 .user-chip {
   display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px 4px 4px;
@@ -1261,6 +1384,14 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 }
 .user-chip .uname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 900px) { .user-wrap .hide-sm { display: none; } .user-chip .uname { display: none; } }
+/* 极窄屏保住「顶栏两行」：第一行必须放得下「返回 + 标题 + 用户区」。
+   这里把顶栏左右留白、顶栏列间距、用户区内部间距一起收紧（放在基础规则之后，
+   否则会被上面的 .user-wrap 规则盖掉），窄到 330px 左右仍只有两行。 */
+@media (max-width: 480px) {
+  .topbar { padding: 7px 12px; gap: 8px 6px; }
+  .user-wrap { gap: 4px; }
+  .user-wrap .btn { padding: 4px 7px; }
+}
 
 /* ---------- 表单控件（登录页 / 设置弹窗共用） ---------- */
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }

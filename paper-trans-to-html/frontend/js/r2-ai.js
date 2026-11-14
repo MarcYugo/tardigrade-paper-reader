@@ -59,72 +59,86 @@ window.R2Ai = function (env) {
     const section = $("aiEnd");
     const pagesBox = $("pages");
     if (!section || !pagesBox) return;
-    /* 页面还没渲染出来时没有 `.page`，量不出缩放比：先按 1 定位。
-       否则这里直接 return，卡片会一直停在 CSS 默认的「贴着右边」，
-       要等第一页渲染完才有机会跳回页码指示器旁边。 */
-    const page = pagesBox.querySelector(".page");
-    const zoom = page && page.offsetWidth ? page.getBoundingClientRect().width / page.offsetWidth : 1;
+    /* ---- 坐标口径（这里踩过两次，务必先看）----
+       本函数写的 left / right / maxWidth / width / padding-bottom 都是 **CSS 长度**，
+       所以量到的一切必须先换成 CSS 长度再算、再写。
+       · Chrome：getBoundingClientRect() 不含 <html> 的 zoom，数字本来就≈CSS 长度
+         （clientWidth / clientHeight 反倒是含 zoom 的视觉值，以前要 /zoom）；
+       · Firefox / Safari：rect **会**把 zoom 乘进去 —— 拿它当 CSS 长度用会再被乘一次。
+       所以这里不猜引擎，统一走 r2-view.js::unit()：k = 「1 个 CSS 长度单位 = 多少 rect 单位」，
+       视口宽高 vw / vh 也由它按 CSS 长度给出。凡 rect 量值一律 /k。
+       ⚠️ 别再退回 `clientWidth / getComputedStyle(html).zoom`：zoom 计算值在 Firefox/Safari
+       读不到，rect 口径又不同，两个错叠在一起（150% 时两枚胶囊与页面中线彻底对不上）。 */
+    const u = typeof env.unit === "function" ? env.unit() : null;
+    const K = u && u.k > 0 ? u.k : 1;                                   // rect 单位 → CSS 长度
+    const vw = u && u.vw ? u.vw : document.documentElement.clientWidth;  // 视口宽（CSS 长度）
+    const vh = u && u.vh ? u.vh : window.innerHeight;                    // 视口高（CSS 长度）
     const pagerRect = pager ? pager.getBoundingClientRect() : null;
-    const viewW = document.documentElement.clientWidth;
-    const viewH = document.documentElement.clientHeight;
     /* 阅读区底部给卡片留位置：展开时留出卡片高度 + 12px，
        文末最后一段就能滚到卡片上方（到底部时不会被浮层盖住）；收起时恢复默认 90px。 */
     const syncAiReserve = () => {
       const main = $("readerMain");
       if (!main) return;
-      const top = section.getBoundingClientRect().top;
-      const pad = aiCollapsed ? 0 : Math.max(0, Math.round(viewH - top / zoom) + 12);
+      const top = section.getBoundingClientRect().top / K;   // CSS 长度
+      const pad = aiCollapsed ? 0 : Math.max(0, Math.round(vh - top) + 12);
       main.style.paddingBottom = pad ? pad + "px" : "";
     };
     if (aiCollapsed && pagerRect) {
-      /* 收起态：页码胶囊 + 这枚小胶囊当**一个整体**，横向以页面列中线（--page-cx）为轴居中。
+      /* 收起态：页码胶囊 + 这枚小胶囊当**一个整体**，整组的水平中心以页面卡片
+         （.page）的中线（--page-cx）为轴居中——不是各自对中线，也不是容器中线。
          目录（左 300px）/ 笔记抽屉（右 384px）打开时正文整体平移，两个胶囊要跟着页面走，
-         而不是死盯窗口中线（那样会与页面错位）。
-         口径：getBoundingClientRect() 是**布局坐标**（不乘 <html> zoom），clientWidth/Height 是
-         视觉坐标 → 先 /zoom 换回布局坐标，而 CSS 的 left/right/bottom 也是布局坐标。 */
-      /* 真正的整体缩放比：上面那个 zoom 是「页面渲染宽 / offsetWidth」，两者都是布局坐标
-         → 恒等于 1，量不出 <html> 的 zoom。这里直接读计算值（实测 1.2 就是 "1.2"）。 */
-      const zoomL = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
-      const vw = viewW / zoomL;                      // 布局坐标下的视口宽
-      const vh = viewH / zoomL;                      // 布局坐标下的视口高
-      const gap = 10;                                // 两个胶囊之间的间距（布局 px）
-      const pagerW = pagerRect.width;
+         而不是死盯窗口中线（那样会与页面错位）。 */
+      const gap = 10;                                // 两个胶囊之间的间距（CSS 长度）
+      const pagerW = pagerRect.width / K;
       const cx = typeof env.syncReadCenter === "function"
-        ? (env.syncReadCenter() || vw / 2)           // 顺手把 --page-cx 刷新到最新
+        ? (env.syncReadCenter() || vw / 2)           // 顺手把 --page-cx 刷新到最新（已是 CSS 长度）
         : vw / 2;
-      /* 胶囊宽度是 fit-content：先给一个“整组居中后不超出左边界”的宽度上限，再量实际宽 */
-      section.style.width = "auto";
-      section.style.left = "auto";
+      /* 胶囊宽度是 fit-content：
+         ① 先给一个“整组居中后不超出左边界”的宽度上限；
+         ② 宽度写 max-content —— 否则放大到页面比布局视口还宽时，`left` 会超出可用空间，
+            浏览器按 shrink-to-fit 把胶囊压成 min-content（实测 150% 时页码胶囊 85→70px）。
+         宽度不再受 left 影响，也就不存在“先有左边缘还是先有宽度”的循环。 */
+      section.style.left = "0px";
+      section.style.right = "auto";
+      section.style.width = "max-content";
       section.style.maxWidth = Math.max(120, 2 * (cx - 10) - gap - pagerW) + "px";
       const inner = section.querySelector(".ai-in");
-      const chipW = inner ? inner.getBoundingClientRect().width : 0;
+      const chipW = inner ? inner.getBoundingClientRect().width / K : 0;
       const groupW = chipW + gap + pagerW;
       const groupLeft = Math.max(10, cx - groupW / 2);
       /* 页码胶囊让开左侧小胶囊的一半（+半个间距），整组才能以页面中线对称 */
       document.documentElement.style.setProperty("--pager-shift", ((chipW + gap) / 2).toFixed(2) + "px");
-      section.style.right = Math.max(0, vw - groupLeft - chipW) + "px";
-      section.style.bottom = Math.max(0, vh - pagerRect.bottom) + "px";
-      section.style.setProperty("--ai-chip-h", pagerRect.height + "px");
+      /* 小胶囊用 left 定位（不用 right）：页面比视口宽、横向滚出去以后，
+         「页面中线」可能已经超出布局视口右侧 —— 那时 right 会算出负数，被 max(0,…) 夹成 0，
+         整组就被糊在视口右边缘（实测 200% 时整组偏左 84px）。left 可以让它跟着页面跑到视口外。 */
+      section.style.left = groupLeft + "px";
+      /* 纵向**不再在这里算**：底边与高度都交给 CSS（.ai-end.ai-collapsed 的 bottom: 14px
+         与 .ai-in 的 height: var(--chip-h)）。以前写的是
+             bottom = vh - pagerRect.bottom;  height = pagerRect.height
+         这两行要求「rect 是布局坐标 + getComputedStyle(html).zoom 能读出真实缩放比」，
+         这个口径只有 Chrome 成立：Firefox / Safari 的 rect 会把 zoom 乘进去、计算值也可能
+         读不到缩放比 → 两枚胶囊在有缩放时底边、高度都错位。这里只清掉展开态残留的内联值。 */
+      section.style.bottom = "";
       syncAiReserve();
       return;
     }
     document.documentElement.style.setProperty("--pager-shift", "0px");   // 展开：页码胶囊独占页面中线
     section.style.maxWidth = "";
-    section.style.removeProperty("--ai-chip-h");
-    /* 展开态：宽度取窗口宽度的 95%，在“避开左右抽屉面板后的可用区间”里居中 */
+    /* 展开态：宽度取视口宽度的 95%，在“避开左右抽屉面板后的可用区间”里居中。
+       全部用 CSS 长度（vw / vh 已由 unit() 换算好），算出来的值直接写 CSS。 */
     const cls = document.body.classList;
-    const leftGap = (cls.contains("toc-open") ? 316 : 12) * zoom;
-    const rightGap = (cls.contains("side-open") ? 400 : 12) * zoom;
-    const availW = Math.max(240 * zoom, viewW * zoom - leftGap - rightGap);
-    const width = Math.min(viewW * 0.95 * zoom, availW);
+    const leftGap = cls.contains("toc-open") ? 316 : 12;
+    const rightGap = cls.contains("side-open") ? 400 : 12;
+    const availW = Math.max(240, vw - leftGap - rightGap);
+    const width = Math.min(vw * 0.95, availW);
     const left = leftGap + (availW - width) / 2;
-    section.style.left = (left / zoom) + "px";
+    section.style.left = left + "px";
     section.style.right = "auto";
-    section.style.width = (width / zoom) + "px";
-    /* 底边贴着页码指示器上方（留 8px），而不是固定 68px 的空当 */
-    section.style.bottom = pagerRect
-      ? Math.max(0, viewH - pagerRect.top / zoom + 8) + "px"
-      : "68px";
+    section.style.width = width + "px";
+    /* 底边贴着页码指示器上方（留 8px）—— 同样交给 CSS：
+       `.ai-end:not(.ai-collapsed) { bottom: calc(var(--chip-h) + 22px) }`。
+       以前写 `vh - pagerRect.top + 8`，和收起态同一个毛病（只有 Chrome 的坐标口径成立）。 */
+    section.style.bottom = "";
     syncAiReserve();
   }
 
@@ -250,6 +264,15 @@ window.R2Ai = function (env) {
   }
   setAiCollapsed(aiCollapsed, false);
   window.addEventListener("resize", positionAiCard);
+  /* 横向滚动（放大后页面卡片比视口宽）会让卡片中线相对视口移动：页码胶囊跟着
+     --page-cx 自动走，小胶囊的 right 是 JS 算出来的 → 这里补一次重算，
+     两枚胶囊才始终「作为一组并列」地贴着页面中线，不会拉开。 */
+  let lastScrollX = window.scrollX;
+  window.addEventListener("scroll", () => {
+    if (window.scrollX === lastScrollX) return;
+    lastScrollX = window.scrollX;
+    positionAiCard();
+  }, { passive: true });
   if (window.ResizeObserver) {
     const pageResizeObserver = new ResizeObserver(positionAiCard);
     const observePage = () => {

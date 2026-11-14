@@ -255,18 +255,121 @@ window.R2Nav = function (env) {
     toast(status === "done" ? "🎉 标记为已读完" : "已改为在读");
   });
 
-  /* ================= 缩放 ================= */
-  $("zoomOut").addEventListener("click", () => changeZoom(-1));
-  $("zoomIn").addEventListener("click", () => changeZoom(1));
-  function changeZoom(d) {
-    const ni = clamp(env.zoomIdx + d, 0, ZOOMS.length - 1);
-    if (ni === env.zoomIdx) return;
-    // 先按旧缩放记下“正在看的这处内容”，换完缩放再按同一处还原滚动位置
-    // （整体缩放只改视觉比例，元素布局坐标不变，不这样做会跳到别处）
-    const anchor = pageAnchor();
+  /* ================= 缩放：顶栏的滑轮条（数值在上、滑杆在下） =================
+     滑杆给的是**请求的档位**（80% ~ 150%，每格 5%，min/max/step 写在 reader.html 里），
+     数值显示的是**实际渲染比例** —— 右侧要留批注栏时页面会等比适宽，
+     两者可能不一致（悬停数值有提示）。
+     ⚠️ 档位下标换算用滑杆自己身上的 min/step，别再写死 80 / 5：
+        它们与 reader2.js 的 ZOOM_PCT_* 是同一套数（那边按同样规则生成 ZOOMS）。
+     ⚠️ **拖动途中不要真的改 zoom**：滑杆本身也在 <html zoom> 里，改 zoom 会让它跟着变宽、
+       指针捕获被打断 —— 实测按下后拖到最右只前进一档（100 → 105 就卡住），而且改回 100%
+       还得靠键盘。所以 input 只预览数值，松手（change）/键盘/失焦时才真正应用。 */
+  const zoomRange = $("zoomRange");
+  const zMin = zoomRange ? Number(zoomRange.min) || 80 : 80;
+  const zStep = zoomRange ? Number(zoomRange.step) || 5 : 5;
+  const idxOfSlider = () => clamp(Math.round((Number(zoomRange.value) - zMin) / zStep), 0, ZOOMS.length - 1);
+  /* 滑杆位置 + 「已滑过」的填充（WebKit 用渐变画，Firefox 用 ::-moz-range-progress） */
+  function paintZoom(pctWanted) {
+    if (!zoomRange) return;
+    const want = String(Math.round(pctWanted));
+    if (zoomRange.value !== want) zoomRange.value = want;
+    const hi = Number(zoomRange.max) || 150;
+    const fill = hi > zMin ? ((Number(want) - zMin) / (hi - zMin)) * 100 : 0;
+    zoomRange.style.setProperty("--zoom-fill", clamp(fill, 0, 100).toFixed(1) + "%");
+  }
+  if (zoomRange) {
+    zoomRange.addEventListener("input", () => {           // 拖动中：只改数值，不动版式
+      const pct = Math.round(ZOOMS[idxOfSlider()] * 100);
+      $("zoomVal").textContent = pct + "%";
+      $("zoomVal").title = "松开鼠标后应用";
+      paintZoom(pct);
+    });
+    zoomRange.addEventListener("change", () => setZoomIdx(idxOfSlider()));   // 松手 / 点轨道
+    zoomRange.addEventListener("keyup", () => setZoomIdx(idxOfSlider()));    // 键盘 ←/→/Home/End 兜底
+    zoomRange.addEventListener("blur", () => setZoomIdx(idxOfSlider()));
+  }
+
+  /* ---- 滚轮缩放：鼠标停在缩放控件上时，**上滚放大、下滚缩小**（每格 5%）----
+     和拖动一个节奏：**滚的时候只改数值，停手（180ms 没新滚动）才真正缩放**。
+     这样连续滚十几格也只会在最后统一应用一次，不会一格一卡；顺带绕开了「控件自己在
+     <html zoom> 里、缩放时相对窗口滑走」的老问题（滚动期间版式根本不动）。
+     几个要点：
+     · 事件挂在 window 上 + 1.2s 手势锁：滚动途中指针即使滑出控件也继续累计
+       （指针离开起点 >90px 或停手 >1.2s 就解锁，新手势仍要求指针真的在控件上）；
+     · 归一化 deltaMode（像素 / 行 / 页）并累计到 60 再走一格：触控板一次只给几像素，
+       不累计根本滚不动；走一格就把余数清零，否则鼠标滚轮一格（~100px）会连跳两格；
+     · 100ms 节流：惯性滚动 / 一次滚轮派发多个事件时不会一帧跳好几档；
+     · Ctrl+滚轮是浏览器自己的页面缩放，放行；横向滚（Shift+滚轮 / 触控板横滑）也不管。 */
+  const zoomBox = document.querySelector(".zoom-group");
+  const WHEEL_UNIT = 60;         // 累计到这个量走一格
+  const WHEEL_GAP = 100;         // 两格之间至少隔这么久（ms）：连续猛滚 / 惯性滚动也不会一帧跳几档
+  const WHEEL_LOCK = 1200;       // 一次滚轮手势的锁定时间（ms）
+  const WHEEL_SETTLE = 180;      // 停手多久后应用（≈ 拖动的 pointerup）
+  const WHEEL_DRIFT = 90;        // 指针离开手势起点超过这么多 px 就解锁（用户可能想滚页面）
+  let wheelAcc = 0, wheelUntil = 0, wheelAnchor = null, wheelStepAt = 0;
+  let wheelPending = null, wheelTimer = 0;   // 滚动中的「待应用档位」+ 停手定时器
+  function wheelPreview() {
+    const pct = Math.round(ZOOMS[wheelPending] * 100);
+    $("zoomVal").textContent = pct + "%";
+    $("zoomVal").title = "滚轮停下后应用";
+    paintZoom(pct);
+  }
+  function wheelCommit() {
+    if (wheelTimer) { clearTimeout(wheelTimer); wheelTimer = 0; }
+    if (wheelPending == null) return;
+    const ni = wheelPending;
+    wheelPending = null;
+    setZoomIdx(ni);            // 里面会 refreshZoomLabel，把数值 / 滑杆对齐到真实比例
+  }
+  window.addEventListener("wheel", (e) => {
+    if (!zoomBox || e.ctrlKey || !e.deltaY) return;
+    const now = performance.now();
+    let live = now < wheelUntil;
+    if (live && wheelAnchor
+        && Math.hypot(e.clientX - wheelAnchor.x, e.clientY - wheelAnchor.y) > WHEEL_DRIFT) live = false;
+    if (!live) {
+      if (!zoomBox.contains(e.target)) { wheelAcc = 0; wheelUntil = 0; wheelAnchor = null; return; }
+      wheelAcc = 0;                                   // 新的一次手势：重新累计
+      wheelStepAt = 0;
+      wheelAnchor = { x: e.clientX, y: e.clientY };
+    }
+    e.preventDefault();                               // 别让整页跟着上下滚
+    wheelUntil = now + WHEEL_LOCK;
+    wheelAcc += e.deltaMode === 1 ? e.deltaY * 40      // 行（Firefox 一格 ≈ 3 行）
+             : e.deltaMode === 2 ? e.deltaY * 400      // 页
+             : e.deltaY;                               // 像素
+    if (Math.abs(wheelAcc) < WHEEL_UNIT) return;       // 触控板还没攒够，先不动
+    if (now - wheelStepAt < WHEEL_GAP) return;         // 节流：等下一格的时间窗，累计值留着
+    wheelStepAt = now;
+    const dir = wheelAcc < 0 ? 1 : -1;                 // 向上（deltaY < 0）= 放大
+    wheelAcc = 0;                                      // 一次事件最多走一格
+    if (wheelPending == null) wheelPending = env.zoomIdx;
+    wheelPending = clamp(wheelPending + dir, 0, ZOOMS.length - 1);
+    wheelPreview();                                    // 只动数值，版式一点没动
+    if (wheelTimer) clearTimeout(wheelTimer);
+    wheelTimer = setTimeout(wheelCommit, WHEEL_SETTLE);
+  }, { passive: false });
+  if (zoomBox) {
+    /* 指针移开就立刻应用，免得「滚完马上走」还要等停手计时 */
+    zoomBox.addEventListener("mouseleave", () => { wheelAcc = 0; if (wheelTimer) wheelCommit(); });
+  }
+  /* 兼容旧的 ± 按钮（旧页面/自检页里可能还有），存在才绑 */
+  if ($("zoomOut")) $("zoomOut").addEventListener("click", () => changeZoom(-1));
+  if ($("zoomIn")) $("zoomIn").addEventListener("click", () => changeZoom(1));
+  function changeZoom(d) { setZoomIdx(env.zoomIdx + d); }
+  function setZoomIdx(ni) {
+    ni = clamp(Math.round(ni), 0, ZOOMS.length - 1);
+    if (ni === env.zoomIdx) { refreshZoomLabel(); return; }
+    /* 缩放 = 纯视觉比例（写到 <html> 的 zoom 上）：页面宽度只由「文档基准宽」决定，
+       版式与各元素的布局坐标**一点都没变** → 不需要 render() 重建 DOM
+       （以前每点一次缩放都整篇重建，38 页要卡一下，滚动位置还得靠 anchor 再摆回来）。
+       固定浮层（页码胶囊 / AI 卡片）跟着 #pages 的尺寸变化由各自的 ResizeObserver 更新。 */
     env.zoomIdx = ni;
     applyZoom();
-    render(anchor);
+    refreshZoomLabel();
+    /* 视觉比例变了：批注栏预留宽（窗口的 25%）与「能不能并排」要按新视口重算。
+       relayoutAll 只在页面宽度或并排模式真的变了时才退回整体 render。 */
+    relayoutAll();
   }
   function refreshZoomLabel() {
     // 右侧留出批注栏时页面会等比缩小(fit)，这里显示**实际**渲染比例，避免和看到的不一致。
@@ -280,6 +383,8 @@ window.R2Nav = function (env) {
     $("zoomVal").title = capped
       ? "窗口宽度要留出侧栏（目录 / 笔记栏），页面已自动适宽；想放大请加宽窗口或收起侧栏"
       : "当前缩放比例";
+    /* 滑杆位置 = **请求**的档位（不是实际渲染比例），换论文 / 首屏 / 被夹紧后都对齐一次 */
+    paintZoom(Math.round(ZOOM() * 100));
   }
 
   /* ============ 对外接口 ============ */

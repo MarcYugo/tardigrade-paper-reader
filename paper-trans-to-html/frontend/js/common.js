@@ -147,14 +147,38 @@ async function syncTheme() {
    左目录(.toc-panel)、右笔记栏(.side-panel / .notes-drawer) 都是 position: fixed，
    如果 top 写死 54px，它们的标题行就会被撑高的顶栏盖住（视觉错位）。
    这里实测顶栏高度写进 --topbar-h，CSS 里统一 top: var(--topbar-h)。
-   注意：getBoundingClientRect() 是布局坐标（不受 <html> 的 zoom 影响），
-   与 CSS 的 top 同坐标系，直接用即可，别再乘/除缩放比。 */
+
+   ⚠️ 两个坑（跨浏览器各踩一次）：
+   ① 不能取整。Math.round 会把它向上取到整数（实测 164.5 → 165），顶栏与面板之间
+      就多出 0.5px 的缝，某些缩放下会被画成一条可见的断续亮线。
+   ② 坐标口径不一致。<html> 上有 zoom 时，Chrome 的 getBoundingClientRect() 返回
+      **布局坐标**（不乘 zoom），Firefox / Safari 则会把 zoom 乘进去。CSS 的 top 用的是
+      布局 px，于是「rect 直接写进 --topbar-h」在后者里会被放大 zoom 倍 → 顶栏与面板
+      之间出现几十 px 的空当（缩放档位越高越大）。这里用一枚隐藏探针实测
+      「rect ÷ 布局 px」的比值把它除回去，两种口径都对。 */
+let layoutScaleKey = null, layoutScaleValue = 1;
+function layoutScale() {
+  const root = document.documentElement;
+  const key = root.style.zoom || "1";
+  if (layoutScaleKey === key) return layoutScaleValue;    // 只在缩放档位变化时重量
+  const probe = document.createElement("div");
+  probe.style.cssText =
+    "position:absolute;top:0;left:-9999px;width:1px;height:100px;visibility:hidden;pointer-events:none";
+  root.appendChild(probe);
+  const h = probe.getBoundingClientRect().height;
+  probe.remove();                                         // 同一个任务里移走，不会引起回流闪烁
+  layoutScaleValue = h > 0 ? h / 100 : 1;                 // Chrome=1；rect 含 zoom 的浏览器=zoom
+  layoutScaleKey = key;
+  return layoutScaleValue;
+}
 function syncTopbarHeight() {
   const bar = document.querySelector(".topbar");
   if (!bar) return;
-  const h = Math.round(bar.getBoundingClientRect().height);
+  const h = bar.getBoundingClientRect().height / layoutScale();   // 归一化成布局 px
   if (!h) return;                                  // 隐藏时高度为 0，别把变量清零
-  document.documentElement.style.setProperty("--topbar-h", h + "px");
+  /* 保留 3 位小数：只取 2 位时 163.7239 会被截成 163.72，再乘回 zoom 就是 0.005px 的
+     缝 —— 平时看不见，但缩放档位一多就容易撞上设备像素网格变成一条亮线 */
+  document.documentElement.style.setProperty("--topbar-h", h.toFixed(3) + "px");
 }
 function watchTopbarHeight() {
   syncTopbarHeight();
@@ -164,6 +188,18 @@ function watchTopbarHeight() {
   if (window.ResizeObserver) new ResizeObserver(syncTopbarHeight).observe(bar);
   window.addEventListener("resize", syncTopbarHeight);
   window.addEventListener("load", syncTopbarHeight);   // 字体/图标加载完高度可能再变一次
+  /* 挂面板（目录 .toc-panel / 笔记栏 .side-panel / 笔记抽屉 .notes-drawer）都靠 body 上的
+     toc-open · side-open · notes-side 改布局：开合那一瞬间若 --topbar-h 还是旧值，面板
+     就会与顶栏错开一道缝。跟一遍 body 的 class 变化，保证面板滑出时用的就是最新高度。 */
+  if (window.MutationObserver) {
+    new MutationObserver(syncTopbarHeight)
+      .observe(document.body, { attributes: true, attributeFilter: ["class"] });
+  }
+  // 没有 ResizeObserver 的老浏览器只能靠事件：Web 字体晚到会改按钮文字宽度、进而改换行条数，
+  // 字体真正就绪时再量一次（有 ResizeObserver 时这一句只是多量一遍，代价可忽略）
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(syncTopbarHeight).catch(() => {});
+  }
 }
 document.addEventListener("DOMContentLoaded", watchTopbarHeight);
 
@@ -188,7 +224,13 @@ async function mountUserBar() {
       `<span class="av">${esc(name.slice(0, 1).toUpperCase())}</span>` +
       `<span class="uname">${esc(name)}</span></span>` +
     `<button class="btn ghost" id="btnLogout" title="退出登录">退出</button>`;
-  bar.appendChild(wrap);
+  /* 阅读页顶栏是两行结构：用户区（主题 / 设置 / 导出 / 账号 / 退出）也属于“设置栏”，
+     要和按钮组**同一条折行流**里排（挤不下就跟共享/目录/笔记一起回行），
+     不能再当独立一块停在被右对齐的第一行末尾 —— 那样看起来很怪。
+     首页/登录页顶栏没有 .top-actions 这一层，退回直接挂到 .topbar。 */
+  const host = bar.querySelector(".tb-toolbar .top-actions")
+    || bar.querySelector(".tb-toolbar") || bar;
+  host.appendChild(wrap);
   wrap.querySelector("#btnLlmSet").onclick = () => openLlmModal();
   if (readerDocId) {
     wrap.querySelector("#btnNoteExport").onclick = () => openNoteExportModal(readerDocId);

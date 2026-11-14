@@ -9,26 +9,42 @@
   <script>try{if(localStorage.getItem("paperReader.theme")==="dark")document.documentElement.classList.add("dark");}catch(e){}</script>
 </head>
 <body>
-  <header class="topbar">
-    <a class="brand" href="./">← 论文列表</a>
-    <h1 class="doc-title" id="docTitle">加载中…</h1>
-    <span class="share-badge" id="shareBadge" hidden></span>
-    <div class="top-actions">
-      <label class="chk"><input type="checkbox" id="chkShowZh"> 显示译文</label>
-      <label class="chk"><input type="checkbox" id="chkShowNotes" checked> 显示笔记</label>
-      <button class="btn" id="btnPageTrans" title="翻译当前页全部英文段落">翻译本页</button>
-      <button class="btn" id="btnAllTrans" title="翻译全文(批量可取消)">翻译全文</button>
-      <button class="btn ghost" id="btnFinished">标记读完</button>
-      <span class="icon-btn" id="zoomOut" title="缩小">−</span>
-      <span class="chk" id="zoomVal" style="min-width:40px;justify-content:center">100%</span>
-      <button class="icon-btn" id="zoomIn" title="放大">＋</button>
-      <button class="btn ghost" id="btnShare" hidden
-              title="把这篇论文（连同笔记/高亮/译文/AI 整理）共享给别的账号">🔗 共享</button>
-      <button class="btn ghost" id="btnToc" title="目录：优先用 PDF 自带书签，没有就让 LLM 从全文提取">📑 目录</button>
-      <button class="btn ghost" id="btnReparse"
-              title="用这篇论文的原始 PDF 重新解析版式（解析器升级/换了 OCR 后端后用；笔记、高亮、译文、进度都保留）">🔄 重解析</button>
-      <input type="file" id="reparseFile" accept="application/pdf,.pdf" hidden>
-      <button class="btn primary" id="btnNotes">📝 笔记 <span id="notesCount">0</span></button>
+  <!-- 顶栏固定两行：
+       ① 论文列表 + 论文名（+ 分享角标）—— 标题独占一行，宽度够用了；
+       ② 操作 / 设置区（.top-actions 按钮组 + 右上角用户区）。
+       以前全挤在一行，操作按钮组内容一多，标题会被压成「atten…」只剩几十 px。 -->
+  <header class="topbar topbar-2row">
+    <div class="tb-row tb-titlebar">
+      <a class="brand" href="./">← 论文列表</a>
+      <h1 class="doc-title" id="docTitle">加载中…</h1>
+      <span class="share-badge" id="shareBadge" hidden></span>
+    </div>
+    <div class="tb-row tb-toolbar">
+      <div class="top-actions">
+        <label class="chk"><input type="checkbox" id="chkShowZh"> 显示译文</label>
+        <label class="chk"><input type="checkbox" id="chkShowNotes" checked> 显示笔记</label>
+        <button class="btn" id="btnPageTrans" title="翻译当前页全部英文段落">翻译本页</button>
+        <button class="btn" id="btnAllTrans" title="翻译全文(批量可取消)">翻译全文</button>
+        <button class="btn ghost" id="btnFinished">标记读完</button>
+        <!-- 缩放：**上排数值、下排滑轮条**（带 5% 刻度），范围 80% ~ 150%，每格 5%。
+             三种用法：拖滑块 / 点轨道 / 鼠标停在上面滚轮（上滚放大、下滚缩小）。
+             包成一组，设置栏收缩时不会被拆到两行去。
+             ⚠️ min/max/step 必须与 js/reader2.js 的 ZOOM_PCT_MIN/MAX/STEP 一致 -->
+        <span class="zoom-group" title="页面缩放：80% ~ 150%，每格 5%（拖动 / 点击 / 滚轮上下均可）">
+          <span class="zoom-val" id="zoomVal">100%</span>
+          <input class="zoom-range" id="zoomRange" type="range"
+                 min="80" max="150" step="5" value="100"
+                 aria-label="页面缩放比例">
+          <span class="zoom-ticks" aria-hidden="true"></span>
+        </span>
+        <button class="btn ghost" id="btnShare" hidden
+                title="把这篇论文（连同笔记/高亮/译文/AI 整理）共享给别的账号">🔗 共享</button>
+        <button class="btn ghost" id="btnToc" title="目录：优先用 PDF 自带书签，没有就让 LLM 从全文提取">📑 目录</button>
+        <button class="btn ghost" id="btnReparse"
+                title="用这篇论文的原始 PDF 重新解析版式（解析器升级/换了 OCR 后端后用；笔记、高亮、译文、进度都保留）">🔄 重解析</button>
+        <input type="file" id="reparseFile" accept="application/pdf,.pdf" hidden>
+        <button class="btn primary" id="btnNotes">📝 笔记 <span id="notesCount">0</span></button>
+      </div>
     </div>
   </header>
 

@@ -112,8 +112,14 @@ window.R2Layout = function (env) {
     return env.CSS_W * k;
   }
   function computePageTarget() {
-    // 整体缩放时视口在布局坐标里只有 clientWidth/ZOOM 这么宽；页面宽度保持 CSS_W，
-    // 由 <html> 的 zoom 把它放大(不支持 zoom 的浏览器才退回“直接算宽页面”的老算法)
+    /* 页面宽度**只由「文档基准宽 × 缩放档位」决定** —— 用户点了几倍就是几倍。
+       走 <html> zoom 时 zoom 已经把页面放大到视觉上（所以 pageW 保持基准宽即等于
+       「基准 × 档位」）；不支持 zoom 的老浏览器才直接把基准宽乘上档位。
+       ⚠️ 以前这里还要跟「可用宽度」取 min（`pageW = min(want, room)`），那等价于
+       「永远不允许横向滚动」：放大后布局视口只剩 clientWidth/zoom，目录(300)与笔记栏(25%)
+       的占位又不变 → 页面被压回去。实测 1485px 窗口、120% 开目录：918 → 711 视觉宽，
+       工具栏从 120% 掉到 93%（点放大反而变小）。现在放不下就横向滚动。
+       `room` 仍然要算 —— 它只用来判断**笔记栏能不能并排**（并排时页面右侧得留出批注栏）。 */
     const clientW = env.vpW();
     const want = env.ZOOM_OK ? basePageW() : basePageW() * env.ZOOM();
     const drawerOpen = !!($("side") && $("side").classList.contains("open"));
@@ -122,12 +128,14 @@ window.R2Layout = function (env) {
     const need = env.notesCount() > 0 || !!env.editingKey;      // 有笔记(或正在写)才预留
     const reserve = clamp(Math.round(clientW * 0.25), 210, 330);
     const room = clientW - reserve - tocW - 36;         // 让出批注栏/目录后页面能用多宽
-    const side = !drawerOpen && env.showNotesOn && need && room >= 520;
+    /* 笔记栏能不能并排：页面宽度不再自动缩小，所以必须保证「页面 + 批注栏 + 目录」
+       真的放得下才并排（room 里已经扣掉了批注栏与目录）。放不下就退回句子下方内嵌 ——
+       否则页面会把批注栏挤出屏幕，右边留一条空白 + 多出一段横向滚动。 */
+    const side = !drawerOpen && env.showNotesOn && need && room >= want;
     return {
       side, reserve, tocW,
       noteW: Math.max(190, reserve - 28),
-      pageW: side ? Math.min(want, room)
-                  : (tocW ? Math.min(want, Math.max(320, clientW - tocW - 36)) : want),
+      pageW: want,
     };
   }
   function applyNoteChrome(t) {
@@ -153,6 +161,9 @@ window.R2Layout = function (env) {
     if (!env.DOC || !env.pages.length) return;      // 论文还没加载好（或加载失败）：别去碰 DOM
     const t = computePageTarget();
     if (Math.abs(t.pageW - env.curPageW) > 0.5) { env.render(); return; }   // 页面尺寸变了 → 整体重排
+    /* 页面宽度现在与缩放档位无关（只跟文档基准宽走），所以改缩放不再需要整篇重建；
+       但「批注栏并排 ↔ 句子下方内嵌」的模式变了就必须重建（笔记卡挂在不同的容器里）。 */
+    if (t.side !== env.noteSide) { env.render(); return; }
     applyNoteChrome(t);
     layoutAi();
     env.pages.forEach((pg, pi) => {
@@ -175,19 +186,29 @@ window.R2Layout = function (env) {
     if (wrapped) box.classList.add("ai-stacked");
   }
 
-  /* ---------- 页面列中线：浮动胶囊（页码 / AI 收起胶囊）的横向锚点 ----------
+  /* ---------- 页面卡片中线：浮动胶囊（页码 / AI 收起胶囊）的横向锚点 ----------
      这两个胶囊是 position: fixed，之前以**窗口**中线居中：目录（左 300px）或
      笔记抽屉（右 384px）一打开，正文整体平移，胶囊却留在原处 → 视觉错位。
-     这里量出正文列（#pages 的内容盒，页面用 margin:auto 在它里面居中）的中线，
-     写进 CSS 变量 --page-cx，CSS 里用 left: calc(var(--page-cx) + …) 定位。
-     ⚠️ getBoundingClientRect() 是**布局坐标**（不乘 <html> 的 zoom），而 CSS 的
-     left/bottom 也是布局坐标 → 直接用，不要除/乘缩放比。 */
+     现在量的是**页面卡片 .page 自身的中线**（两枚胶囊由 r2-ai.js / .pageind 拼成
+     一整个组，组的水平中心对齐这条线），写进 CSS 变量 --page-cx，
+     CSS 里用 left: calc(var(--page-cx) + …) 定位。
+     ⚠️ 不要退回用 #pages 容器的中线：页面正常时靠 margin:auto 居中，两者重合；
+     但放大到页面比容器宽时 auto 外边距退化成 0，页面从容器左边开始向右溢出，
+     容器中线就会明显偏左（实测 150% 下差 80px+），胶囊会骑到页面外侧去。
+     按卡片中线算，横向滚动时也会跟着页面走。
+     ⚠️ 量出来的是 **rect 口径**的数字，各家浏览器不一样：Chrome 的 getBoundingClientRect()
+     不含 <html> zoom（数字≈CSS 长度），Firefox / Safari 会把 zoom 乘进去。
+     而 --page-cx 是写进 CSS 的**长度**（.pageind 的 left）→ 必须先 / 掉 unit().k 换成 CSS 长度，
+     否则 Firefox 上会被 zoom 再乘一次：150% 时两枚胶囊整组比页面中线偏出一大截。 */
   let lastCenterX = null;                 // 上次写入的值：一样就不重复写（滚动时会被反复调用）
   function readCenterX() {
     const pagesEl = $("pages");
     if (!pagesEl) return null;
-    const r = pagesEl.getBoundingClientRect();
-    return r.width ? r.left + r.width / 2 : null;
+    // 还没渲染出卡片时退回容器（首屏、加载中）
+    const r = (pagesEl.querySelector(".page") || pagesEl).getBoundingClientRect();
+    if (!r.width) return null;
+    const k = env.unit ? (env.unit().k || 1) : 1;    // rect 单位 → CSS 长度（见 r2-view.js::unit）
+    return (r.left + r.width / 2) / k;
   }
   function syncReadCenter() {
     const cx = readCenterX();

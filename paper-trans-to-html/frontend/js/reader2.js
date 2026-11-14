@@ -8,7 +8,12 @@
   "use strict";
 
   const CSS_W = 900;                       // zoom=1 时页面目标宽度
-  const ZOOMS = [0.8, 1, 1.2, 1.5];
+  /* 缩放档位：80% ~ 150%，每格 5%（对应顶栏的横向滑轮条 #zoomRange）。
+     ⚠️ reader.html 里那根 range 的 min/max/step 必须与这三个数一致；r2-nav.js 按
+        「(值 − min) / step = 档位下标」换算，两边不同步就会点一格跳两档。 */
+  const ZOOM_PCT_MIN = 80, ZOOM_PCT_MAX = 150, ZOOM_PCT_STEP = 5;
+  const ZOOMS = [];
+  for (let p = ZOOM_PCT_MIN; p <= ZOOM_PCT_MAX; p += ZOOM_PCT_STEP) ZOOMS.push(p / 100);
   const FONT = {
     sans: '"Segoe UI","Helvetica Neue",Arial,"Microsoft YaHei",sans-serif',
     serif: 'Georgia,"Times New Roman","SimSun",serif',
@@ -23,7 +28,7 @@
   if ("scrollRestoration" in history) history.scrollRestoration = "manual";
 
   let DOC = null, META = null;
-  let zoomIdx = 1;
+  let zoomIdx = ZOOMS.indexOf(1);          // 默认 100%（= 80% + 4 格）
   let posRestored = false;   // 首次进入是否已按服务端的 `last_pos` 定位过（见 restoreLastPos）
   const ZOOM = () => ZOOMS[zoomIdx];
   const pages = [];
@@ -61,7 +66,7 @@
   const { hex2rgb, rgb2hsl, hsl2hex, invertInk, pageInk, hexToRgba } =
     R2Color({ inkCache, isDark });
   const { gapStats, fitLineEl, fitItemLines } = R2Fit();
-  const { ZOOM_OK, GZ, vpW, vpH, scrolled, toScrollTop, toScrollDelta, applyZoom,
+  const { ZOOM_OK, GZ, vpW, vpH, scrolled, toScrollTop, toScrollDelta, applyZoom, unit,
           anchorProbe, pageAnchor, restoreAnchor, posValid, posIsTail,
           restoreLastPos } = R2View({
     ZOOM, pages,
@@ -872,7 +877,7 @@
      · notesCount / notesOfBlock / tocPanelOpen 来自更后面的 r2-notes、r2-nav 装配 →
        包一层转发；TOC_W 是常量，用 getter 延后取值。 */
   const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, syncReadCenter, basePageW } = R2Layout({
-    $, CSS_W, ZOOM, ZOOM_OK, vpW, NOTE_GAP, pages,
+    $, CSS_W, ZOOM, ZOOM_OK, vpW, unit, NOTE_GAP, pages,
     keyParts, lineOfChar, sentRange, render, paintFormulaMarks,
     get DOC() { return DOC; },
     get curPageW() { return curPageW; }, set curPageW(v) { curPageW = v; },
@@ -953,7 +958,8 @@
     $, docId, findItem, keyParts, pageOfItem, needWrite,
     canWrite: (...a) => canWrite(...a),
     scrollToPage, flashRelatedBlock, jumpToNoteId, openSidePanel, refreshSideList, layoutAi,
-    syncReadCenter,          // 页面列中线：AI 收起胶囊与页码胶囊都要以它为横向锚点
+    syncReadCenter,          // 页面卡片中线：AI 收起胶囊与页码胶囊（整组）都要以它为横向锚点
+    unit,                    // rect → CSS 长度 / 视口尺寸（跨浏览器 zoom 口径，见 r2-view.js）
     refreshNotes: async () => {
       anno = await api("/api/doc/" + docId + "/anno");
       renderAllNotes();
