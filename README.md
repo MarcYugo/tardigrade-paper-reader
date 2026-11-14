@@ -87,23 +87,19 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 ### 1. 多用户和设置
 
-<img src="./function_display/1.log-in-switch-out.gif" width=400px>
-<img src="./function_display/2.config.gif" width=400px>
+<img src="./function_display/1.log-in-switch-out.gif" width=400px><img src="./function_display/2.config.gif" width=400px>
 
 ### 3. 论文载入和删除、标注、笔记和翻译
 
-<img src="./function_display/3.paper-load-del.gif" width=400px>
-<img src="./function_display/4.highlight-mark-translate.gif" width=400px>
+<img src="./function_display/3.paper-load-del.gif" width=400px><img src="./function_display/4.highlight-mark-translate.gif" width=400px>
 
 ### 4. 笔记整理和AI辅助、笔记共享
 
-<img src="./function_display/5.note-ai-assitant.gif" width=400px>
-<img src="./function_display/6.note-share.gif" width=400px>
+<img src="./function_display/5.note-ai-assitant.gif" width=400px><img src="./function_display/6.note-share.gif" width=400px>
 
 ### 5. 笔记和内容定位、笔记添加
 
-<img src="./function_display/7.agent-location.gif" width=400px>
-<img src="./function_display/8.agent-write-notes.gif" width=400px>
+<img src="./function_display/7.agent-location.gif" width=400px><img src="./function_display/8.agent-write-notes.gif" width=400px>
 
 ## TODO
 
