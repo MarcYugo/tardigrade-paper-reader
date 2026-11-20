@@ -1,0 +1,83 @@
+# ============================================================
+#  draw-sandbox（画图沙盒容器）
+#
+#  启动：cd draw_sandbox_service && docker compose up -d --build
+#  验证：curl http://127.0.0.1:8090/healthz
+#  联调：python example_client.py            # 跑一段示例 matplotlib 代码
+#
+#  只映射到宿主机回环，外网访问不到（要对外请自行加反代/改端口）。
+# ============================================================
+services:
+  draw-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: draw-sandbox:1.0.0
+    container_name: draw-sandbox
+    restart: unless-stopped
+
+    ports:
+      # 容器与宿主机端口保持一致：8090 → 8090
+      - "127.0.0.1:${SANDBOX_PORT:-8090}:8090"
+
+    environment:
+      # ---- 监听地址由 Dockerfile CMD 固定为 0.0.0.0:8090（容器里不能写 127.0.0.1）----
+      SANDBOX_BASE_DIR: /tmp/sandbox
+
+      # ---- 鉴权：留空 = 不校验；对外暴露时务必设一个（请求头 X-API-Key）----
+      SANDBOX_API_KEY: ${SANDBOX_API_KEY:-}
+
+      # ---- 并发与超时 ----
+      SANDBOX_MAX_CONCURRENCY: ${SANDBOX_MAX_CONCURRENCY:-2}
+      SANDBOX_QUEUE_TIMEOUT: ${SANDBOX_QUEUE_TIMEOUT:-30}       # 排队上限（秒）
+      SANDBOX_DEFAULT_TIMEOUT: ${SANDBOX_DEFAULT_TIMEOUT:-20}   # 请求未带 timeout 时
+      SANDBOX_MAX_TIMEOUT: ${SANDBOX_MAX_TIMEOUT:-60}           # 请求 timeout 的上限
+
+      # ---- 入参 / 产出上限 ----
+      SANDBOX_MAX_CODE_BYTES: ${SANDBOX_MAX_CODE_BYTES:-262144}
+      SANDBOX_MAX_OUTPUT_FILES: ${SANDBOX_MAX_OUTPUT_FILES:-20}
+      SANDBOX_MAX_OUTPUT_FILE_BYTES: ${SANDBOX_MAX_OUTPUT_FILE_BYTES:-10485760}
+      SANDBOX_MAX_OUTPUT_BYTES: ${SANDBOX_MAX_OUTPUT_BYTES:-25165824}
+      SANDBOX_MAX_LOG_BYTES: ${SANDBOX_MAX_LOG_BYTES:-65536}
+      SANDBOX_ALLOWED_EXT: ${SANDBOX_ALLOWED_EXT:-png,jpg,jpeg,webp,gif,svg,pdf,csv,tsv,json,txt,md,tex}
+
+      # ---- 子进程资源限制（0 = 不设）----
+      # ⚠️ SANDBOX_MEM_LIMIT_MB 走的是 RLIMIT_AS（虚拟内存），numpy/OpenBLAS 启动就会
+      #    预留几百 MB，设 512 之类的值会出现"import numpy 就 MemoryError"的假故障。
+      #    内存主防线是下面的 mem_limit（cgroup），这里默认不设。
+      SANDBOX_MEM_LIMIT_MB: ${SANDBOX_MEM_LIMIT_MB:-0}
+      SANDBOX_FSIZE_LIMIT_MB: ${SANDBOX_FSIZE_LIMIT_MB:-64}    # 单个文件最大写入量
+      SANDBOX_NPROC_LIMIT: ${SANDBOX_NPROC_LIMIT:-64}          # 进程/线程总数
+      SANDBOX_NOFILE_LIMIT: ${SANDBOX_NOFILE_LIMIT:-256}
+
+      # ---- 出图 ----
+      SANDBOX_FIGURE_DPI: ${SANDBOX_FIGURE_DPI:-150}
+
+      # ---- 排障：保留运行目录（默认跑完即删）----
+      SANDBOX_KEEP_WORKDIR: ${SANDBOX_KEEP_WORKDIR:-0}
+
+    # ================= 隔离加固 =================
+    # 根文件系统只读，唯一可写的地方是下面的 tmpfs；用户的产出都落在 /tmp/sandbox
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # 进程数 / 内存 / CPU 上限（防一段死循环 + 无限 fork 的代码把宿主机拖垮）
+    pids_limit: 256
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2.0
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

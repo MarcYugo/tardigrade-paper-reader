@@ -48,6 +48,9 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}        # 安装级默认 Key（每个账号还能各自覆盖）
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-}
+      # Agent 笔记图片：draw-sandbox 的 HTTP 地址与可选鉴权 Key
+      DRAW_SANDBOX_URL: ${DRAW_SANDBOX_URL:-http://host.docker.internal:8090/v1/run}
+      DRAW_SANDBOX_API_KEY: ${DRAW_SANDBOX_API_KEY:-}
 
       # ---- Surya 解析服务（PDF 整页 OCR：文字 / 公式 / 插图；backend=surya 时使用）----
       # ⚠️ 容器里的 127.0.0.1 是容器自己，连不到宿主机上的 surya-server；

@@ -191,31 +191,45 @@ a { color: var(--accent); text-decoration: none; }
   background: transparent; cursor: pointer;
 }
 .zoom-range:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
-/* 轨道：WebKit 没有「已滑过」伪元素，用渐变切一刀；Firefox 用 ::-moz-range-progress */
+/* 轨道：WebKit 没有「已滑过」伪元素，用渐变切一刀；Firefox 用 ::-moz-range-progress。
+   ⚠️ 填充的切分点必须落在**滑块中心线**上，不能直接用 --zoom-fill：
+   滑块行程两端各内缩半个滑块宽（6px），所以 fill=0% 时中心在 6px、fill=100% 时在 118-6px。
+   换算：6px + f × (118 - 12) ⇒ `calc(var(--zoom-thumb)/2 + var(--zoom-fill) * .8983)`，
+   其中 .8983 = 106 / 118（118px = .zoom-range 宽度，12px = --zoom-thumb）。
+   少了这一步，填充永远比滑块中心慢半格，看着像「进度条拖在按钮左边」。 */
 .zoom-range::-webkit-slider-runnable-track {
   height: 4px; border-radius: 2px;
   background: linear-gradient(to right,
-    var(--accent) var(--zoom-fill), var(--line) var(--zoom-fill));
+    var(--accent) calc(var(--zoom-thumb) / 2 + var(--zoom-fill) * .8983),
+    var(--line) 0);
 }
 .zoom-range::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line); }
 .zoom-range::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent); }
-/* 滑块 = **钝角矩形**（12 × 16，圆角 3）：竖直的小扁块，压在轨道上比圆点更好点。
-   Firefox 的 thumb 尺寸不含 border，所以那边不写 border，靠 box-shadow 出层次 */
+/* 滑块 = **一颗蓝色的迷你按钮**（12 × 16，圆角 5）：竖直的小扁块，压在轨道上比圆点更好点。
+   形态/圆角跟顶栏设置栏里的 `.btn` 一致，但底色必须是**主色蓝**（--accent，
+   日间 #2f6fed / 夜间 #6ea8ff），跟 `.btn.primary` 同色；
+   边框用 1px 白内描边画（不是 border），尺寸恒为 --zoom-thumb，
+   不用改 .zoom-ticks 的 106px 对位；Firefox 的 thumb 尺寸不含 border，用阴影更稳。 */
 .zoom-range::-webkit-slider-thumb {
   appearance: none; -webkit-appearance: none;
-  width: var(--zoom-thumb); height: 16px; margin-top: -6px; border-radius: 3px;
+  width: var(--zoom-thumb); height: 16px; margin-top: -6px; border-radius: 5px;
   background: var(--accent);
-  box-shadow: 0 1px 3px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.22);
+  opacity: .85;                     /* 85% 不透明度 */
+  box-shadow: 0 1px 2px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.28);
+  transition: filter .15s, box-shadow .15s, opacity .15s;
 }
 .zoom-range::-moz-range-thumb {
-  width: var(--zoom-thumb); height: 16px; border: 0; border-radius: 3px;
+  width: var(--zoom-thumb); height: 16px; border: 0; border-radius: 5px;
   background: var(--accent);
-  box-shadow: 0 1px 3px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.22);
+  opacity: .85;                     /* 85% 不透明度 */
+  box-shadow: 0 1px 2px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.28);
+  transition: filter .15s, box-shadow .15s, opacity .15s;
 }
+/* 悬停 / 拖动：跟 `.btn.primary:hover` 一个意思——蓝底提亮一点，并回到不透明 */
 .zoom-range:hover::-webkit-slider-thumb,
-.zoom-range:active::-webkit-slider-thumb { filter: brightness(1.15); }
+.zoom-range:active::-webkit-slider-thumb { filter: brightness(1.15); opacity: 1; }
 .zoom-range:hover::-moz-range-thumb,
-.zoom-range:active::-moz-range-thumb { filter: brightness(1.15); }
+.zoom-range:active::-moz-range-thumb { filter: brightness(1.15); opacity: 1; }
 /* 刻度：15 根（80/85/…/150）。
    滑块行程两端各内缩半个滑块宽（6px），所以刻度条比轨道窄 12px 并居中，刻度才对得上滑块中心。
    ⚠️ 周期必须写**像素**（106px / 14 格 = 7.5714px）。若写成 `calc(100% / 14)`，一旦再配
@@ -1584,8 +1598,57 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 
 /* ---------- 笔记导出弹窗（顶栏「📤 导出」） ---------- */
 .modal-card.no-card { max-width: 600px; }
-.no-seg { display: flex; width: 100%; }
-.no-seg button { flex: 1; justify-content: center; padding: 8px 10px; font-size: 13px; }
+/* 顶部锚定：设置 / 导出两个弹窗共用同一个顶部位置（8% 视口高），内容变高时卡片只向下长高、
+   顶部位置不动（--modal-top / --modal-maxh 由 common.js 的 anchorModalTop() 算好写进来） */
+.modal.modal-top { align-items: flex-start; padding-top: var(--modal-top, 8vh); }
+.modal.modal-top > .modal-card { max-height: var(--modal-maxh, 88vh); }
+/* 导出方式：带表头的表格（列头 = 机械 / Agent，行头 = 文本 JSON / 图片，格子里单选） */
+.no-table {
+  width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed;
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+.no-table th, .no-table td { padding: 0; }
+/* 第一列（行头「文本（JSON）/ 图片」）定宽收窄，剩下两列给勾选格均分 */
+.no-table thead th:first-child,
+.no-table tbody th { width: 110px; white-space: nowrap; }
+.no-table thead th {
+  font-size: 12px; font-weight: 600; color: var(--mut);
+  padding: 7px 8px; text-align: center; background: var(--bg-soft);
+}
+.no-table tbody th {
+  font-size: 12.5px; font-weight: 500; color: var(--ink);
+  text-align: left; padding: 8px 10px; white-space: nowrap; background: var(--bg-soft);
+  border-top: 1px solid var(--line);
+}
+.no-table thead th:not(:first-child),
+.no-table tbody td { border-left: 1px solid var(--line); }
+.no-table tbody td { border-top: 1px solid var(--line); }
+/* 单元格：整格可点，里面是一个自绘的单选圈 */
+.no-cell {
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 38px; cursor: pointer; transition: background .15s;
+}
+.no-cell input[type="radio"] {
+  position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+}
+.no-dot {
+  width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--line-hover);
+  display: inline-flex; align-items: center; justify-content: center; transition: .15s;
+}
+.no-cell input:checked + .no-dot {
+  border-color: var(--accent); background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.no-cell input:checked + .no-dot::after {
+  content: ""; width: 5px; height: 5px; border-radius: 50%; background: #fff;
+}
+.no-cell:hover:not(.is-off) { background: var(--bg-soft); }
+.no-cell.on { background: var(--accent-soft); }
+/* 只有键盘操作（Tab 聚焦）才画外框，鼠标点击不留一圈蓝边 */
+.no-cell:has(input:focus-visible) { box-shadow: inset 0 0 0 2px var(--accent); }
+.no-cell.is-off { cursor: not-allowed; opacity: .45; }
+.no-cell.is-off:hover { background: transparent; }
 .no-instr {
   width: 100%; box-sizing: border-box; min-height: 92px; resize: vertical;
   border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
@@ -1599,6 +1662,27 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 }
 .no-list li { margin: 2px 0; }
 .no-list b { color: var(--ink); font-weight: 600; }
+/* 导出弹窗里的折叠面板（学术库 Key / 沙盒设置）：默认收起 */
+.no-fold {
+  margin: 12px 0 0; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg-soft);
+}
+.no-fold > summary {
+  cursor: pointer; padding: 9px 12px; font-size: 12.5px; font-weight: 600;
+  color: var(--mut); list-style-position: inside; outline: none;
+  border-radius: 10px;
+}
+.no-fold > summary:hover { color: var(--ink); }
+.no-fold[open] > summary {
+  color: var(--ink); border-bottom: 1px solid var(--line); border-radius: 10px 10px 0 0;
+}
+.no-fold-body { padding: 12px 12px 2px; }
+.no-fold-body .field:last-of-type { margin-bottom: 4px; }
+.no-fold-body .row-actions { margin-bottom: 10px; }
+.no-fold-body .form-err, .no-fold-body .form-ok { margin-bottom: 8px; }
+/* 导出进行中（.modal-busy）：× / 遮罩 / 「关闭」都关不掉，仅做视觉弱化 */
+.modal-busy .modal-x { opacity: .4; cursor: not-allowed; }
+.modal-busy .modal-mask { cursor: progress; }
 /* 已共享名单里的小号分段按钮（就地改权限） */
 .sh-mini {
   flex: none; display: inline-flex; gap: 2px; padding: 2px;

@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from backend.agents.ai_read_agent import (add_summary_item, locate_page,
-                                          locate_text_block, reply_agent_stream)
+from backend.agents.skills.ai_read import (add_summary_item, locate_page,
+                                         locate_text_block, reply_agent_stream)
 from backend.ai_read import notes_fingerprint
 from backend.records import Store, anno_with_authors
 from backend.agents.llm import probe_llm

@@ -111,7 +111,10 @@ window.R2Layout = function (env) {
     const k = (p === "unlimited_ocr" || p === "unlimited_ocr_online") ? DOC_SCALE : 1;
     return env.CSS_W * k;
   }
-  function computePageTarget() {
+  /* `zt` = 想按**哪个缩放档位**算（不传 = 当前 `<html>` 上那个）。
+     缩放过渡期间版式还没落位，GZ() 还是旧值，要在动画开跑之前预判
+     「目标档位下笔记栏还放不放得下」就得显式传它（见 switchSideFor）。 */
+  function computePageTarget(zt) {
     /* 页面宽度**只由「文档基准宽 × 缩放档位」决定** —— 用户点了几倍就是几倍。
        走 <html> zoom 时 zoom 已经把页面放大到视觉上（所以 pageW 保持基准宽即等于
        「基准 × 档位」）；不支持 zoom 的老浏览器才直接把基准宽乘上档位。
@@ -120,8 +123,11 @@ window.R2Layout = function (env) {
        的占位又不变 → 页面被压回去。实测 1485px 窗口、120% 开目录：918 → 711 视觉宽，
        工具栏从 120% 掉到 93%（点放大反而变小）。现在放不下就横向滚动。
        `room` 仍然要算 —— 它只用来判断**笔记栏能不能并排**（并排时页面右侧得留出批注栏）。 */
-    const clientW = env.vpW();
-    const want = env.ZOOM_OK ? basePageW() : basePageW() * env.ZOOM();
+    const z = zt > 0 ? zt : 0;
+    /* 目标档位下的布局视口宽（clientWidth 是视觉宽，不随 zoom 变 → 可以直接除）；
+       不传 zt 时仍用当前档位的 vpW()，与改前完全一致。 */
+    const clientW = (z && env.vpWAt) ? env.vpWAt(z) : env.vpW();
+    const want = env.ZOOM_OK ? basePageW() : basePageW() * (z || env.ZOOM());
     const drawerOpen = !!($("side") && $("side").classList.contains("open"));
     // 左侧目录展开时也要给它让出宽度，否则页面会被盖住
     const tocW = env.tocPanelOpen() ? env.TOC_W : 0;
@@ -154,6 +160,93 @@ window.R2Layout = function (env) {
     env.noteW = t.noteW;
     env.noteLeft = t.pageW + 14;                            // 页面坐标：贴着页面右边线外侧
   }
+  /* ---- 重排过渡：正文块的位移（shift）插值 ----
+     并排 ↔ 内嵌切换要重建 DOM，卡片位置一变，下方正文会被「顶开」—— `it.shift`
+     （写到 `.blk` 的 translateY，连同页面级公式框 `.fbox`）以前也是瞬时的。
+     这里把重排前后同一块的两份位移都拿到，重排后先把块摆回旧位移，再跟卡片的 FLIP
+     共用同一根时间轴插值到新位移（时长/缓动完全一致，卡与正文不会错拍）。
+     ⚠️ 块的 transform 本来就被 shift 占用，所以不能套 FLIP，只能自己插值；
+     ⚠️ `.fbox` 不在块的 DOM 子树里，必须跟着一起平移（与 relayoutPage 同口径）。 */
+  function captureShift() {
+    const out = {};
+    (env.pages || []).forEach((pg, pi) => {
+      (pg.items || []).forEach((it, i) => {
+        if (!it.el) return;
+        out[pi + "#" + i] = { kind: it.kind, shift: it.shift || 0 };
+      });
+    });
+    return out;
+  }
+  function shiftTween(oldShift) {
+    const all = [];
+    (env.pages || []).forEach((pg, pi) => {
+      (pg.items || []).forEach((it, i) => {
+        if (!it.el) return;
+        const o = oldShift[pi + "#" + i];
+        if (o && o.kind === it.kind && Math.abs((it.shift || 0) - o.shift) >= 0.5) {
+          all.push({ el: it.el, from: o.shift, to: it.shift || 0, fbs: it.formulaBoxes || [] });
+        }
+      });
+    });
+    /* 先把所有块/公式框恢复成布局值：上一次过渡被打断时不会留下旧插值 */
+    (env.pages || []).forEach(pg => (pg.items || []).forEach(it => {
+      if (!it.el) return;
+      const v = it.shift ? "translateY(" + it.shift + "px)" : "";
+      it.el.style.transform = v;
+      const fbs = it.formulaBoxes || [];
+      for (let i = 0; i < fbs.length; i++) fbs[i].style.transform = v;
+    }));
+    if (!all.length) return null;
+    return function (q) {
+      for (let i = 0; i < all.length; i++) {
+        const t = all[i];
+        const v = q >= 1 ? t.to : t.from + (t.to - t.from) * q;
+        const s = Math.abs(v) < 0.05 ? "" : "translateY(" + (q >= 1 ? v : v.toFixed(2)) + "px)";
+        t.el.style.transform = s;
+        for (let j = 0; j < t.fbs.length; j++) t.fbs[j].style.transform = s;
+      }
+    };
+  }
+  /* ============ 「并排批注栏 ↔ 收回句子下方」的模式切换 ============
+     笔记卡一直都在 `.exp` 里，两种模式的区别只是 `applyNoteSide` 写的 position/left/width
+     + `relayoutPage` 里算不算它的高度（见 `inlineNotes`）—— 所以**不需要重建 DOM**：
+     `applyNoteChrome(t)` 换掉 body 类 / `--note-reserve` / noteW，再重排「有笔记卡的页」即可。
+     ⚠️ 别再退回 render()：页面宽度与版式坐标一点没变，整篇重建却要重造 15 页 / 9k 元素、
+        重跑 finalize（公式框重新 fit 实测 ~0.7s）再整篇布局一次，全都压在缩放落位后的
+        同一帧里 —— 实测单个长任务 2273ms，画面先冻住、之后笔记卡才滑出去。
+     卡片与正文块的位移走 FLIP（`env.flipPlay`，与缩放过渡同一套时长/缓动）；
+     `done` 在动画收尾时回调一次（「先切模式、再缩放」靠它接力，见 switchSideFor）。 */
+  function applySideSwitch(t, done) {
+    const flip = env.flipCapture ? env.flipCapture() : null;
+    const shift0 = captureShift();
+    applyNoteChrome(t);                       // body.notes-side + --note-reserve + noteW/noteLeft
+    layoutAi();                               // 预留宽度变了，文末 AI 面板的左右/上下堆叠要重判
+    /* 只有「有笔记卡的页」会变（顶开量算不算笔记卡高度就取决于这个模式），
+       其余页的版式坐标一动没动 —— 没必要挨页重量。 */
+    for (let pi = 0; pi < env.pages.length; pi++) {
+      const pg = env.pages[pi];
+      if (!pg || !(pg.items || []).some(it => it.kind === "blk" && it.nbox && !it.nbox.hidden)) continue;
+      relayoutPage(pi);
+    }
+    const tween = shiftTween(shift0);         // 新位移已经写好 → 返回的 tween 先把它们摆回旧值
+    if (env.flipPlay) env.flipPlay(flip, tween, done);
+    else { if (tween) tween(1); if (done) done(); }
+    env.paintFormulaMarks();                  // 公式框跟着挪了，高亮命中要重新对一遍
+  }
+  /* 缩放跨过「并排 ↔ 内嵌」临界时，**先**把笔记卡移到位、动画结束后**再**启动缩放过渡。
+     原因：切模式本身只要几十毫秒（动不到主线程），但缩放落位（写 `<html> zoom`）要整篇
+     重排 0.7~1.8s；如果反过来先缩放，FLIP 动画只能排在那次重排之后才跑得起来 ——
+     用户看到的就是「缩放完 ⇒ 冻一下 ⇒ 卡片才慢慢滑出去」。先切模式则重排那一帧前后
+     画面完全一致（卡片已经在终位），卡顿看不见。
+     `zt` = 目标档位（按 vpWAt 预判该档位下还放不放得下批注栏）；返回 true 表示
+     接管了这次缩放 —— 缩放过渡由 `done` 里启动。 */
+  function switchSideFor(zt, done) {
+    if (!env.DOC || !env.pages.length) return false;
+    const t = computePageTarget(zt);
+    if (t.side === env.noteSide) return false;
+    applySideSwitch(t, done);
+    return true;
+  }
   /* `only` = 只重排这几页（Set，逐页加载时空口令：每次只排刚挂上的页，
      其余页的 DOM 一动没动，没必要重新量）。不传 = 全部页。 */
   function relayoutAll(only) {
@@ -162,8 +255,9 @@ window.R2Layout = function (env) {
     const t = computePageTarget();
     if (Math.abs(t.pageW - env.curPageW) > 0.5) { env.render(); return; }   // 页面尺寸变了 → 整体重排
     /* 页面宽度现在与缩放档位无关（只跟文档基准宽走），所以改缩放不再需要整篇重建；
-       但「批注栏并排 ↔ 句子下方内嵌」的模式变了就必须重建（笔记卡挂在不同的容器里）。 */
-    if (t.side !== env.noteSide) { env.render(); return; }
+       「并排 ↔ 内嵌」的模式变了也只原地切一次（见 applySideSwitch 上方）。
+       （缩放跨临界时，r2-nav 会先用 switchSideFor 把这一步提到缩放过渡之前。） */
+    if (t.side !== env.noteSide) { applySideSwitch(t); return; }
     applyNoteChrome(t);
     layoutAi();
     env.pages.forEach((pg, pi) => {
@@ -465,5 +559,5 @@ window.R2Layout = function (env) {
 
   /* ============ 对外接口 ============ */
   return { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, xOverlap, pageColumns,
-           syncReadCenter, readCenterX, basePageW };
+           syncReadCenter, readCenterX, basePageW, switchSideFor };
 };

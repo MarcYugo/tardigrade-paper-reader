@@ -77,6 +77,7 @@ window.R2Notes = function (env) {
   function noteCardEl(item, note, si, editing) {
     const key = note ? note.block_id : sentKey(item, si);
     const card = el("div", "ncard" + (editing ? " editing" : ""));
+    card.dataset.nkey = key;      // 稳定标识：布局重排（并排 ↔ 内嵌）时用它做 FLIP 过渡（见 r2-view.js）
     const sentTxt = sentenceText(item, si) || "（原文句已不存在）";
 
     const head = el("div", "nhead");

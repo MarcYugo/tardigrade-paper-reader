@@ -78,6 +78,8 @@ docker run --rm -v paper-app-data:/d -v $PWD:/b alpine tar czf /b/app-data.tgz -
 | `PADDLE_OCR_URL` / `PADDLE_OCR_MODEL` / `PADDLE_OCR_API_KEY` | 见 compose | **已删除**：PaddleOCR-VL 的旧客户端与配对链路已随代码移除，这些变量不再被读取（仅作历史记录保留） |
 | `ALLOW_SIGNUP` | `1` | 未登录自助注册；**暴露到公网请设 0** |
 | `DEEPSEEK_API_KEY` 等 | 空 | 安装级默认 LLM；每个账号还能在网页里各自覆盖 |
+| `DRAW_SANDBOX_URL` | `http://host.docker.internal:8090/v1/run` | Agent 笔记图片调用的 draw-sandbox 接口；网页「🧪 沙盒设置」里可按账号覆盖（存账号偏好，只影响本人） |
+| `DRAW_SANDBOX_API_KEY` | 空 | 可选；需与 draw-sandbox 的 `SANDBOX_API_KEY` 一致 |
 | `MEM_LIMIT` / `MEM_RESERVATION` / `MEMSWAP_LIMIT` | 空（不限） | 容器内存硬上限 / 软保障 / “上限+swap”总配额（见第 8 节） |
 | `SHM_SIZE` | `512m` | `/dev/shm` 大小；Docker 默认只给 64MB，PDF 位图渲染容易撞上限 |
 

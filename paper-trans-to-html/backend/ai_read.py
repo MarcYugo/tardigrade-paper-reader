@@ -38,7 +38,8 @@
 （句子切分在 `reader2.js` 里做），后端负责收敛长度并拼成提示词。
 
 **带工具的对话 Agent 不在这里**：工具声明、工具循环与两个工具的实现（写整理卡片、
-定位页面 / 文本块）已拆到 `agents/ai_read_agent.py`，本模块只保留共用的上下文拼装
+定位页面 / 文本块）已在 `agents/skills/ai_read.py`（技能「辅助阅读」），循环本身在
+`agents/agent.py`；本模块只保留共用的上下文拼装
 （`chat_payload()`）与笔记整理。
 """
 from __future__ import annotations

@@ -1,9 +1,9 @@
 import json
 import unittest
 
-from backend.agents.note_out_agent import (extract_code_links, run_note_out_agent)
-from backend.note_out import (build_notes, build_sections, export_filename,
-                              export_paper, to_json)
+from backend.agents.skills.note_out import (extract_code_links, run_note_out_agent)
+from backend.notes_out import (build_notes, build_sections, export_filename,
+                               export_paper, to_json)
 
 
 def _block(block_id, text, kind="text"):
@@ -136,6 +136,13 @@ class NoteOutExportTest(unittest.TestCase):
         self.assertEqual(export["report"]["stats"]["sentence_notes"], 1)
         json.loads(to_json(export))          # 必须能序列化
         self.assertIn("note-export.json", export_filename(export["paper"]))
+        # Agent 导出的文件名要带 -agent
+        self.assertEqual(
+            export_filename(export["paper"], "agent"),
+            export_filename(export["paper"]).replace(
+                "-note-export.json", "-agent-note-export.json"))
+        self.assertIn("-agent-note-export.json", export_filename(export["paper"], "agent"))
+        self.assertNotIn("-agent", export_filename(export["paper"], "mechanical"))
 
     def test_agent_mode_requires_llm(self):
         with self.assertRaises(ValueError):
@@ -196,6 +203,36 @@ class NoteOutAgentTest(unittest.TestCase):
         self.assertIn("references_stats", report)
         json.loads(json.dumps(report, ensure_ascii=False))   # 可序列化
 
+    def test_empty_notes_analysis_falls_back_to_raw_notes(self):
+        """模型没整理笔记时，报告里也要有「笔记整理」（按页码原样归类）。"""
+        doc = _sample_doc()
+        anno = {"notes": [{"id": "n1", "block_id": "p0b4#0", "text": "我的第一条笔记"}],
+                "free_notes": [{"id": "f1", "title": "想法", "text": "独立笔记内容"}],
+                "highlights": {}}
+        notes = build_notes(anno, doc)
+
+        class _NoToolTranslator(_FakeTranslator):
+            def chat_completion(self, system, messages, *, tools=None, temperature=0.3):
+                return {"content": "已完成核查。"}      # 不调工具
+
+            def chat_json(self, system, user, *, temperature=0.1):
+                return {"summary": "测试报告", "paper_overview": {},
+                        "notes_analysis": {}, "references_review": [],
+                        "code_repositories": [], "conclusion": "",
+                        "next_steps": []}
+
+        report = run_note_out_agent(
+            _NoToolTranslator(),
+            paper={"title": "A Sample Paper", "num_pages": 2},
+            sections=build_sections(doc), notes=notes, verify_all=False)
+
+        analysis = report["notes_analysis"]
+        self.assertIn("2 条笔记", analysis["overview"])
+        titles = [t["title"] for t in analysis["themes"]]
+        self.assertIn("P1", titles)                 # 句子笔记按页码归组
+        self.assertIn("独立笔记", titles)
+        self.assertIn("我的第一条笔记", analysis["themes"][titles.index("P1")]["points"][0])
+
 
 class _QuietTranslator:
     """不调工具、只给报告的假 LLM（用于只测核验链路）。"""
@@ -210,7 +247,7 @@ class _QuietTranslator:
 
 class NoteOutFullVerifyTest(unittest.TestCase):
     def test_all_references_verified_and_counted(self):
-        import backend.agents.note_out_agent as agent
+        import backend.agents.skills.note_out as agent
 
         called = []
 
@@ -266,7 +303,7 @@ class CodeLinkTest(unittest.TestCase):
 
 class RefReviewConsistencyTest(unittest.TestCase):
     def test_evidence_status_wins_over_model(self):
-        from backend.agents.note_out_agent import _clean_ref_review
+        from backend.agents.skills.note_out import _clean_ref_review
 
         evidence = {"references": {
             1: {"status": "verified", "message": "ok"},
@@ -280,6 +317,37 @@ class RefReviewConsistencyTest(unittest.TestCase):
         self.assertEqual([(r["id"], r["status"]) for r in rows],
                          [(1, "verified"), (2, "not_found")])
         self.assertEqual(rows[0]["note"], "模型说没查到")   # 说明文字保留模型写法
+
+
+class RefSimilarityTest(unittest.TestCase):
+    """相似度独立成字段（不再写进 note），并附一份分布统计。"""
+
+    def test_similarity_field_and_summary(self):
+        from backend.agents.skills.note_out import (_clean_ref_review,
+                                                    _ref_similarity_summary)
+
+        evidence = {"references": {
+            1: {"status": "verified", "message": "ok",
+                "best": {"title": "A", "similarity": 0.96}},
+            2: {"status": "verified", "message": "ok",
+                "best": {"title": "B", "similarity": 0.62}},
+            3: {"status": "not_found", "message": "no"},
+        }}
+        rows = _clean_ref_review([], evidence)
+        self.assertEqual([r["id"] for r in rows], [1, 2, 3])
+        self.assertEqual(rows[0]["similarity"], 0.96)
+        self.assertEqual(rows[1]["similarity"], 0.62)
+        self.assertIsNone(rows[2]["similarity"])
+        # 相似度不再出现在 note 文本里
+        for row in rows:
+            self.assertNotIn("相似度", row["note"])
+
+        summary = _ref_similarity_summary(rows)
+        self.assertEqual((summary["total"], summary["with_similarity"],
+                          summary["missing"]), (3, 2, 1))
+        self.assertEqual((summary["high"], summary["medium"], summary["low"]),
+                         (1, 0, 1))
+        self.assertIn("高相似度", summary["text"])
 
 
 if __name__ == "__main__":

@@ -492,14 +492,26 @@ function openShareModal(docId, title, onChange) {
 }
 
 /* 笔记导出弹窗（阅读页顶栏「📤 导出」，位置在「⚙ 设置」右侧）。
-   导出的是后端 `POST /api/doc/{id}/note-out` 返回的 JSON：
+   导出的是后端 `POST /api/doc/{id}/note-out` 返回的结果：
    论文分节（title / abstract / main_text / references / appendix）
    + 句子笔记 / 独立笔记 / 高亮 + 分析报告。
    · 机械导出：纯本地、零 LLM 成本；
-   · Agent 导出：核验参考文献 + 提取代码仓库 + 生成报告（需要当前账号的 LLM）。 */
+   · Agent 导出：核验参考文献 + 提取代码仓库 + 生成报告（需要当前账号的 LLM）；
+   · 文本（JSON）/ 图片（PNG；Agent 图片由 Python 绘图代码在沙盒中生成）。 */
 function downloadJsonFile(data, name) {
   const blob = new Blob([JSON.stringify(data, null, 2)],
                         { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+function downloadBlob(blob, name) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -514,7 +526,33 @@ function noteExportFileName(data) {
   const title = String((data && data.paper && data.paper.title) || "paper").trim() || "paper";
   const safe = title.replace(/[\\/:*?"<>|]+/g, "_").replace(/^[ ._]+|[ ._]+$/g, "")
                    .slice(0, 60) || "paper";
-  return safe + "-note-export.json";
+  // Agent 导出在文件名里带上 agent，便于和机械导出区分
+  const tag = String((data && data.mode) || "").toLowerCase() === "agent" ? "-agent" : "";
+  return safe + tag + "-note-export.json";
+}
+
+/* 图片导出在请求前就得知道文件名（响应是二进制，没有 paper.title） */
+function noteExportImageName(title, mode) {
+  const safe = String(title || "paper").trim()
+    .replace(/[\\/:*?"<>|]+/g, "_").replace(/^[ ._]+|[ ._]+$/g, "").slice(0, 60);
+  const tag = String(mode || "").toLowerCase() === "agent" ? "-agent" : "";
+  return (safe || "paper") + tag + "-note-export.png";
+}
+
+/* 导出请求：JSON 走 api()，图片要拿二进制，所以统一走这个原生 fetch。 */
+async function postNoteExport(docId, body) {
+  const r = await fetch("/api/doc/" + encodeURIComponent(docId) + "/note-out", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let msg = "请求失败(" + r.status + ")";
+    try { const j = await r.json(); if (j && j.detail) msg = j.detail; } catch (e) { /* ignore */ }
+    if (r.status === 401) gotoLogin();
+    throw new Error(msg);
+  }
+  return r;
 }
 
 function openNoteExportModal(docId) {
@@ -531,29 +569,125 @@ function openNoteExportModal(docId) {
         <button class="modal-x" data-close title="关闭">×</button></div>
       <div class="modal-body">
         <p class="hint" style="margin:0 0 12px">
-          把《<b id="noTitle"></b>》导出为 JSON：论文按
+          把《<b id="noTitle"></b>》导出：论文按
           <b>标题 / 摘要 / 正文 / 参考文献 / 附录</b> 分节，
           并带上句子笔记、独立笔记、高亮与分析报告。
         </p>
         <div class="field">
-          <label>导出模式</label>
-          <div class="seg no-seg" id="noMode">
-            <button type="button" data-mode="mechanical" class="on">机械导出</button>
-            <button type="button" data-mode="agent">Agent 导出</button>
-          </div>
+          <label>导出方式</label>
+          <table class="no-table" id="noMode">
+            <thead>
+              <tr>
+                <th></th>
+                <th scope="col">机械导出</th>
+                <th scope="col">Agent 导出</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">文本（JSON）</th>
+                <td><label class="no-cell on">
+                  <input type="radio" name="noPick" value="mechanical|json" autocomplete="off" checked>
+                  <span class="no-dot"></span></label></td>
+                <td><label class="no-cell">
+                  <input type="radio" name="noPick" value="agent|json" autocomplete="off">
+                  <span class="no-dot"></span></label></td>
+              </tr>
+              <tr>
+                <th scope="row">图片（PNG）</th>
+                <td><label class="no-cell" title="Matplotlib + XKCD 手绘风，三栏固定版式">
+                  <input type="radio" name="noPick" value="mechanical|image" autocomplete="off">
+                  <span class="no-dot"></span></label></td>
+                <td><label class="no-cell" title="Agent 生成绘图代码并在 draw-sandbox 中执行">
+                  <input type="radio" name="noPick" value="agent|image" autocomplete="off">
+                  <span class="no-dot"></span></label></td>
+              </tr>
+            </tbody>
+          </table>
           <div class="hint" id="noModeHint"></div>
         </div>
         <div class="field" id="noInstrField" hidden>
-          <label for="noInstr">额外要求（可选，仅 Agent 导出使用）</label>
+          <label for="noInstr">额外要求（可选，Agent 报告与图片风格/栏目均会参考）</label>
           <textarea id="noInstr" class="no-instr" rows="4"
-                    placeholder="例如：重点核验与 XX 相关的参考文献；顺便找找作者的项目主页。"></textarea>
+                    placeholder="例如：重点核验与 XX 相关的参考文献；图片用深色横版布局，增加方法流程栏。"></textarea>
         </div>
+        <details class="no-fold" id="noScholar">
+          <summary>🔗 学术库 Key（可选：Agent 导出核验参考文献用）</summary>
+          <div class="no-fold-body">
+            <p class="hint" style="margin:0 0 12px">
+              <b>同样跟账号走</b>：不填也能用，但免费额度<b>共享且易限流</b>，
+              自备 Key 命中率更高。
+            </p>
+            <div class="field">
+              <label for="scOpenAlex">OpenAlex API Key</label>
+              <input id="scOpenAlex" type="password" autocomplete="new-password" spellcheck="false"
+                     placeholder="留空表示不修改">
+              <div class="hint" id="scOpenAlexHint">展开后读取中…</div>
+            </div>
+            <div class="field">
+              <label for="scS2Base">Semantic Scholar 服务地址</label>
+              <input id="scS2Base" autocomplete="off" spellcheck="false"
+                     placeholder="https://s2api.ominiai.cn/s2">
+              <div class="hint">
+                默认走代理：地址填到 <code>/s2</code>，令牌作 <code>Bearer</code>；
+                填 <code>https://api.semanticscholar.org</code> 则官方直连（用 <code>x-api-key</code>）。
+              </div>
+            </div>
+            <div class="field">
+              <label for="scS2">Semantic Scholar 令牌 / Key</label>
+              <input id="scS2" type="password" autocomplete="new-password" spellcheck="false"
+                     placeholder="留空表示不修改">
+              <div class="hint" id="scS2Hint">展开后读取中…</div>
+            </div>
+            <div class="field">
+              <label for="scMailto">联系邮箱（Crossref / OpenAlex polite pool，可选）</label>
+              <input id="scMailto" autocomplete="off" spellcheck="false"
+                     placeholder="you@example.com">
+              <div class="hint" id="scMailtoHint">展开后读取中…</div>
+            </div>
+            <div class="row-actions">
+              <button class="btn" id="scTest" type="button">测试连接</button>
+              <button class="btn primary" id="scSave" type="button">保存</button>
+              <button class="btn" id="scReset" type="button"
+                      title="删除本账号设置，回落到 .env / 环境变量">清除本账号设置</button>
+            </div>
+            <div class="form-err" id="scErr" hidden></div>
+            <div class="form-ok" id="scOk" hidden></div>
+            <div class="hint" id="scNotes"></div>
+          </div>
+        </details>
+        <details class="no-fold" id="noSandbox">
+          <summary>🧪 沙盒设置（可选：Agent 图片的绘图沙盒地址）</summary>
+          <div class="no-fold-body">
+            <p class="hint" style="margin:0 0 12px">
+              <b>同样跟账号走</b>：默认沿用安装级配置（环境变量 / 内置本地地址），
+              一般不用改；沙盒跑在别的容器或机器上时，填它的请求地址即可，只影响本账号。
+            </p>
+            <div class="field">
+              <label for="sbUrl">绘图沙盒请求地址</label>
+              <input id="sbUrl" autocomplete="off" spellcheck="false"
+                     placeholder="http://127.0.0.1:8090/v1/run">
+              <div class="hint" id="sbUrlHint">展开后读取中…</div>
+            </div>
+            <div class="row-actions">
+              <button class="btn primary" id="sbSave" type="button">保存</button>
+              <button class="btn" id="sbReset" type="button"
+                      title="清除本账号设置，回落到环境变量 / 内置默认">恢复默认</button>
+            </div>
+            <div class="form-err" id="sbErr" hidden></div>
+            <div class="form-ok" id="sbOk" hidden></div>
+            <div class="hint" id="sbNotes"></div>
+          </div>
+        </details>
         <div class="form-err" id="noErr" hidden></div>
         <div class="form-ok" id="noOk" hidden></div>
         <ul class="no-list">
           <li><b>机械导出</b>：纯本地、零 LLM 成本，通常几秒完成。</li>
           <li><b>Agent 导出</b>：联网核验参考文献、提取并确认代码仓库地址，再生成分析报告；
-              需要当前账号配置 LLM，可能耗时 1–3 分钟。</li>
+              需要当前账号配置 LLM，可能耗时 1–3 分钟；图片由绘图 Agent 编写 Python 并在 draw-sandbox 执行。</li>
+          <li><b>文本（JSON）</b>：完整导出数据；<b>机械图片</b>：Matplotlib + XKCD
+              手绘风三栏版式；<b>Agent 图片</b>：默认同款风格，第一栏增加文献核查摘要，
+              也可在额外要求中自定义风格或栏目。</li>
         </ul>
       </div>
       <div class="modal-foot">
@@ -563,36 +697,79 @@ function openNoteExportModal(docId) {
     </div>`;
   document.body.appendChild(m);
 
+  /* 顶部锚定：与设置弹窗同一个顶部位置（8% 视口高），内容变高（展开「学术库 Key / 沙盒设置」/ 切 Agent 模式）时
+     只向下长高、顶部不动；超出屏幕就由卡片自己滚。 */
+  anchorModalTop(m);
+
   const $ = id => m.querySelector("#" + id);
   $("noTitle").textContent = docTitle || "这篇论文";
 
   const modeHints = {
     mechanical: "纯本地解析：论文分节 + 笔记 / 高亮 + 统计报告，不调用 LLM。",
-    agent: "在机械导出的基础上调用 Agent：核验参考文献真实性、提取代码地址并生成分析报告。",
+    agent: "在机械导出的基础上调用 Agent：核验参考文献真实性、提取代码地址并生成分析报告。" +
+           "（可在下方「🔗 学术库 Key」里填自备 Key，降低限流。）",
   };
-  let mode = "mechanical";
+  const formatHints = {
+    json: "文本（JSON）：完整导出数据，可再交给其它工具处理。",
+    image: "图片（PNG）：Matplotlib + XKCD 手绘风，三栏固定版式，配色跟随当前主题。",
+  };
+  let mode = "mechanical";     // mechanical | agent
+  let format = "json";        // json | image
+  let busy = false;           // 正在导出：期间不允许关闭弹窗（Agent 导出可能要几分钟）
   const err = msg => { const n = $("noErr"); n.textContent = msg || ""; n.hidden = !msg; };
   const ok = msg => { const n = $("noOk"); n.textContent = msg || ""; n.hidden = !msg; };
 
   function syncMode() {
-    $("noMode").querySelectorAll("button[data-mode]").forEach(b => {
-      b.classList.toggle("on", b.dataset.mode === mode);
+    $("noMode").querySelectorAll('input[name="noPick"]').forEach(inp => {
+      const [m, f] = String(inp.value).split("|");
+      inp.checked = (m === mode && (f || "json") === format);
+      const cell = inp.closest(".no-cell");
+      if (cell) cell.classList.toggle("on", inp.checked);   // 表格单元格高亮（禁用格不会命中）
     });
-    $("noModeHint").textContent = modeHints[mode];
+    const formatHint = format === "image" && mode === "agent"
+      ? "图片（PNG）：Agent 默认沿用 XKCD 三栏风格，第一栏含文献核查摘要；可用额外要求自定义。"
+      : formatHints[format];
+    $("noModeHint").textContent = modeHints[mode] + " " + formatHint;
     $("noInstrField").hidden = mode !== "agent";
-    $("noGo").textContent = mode === "agent" ? "Agent 分析并导出" : "导出并下载";
+    $("noGo").textContent = (mode === "agent" ? "Agent 分析并导出" : "导出并下载") +
+      (format === "image" ? "（图片）" : "");
   }
 
-  $("noMode").onclick = (e) => {
-    const b = e.target.closest("button[data-mode]");
-    if (!b) return;
-    mode = b.dataset.mode;
+  /* 表格：列头 = 机械 / Agent，行头 = 文本（JSON）/ 图片；直接在格子里勾选 */
+  $("noMode").addEventListener("change", (e) => {
+    const inp = e.target.closest('input[name="noPick"]');
+    if (!inp || inp.disabled) return;
+    const [m, f] = String(inp.value).split("|");
+    mode = m || "mechanical";
+    format = f || "json";
     err("");
     ok("");
     syncMode();
-  };
+  });
+
+  /* 导出期间：弹窗锁住（× / 遮罩 / Esc / 「关闭」都关不掉），
+     并拦住刷新 / 关标签页 —— 请求本身不会被「关闭弹窗」取消，但刷新会中断。 */
+  function onUnload(e) {
+    e.preventDefault();
+    e.returnValue = "正在导出，离开页面会中断导出。";
+    return e.returnValue;
+  }
+  function setBusy(on) {
+    busy = !!on;
+    m.classList.toggle("modal-busy", busy);
+    m.querySelectorAll("[data-close]").forEach(b => { b.disabled = busy; });
+    $("noMode").querySelectorAll('input[name="noPick"]').forEach(inp => {
+      inp.disabled = busy;
+    });
+    if (busy) window.addEventListener("beforeunload", onUnload);
+    else window.removeEventListener("beforeunload", onUnload);
+  }
 
   function close() {
+    if (busy) {
+      toast("正在导出，完成前请先不要关闭弹窗", 2600);
+      return;
+    }
     document.removeEventListener("keydown", onEsc);
     m.remove();
   }
@@ -603,29 +780,199 @@ function openNoteExportModal(docId) {
   m.querySelectorAll("[data-close]").forEach(b => b.onclick = close);
   document.addEventListener("keydown", onEsc);
 
+  /* ---- 学术库 Key（原「⚙ 设置 → 学术检索」页签，归到导出里）：只有 Agent 导出会用到 ---- */
+  const scholarBox = $("noScholar");
+  let scholar = null;
+  const scMsg = (node, msg) => {
+    node.innerHTML = msg ? esc(msg).replace(/\n/g, "<br>") : "";
+    node.hidden = !msg;
+  };
+  const scErr = msg => scMsg($("scErr"), msg);
+  const scOk = msg => scMsg($("scOk"), msg);
+
+  function renderScholar(d) {
+    scholar = d || {};
+    const oa = d && d.openalex_key_set ? d.openalex_key_masked : "";
+    const s2 = d && d.semantic_scholar_key_set ? d.semantic_scholar_key_masked : "";
+    $("scOpenAlex").value = "";
+    $("scS2").value = "";
+    $("scOpenAlex").placeholder = oa ? ("已保存：" + oa + "（留空不改）") : "留空不改 /";
+    $("scS2").placeholder = s2 ? ("已保存：" + s2 + "（留空不改）") : "留空不改 /";
+    $("scS2Base").value = (d && d.s2_base_url) || "";
+    $("scMailto").value = (d && d.mailto) || "";
+    const src = (d && d.source_text) || {};
+    $("scOpenAlexHint").textContent =
+      "来源：" + (src.openalex_key || "未配置") +
+      "；不配则共用免费额度，容易用尽";
+    $("scS2Hint").textContent =
+      "来源：" + (src.semantic_scholar_key || "未配置") +
+      "；代理用 Bearer；官方直连约 1 次/秒，超限返回 429";
+    $("scMailtoHint").textContent =
+      "来源：" + (src.mailto || "未配置") +
+      "；填写后进入 Crossref / OpenAlex polite pool，限额更宽";
+    $("scNotes").innerHTML = (d && d.from_ui)
+      ? ("本账号最后修改：" + esc(String(d.updated_by || "") + " " +
+         String(d.updated_at || "").replace("T", " ")))
+      : "当前用的是安装级配置（环境变量 / <code>.env</code>）；保存后会以本账号为准。";
+  }
+
+  async function loadScholar() {
+    scErr(""); scOk("");
+    try { renderScholar(await api("/api/settings/scholar")); }
+    catch (e) { scErr("读取失败：" + e.message); }
+  }
+
+  function scholarBody() {
+    const body = { mailto: $("scMailto").value.trim(),
+                   s2_base_url: $("scS2Base").value.trim() };
+    const oa = $("scOpenAlex").value.trim();
+    const s2 = $("scS2").value.trim();
+    if (oa) body.openalex_key = oa;      // 留空 = 不修改
+    if (s2) body.semantic_scholar_key = s2;
+    return body;
+  }
+
+  $("scSave").onclick = async () => {
+    scErr(""); scOk("");
+    const btn = $("scSave");
+    btn.disabled = true; btn.textContent = "保存中…";
+    try {
+      const r = await api("/api/settings/scholar", { method: "POST", json: scholarBody() });
+      renderScholar(r);
+      scOk("✅ 已保存到本账号（" + (r.owner || "") + "）");
+      toast("学术库设置已保存（本账号）");
+    } catch (e) { scErr(e.message); } finally {
+      btn.disabled = false; btn.textContent = "保存";
+    }
+  };
+
+  $("scTest").onclick = async () => {
+    scErr(""); scOk("");
+    const btn = $("scTest");
+    btn.disabled = true; btn.textContent = "测试中…";
+    try {
+      const r = await api("/api/settings/scholar/test", { method: "POST", json: scholarBody() });
+      const detail = (r.checks || []).map(c => (c.ok ? "✅ " : "❌ ") + c.label +
+        (c.ok ? "（返回 " + c.count + " 条）" : (c.error ? "：" + c.error : ""))).join("\n");
+      (r.ok ? scOk : scErr)((r.message || "") + (detail ? "\n" + detail : ""));
+    } catch (e) { scErr("❌ " + e.message); } finally {
+      btn.disabled = false; btn.textContent = "测试连接";
+    }
+  };
+
+  $("scReset").onclick = async () => {
+    if (!confirm("清除本账号的学术库设置？\n\n清除后会回落到环境变量 / .env 里的配置。")) return;
+    scErr(""); scOk("");
+    try {
+      renderScholar(await api("/api/settings/scholar",
+                              { method: "POST", json: { reset: true } }));
+      scOk("已清除本账号设置，回落到环境变量 / .env");
+    } catch (e) { scErr(e.message); }
+  };
+
+  /* 首次展开才去拉一次配置，不展开就不发请求 */
+  scholarBox.addEventListener("toggle", () => {
+    if (scholarBox.open && !scholar) loadScholar();
+  });
+
+  /* ---- 沙盒设置（与「学术库 Key」同理：折叠、展开才拉配置）：只有 Agent 图片会用到 ---- */
+  const sandboxBox = $("noSandbox");
+  let sandbox = null;
+  const sbMsg = (node, msg) => {
+    node.textContent = msg || "";
+    node.hidden = !msg;
+  };
+  const sbErr = msg => sbMsg($("sbErr"), msg);
+  const sbOk = msg => sbMsg($("sbOk"), msg);
+
+  function renderSandbox(d) {
+    sandbox = d || {};
+    const fromUi = Boolean(d && d.from_ui);
+    const def = (d && d.default_url) || "http://127.0.0.1:8090/v1/run";
+    $("sbUrl").value = fromUi ? String(d.raw_url || "") : "";
+    $("sbUrl").placeholder = "默认：" + def;
+    $("sbUrlHint").textContent =
+      "当前生效：" + ((d && d.url) || def) +
+      "（来源：" + ((d && d.source_text) || "内置默认") + "）" +
+      "；可只填到端口，例如 http://host:8090";
+    $("sbNotes").innerHTML = fromUi
+      ? ("本账号最后修改：" + esc(String(d.updated_by || "") + " " +
+         String(d.updated_at || "").replace("T", " ")) +
+         "；清空后保存即恢复默认。")
+      : "当前用的是安装级配置（环境变量 <code>DRAW_SANDBOX_URL</code> / 内置默认）；" +
+        "保存后会以本账号为准。";
+  }
+
+  async function loadSandbox() {
+    sbErr(""); sbOk("");
+    try { renderSandbox(await api("/api/settings/sandbox")); }
+    catch (e) { sbErr("读取失败：" + e.message); }
+  }
+
+  $("sbSave").onclick = async () => {
+    sbErr(""); sbOk("");
+    const btn = $("sbSave");
+    btn.disabled = true; btn.textContent = "保存中…";
+    try {
+      const r = await api("/api/settings/sandbox",
+                          { method: "POST", json: { url: $("sbUrl").value.trim() } });
+      renderSandbox(r);
+      sbOk("✅ 已保存到本账号（" + (r.owner || "") + "）");
+      toast("沙盒设置已保存（本账号）");
+    } catch (e) { sbErr(e.message); } finally {
+      btn.disabled = false; btn.textContent = "保存";
+    }
+  };
+
+  $("sbReset").onclick = async () => {
+    if (!confirm("恢复沙盒默认设置？\n\n清除本账号的地址后，回落到环境变量 / 内置默认。")) return;
+    sbErr(""); sbOk("");
+    try {
+      renderSandbox(await api("/api/settings/sandbox",
+                              { method: "POST", json: { reset: true } }));
+      sbOk("已恢复默认设置");
+    } catch (e) { sbErr(e.message); }
+  };
+
+  /* 首次展开才去拉一次配置，不展开就不发请求 */
+  sandboxBox.addEventListener("toggle", () => {
+    if (sandboxBox.open && !sandbox) loadSandbox();
+  });
+
   $("noGo").onclick = async () => {
     err("");
     ok("");
     const btn = $("noGo");
     const label = btn.textContent;
+    setBusy(true);
     btn.disabled = true;
-    btn.textContent = mode === "agent" ? "Agent 分析中…" : "导出中…";
+    btn.textContent = format === "image" ? "绘制图片中…"
+      : (mode === "agent" ? "Agent 分析中…" : "导出中…");
+    const payload = {
+      mode,
+      format,
+      theme: currentTheme(),               // 图片配色跟随阅读页当前主题
+      instructions: mode === "agent" ? $("noInstr").value.trim() : "",
+    };
     try {
-      const data = await api("/api/doc/" + encodeURIComponent(docId) + "/note-out", {
-        method: "POST",
-        json: {
-          mode,
-          instructions: mode === "agent" ? $("noInstr").value.trim() : "",
-        },
-      });
-      const name = noteExportFileName(data);
-      downloadJsonFile(data, name);
-      const summary = data && data.report && data.report.summary;
-      ok("✅ 已下载 " + name + (summary ? "：" + summary : ""));
-      toast("笔记导出已下载", 3200);
+      if (format === "image") {
+        const name = noteExportImageName(docTitle, mode);
+        const blob = await (await postNoteExport(docId, payload)).blob();
+        downloadBlob(blob, name);
+        ok("✅ 已下载 " + name);
+        toast("笔记图片已下载", 3200);
+      } else {
+        const data = await (await postNoteExport(docId, payload)).json();
+        const name = noteExportFileName(data);
+        downloadJsonFile(data, name);
+        const summary = data && data.report && data.report.summary;
+        ok("✅ 已下载 " + name + (summary ? "：" + summary : ""));
+        toast("笔记导出已下载", 3200);
+      }
     } catch (e) {
       err(e.message);
     } finally {
+      setBusy(false);
       btn.disabled = false;
       btn.textContent = label;
     }
@@ -836,7 +1183,23 @@ document.addEventListener("wheel", (e) => {
   e.preventDefault();                                // 到顶 / 到底 / 没得滚 → 只吞掉，不带动页面
 }, { passive: false, capture: true });
 
-/* 设置弹窗：LLM 服务 / 存储 与 OCR / 账号 三个页签（首页 / 阅读页共用） */
+/* 弹窗「顶部锚定」：设置 / 导出两个弹窗都从**同一个顶部位置**开始（8% 视口高），
+   内容变高（切页签 / 展开折叠区 / 换导出方式）时卡片只向下长高、顶部不动；
+   高度仍随内容，超出视口就由卡片自己滚。 */
+const MODAL_TOP_RATIO = 0.08;      // 顶部距离 = 视口高 × 8%（两个弹窗一致）
+function anchorModalTop(m) {
+  const card = m.querySelector(".modal-card");
+  if (!card) return;
+  const gz = parseFloat(getComputedStyle(document.documentElement).zoom) || 1;
+  const vh = window.innerHeight / gz;          // 布局坐标下的视口高度
+  const top = Math.max(8, Math.round(vh * MODAL_TOP_RATIO));
+  m.classList.add("modal-top");
+  m.style.setProperty("--modal-top", top + "px");
+  m.style.setProperty("--modal-maxh", Math.max(240, Math.round(vh - top - 10)) + "px");
+}
+
+/* 设置弹窗：LLM 服务 / 存储 与 OCR / 账号 三个页签（首页 / 阅读页共用）。
+   学术库 Key 已从这里的「学术检索」页签移到阅读页「📤 导出」弹窗里（见 openNoteExportModal）。 */
 function openLlmModal(tab) {
   if (document.getElementById("llmModal")) return;
   const m = el("div", "modal");
@@ -849,7 +1212,6 @@ function openLlmModal(tab) {
       <div class="tabs">
         <button class="tab on" id="tabLlm" type="button">LLM 服务</button>
         <button class="tab" id="tabSys" type="button">存储 / OCR</button>
-        <button class="tab" id="tabScholar" type="button">学术检索</button>
         <button class="tab" id="tabAcc" type="button">账号</button>
       </div>
       <div class="modal-body" id="paneLlm">
@@ -953,48 +1315,6 @@ function openLlmModal(tab) {
         </div>
         <div class="form-err" id="sysErr" hidden></div>
       </div>
-      <div class="modal-body" id="paneScholar" hidden>
-        <p class="hint" style="margin:0 0 12px">
-          <b>学术库 Key，同样跟账号走</b>：导出时逐条核验参考文献。不填也能用，
-          但免费额度<b>共享且易限流</b>，自备 Key 命中率更高。
-        </p>
-        <div class="field">
-          <label for="scOpenAlex">OpenAlex API Key</label>
-          <input id="scOpenAlex" type="password" autocomplete="new-password" spellcheck="false"
-                 placeholder="留空表示不修改">
-          <div class="hint" id="scOpenAlexHint">读取中…</div>
-        </div>
-        <div class="field">
-          <label for="scS2Base">Semantic Scholar 服务地址</label>
-          <input id="scS2Base" autocomplete="off" spellcheck="false"
-                 placeholder="https://s2api.ominiai.cn/s2">
-          <div class="hint">
-            默认走代理：地址填到 <code>/s2</code>，令牌作 <code>Bearer</code>；
-            填 <code>https://api.semanticscholar.org</code> 则官方直连（用 <code>x-api-key</code>）。
-          </div>
-        </div>
-        <div class="field">
-          <label for="scS2">Semantic Scholar 令牌 / Key</label>
-          <input id="scS2" type="password" autocomplete="new-password" spellcheck="false"
-                 placeholder="留空表示不修改">
-          <div class="hint" id="scS2Hint">读取中…</div>
-        </div>
-        <div class="field">
-          <label for="scMailto">联系邮箱（Crossref / OpenAlex polite pool，可选）</label>
-          <input id="scMailto" autocomplete="off" spellcheck="false"
-                 placeholder="you@example.com">
-          <div class="hint" id="scMailtoHint">读取中…</div>
-        </div>
-        <div class="row-actions">
-          <button class="btn" id="scTest" type="button">测试连接</button>
-          <button class="btn primary" id="scSave" type="button">保存</button>
-          <button class="btn" id="scReset" type="button"
-                  title="删除本账号设置，回落到 .env / 环境变量">清除本账号设置</button>
-        </div>
-        <div class="form-err" id="scErr" hidden></div>
-        <div class="form-ok" id="scOk" hidden></div>
-        <div class="hint" id="scNotes"></div>
-      </div>
       <div class="modal-body" id="paneAcc" hidden>
         <div class="field">
           <label>当前账号</label>
@@ -1041,6 +1361,7 @@ function openLlmModal(tab) {
       </div>
     </div>`;
   document.body.appendChild(m);
+  anchorModalTop(m);        // 与导出弹窗同一个顶部位置，切页签只向下长高
 
   const $ = id => m.querySelector("#" + id);
   const err = msg => { const n = $("lmErr"); n.textContent = msg || ""; n.hidden = !msg; };
@@ -1540,100 +1861,10 @@ function openLlmModal(tab) {
   document.addEventListener("click", onDocClick);
   $("lmKey").addEventListener("input", () => { keyTouched = true; });
 
-  /* ---- 学术检索（参考文献核验）配置：同样按账号存 ---- */
-  let scholar = null;
-  const scMsg = (node, msg) => {
-    node.innerHTML = msg ? esc(msg).replace(/\n/g, "<br>") : "";
-    node.hidden = !msg;
-  };
-  const scErr = msg => scMsg($("scErr"), msg);
-  const scOk = msg => scMsg($("scOk"), msg);
-
-  function renderScholar(d) {
-    scholar = d || {};
-    const oa = d && d.openalex_key_set ? d.openalex_key_masked : "";
-    const s2 = d && d.semantic_scholar_key_set ? d.semantic_scholar_key_masked : "";
-    $("scOpenAlex").value = "";
-    $("scS2").value = "";
-    $("scOpenAlex").placeholder = oa ? ("已保存：" + oa + "（留空不改）") : "留空不改 /";
-    $("scS2").placeholder = s2 ? ("已保存：" + s2 + "（留空不改）") : "留空不改 /";
-    $("scS2Base").value = (d && d.s2_base_url) || "";
-    $("scMailto").value = (d && d.mailto) || "";
-    const src = (d && d.source_text) || {};
-    $("scOpenAlexHint").textContent =
-      "来源：" + (src.openalex_key || "未配置") +
-      "；不配则共用免费额度，容易用尽";
-    $("scS2Hint").textContent =
-      "来源：" + (src.semantic_scholar_key || "未配置") +
-      "；代理用 Bearer；官方直连约 1 次/秒，超限返回 429";
-    $("scMailtoHint").textContent =
-      "来源：" + (src.mailto || "未配置") +
-      "；填写后进入 Crossref / OpenAlex polite pool，限额更宽";
-    $("scNotes").innerHTML = (d && d.from_ui)
-      ? ("本账号最后修改：" + esc(String(d.updated_by || "") + " " +
-         String(d.updated_at || "").replace("T", " ")))
-      : "当前用的是安装级配置（环境变量 / <code>.env</code>）；保存后会以本账号为准。";
-  }
-
-  async function loadScholar() {
-    scErr(""); scOk("");
-    try { renderScholar(await api("/api/settings/scholar")); }
-    catch (e) { scErr("读取失败：" + e.message); }
-  }
-
-  function scholarBody() {
-    const body = { mailto: $("scMailto").value.trim(),
-                   s2_base_url: $("scS2Base").value.trim() };
-    const oa = $("scOpenAlex").value.trim();
-    const s2 = $("scS2").value.trim();
-    if (oa) body.openalex_key = oa;      // 留空 = 不修改
-    if (s2) body.semantic_scholar_key = s2;
-    return body;
-  }
-
-  $("scSave").onclick = async () => {
-    scErr(""); scOk("");
-    const btn = $("scSave");
-    btn.disabled = true; btn.textContent = "保存中…";
-    try {
-      const r = await api("/api/settings/scholar", { method: "POST", json: scholarBody() });
-      renderScholar(r);
-      scOk("✅ 已保存到本账号（" + (r.owner || "") + "）");
-      toast("学术库设置已保存（本账号）");
-    } catch (e) { scErr(e.message); } finally {
-      btn.disabled = false; btn.textContent = "保存";
-    }
-  };
-
-  $("scTest").onclick = async () => {
-    scErr(""); scOk("");
-    const btn = $("scTest");
-    btn.disabled = true; btn.textContent = "测试中…";
-    try {
-      const r = await api("/api/settings/scholar/test", { method: "POST", json: scholarBody() });
-      const detail = (r.checks || []).map(c => (c.ok ? "✅ " : "❌ ") + c.label +
-        (c.ok ? "（返回 " + c.count + " 条）" : (c.error ? "：" + c.error : ""))).join("\n");
-      (r.ok ? scOk : scErr)((r.message || "") + (detail ? "\n" + detail : ""));
-    } catch (e) { scErr("❌ " + e.message); } finally {
-      btn.disabled = false; btn.textContent = "测试连接";
-    }
-  };
-
-  $("scReset").onclick = async () => {
-    if (!confirm("清除本账号的学术库设置？\n\n清除后会回落到环境变量 / .env 里的配置。")) return;
-    scErr(""); scOk("");
-    try {
-      renderScholar(await api("/api/settings/scholar",
-                              { method: "POST", json: { reset: true } }));
-      scOk("已清除本账号设置，回落到环境变量 / .env");
-    } catch (e) { scErr(e.message); }
-  };
-
-  /* ---- 页签：LLM 服务 / 存储与 OCR / 学术检索 / 账号 ---- */
+  /* ---- 页签：LLM 服务 / 存储与 OCR / 账号 ---- */
   function switchTab(which) {
     const isLlm = which === "llm";
     const isSys = which === "sys";
-    const isSch = which === "scholar";
     const isAcc = which === "acc";
     toggleProfileMenu(false);        // 切页签时收起配置下拉
     providerDrop.toggle(false);      // 服务类型下拉也一并收起
@@ -1641,20 +1872,16 @@ function openLlmModal(tab) {
     ocrDrop.toggle(false);           // OCR 后端下拉也一样
     $("tabLlm").classList.toggle("on", isLlm);
     $("tabSys").classList.toggle("on", isSys);
-    $("tabScholar").classList.toggle("on", isSch);
     $("tabAcc").classList.toggle("on", isAcc);
     $("paneLlm").hidden = !isLlm;
     $("paneSys").hidden = !isSys;
-    $("paneScholar").hidden = !isSch;
     $("paneAcc").hidden = !isAcc;
     $("lmFoot").hidden = !isLlm;    // 底部按钮只属于 LLM 页签
     if (isAcc) loadUsers();
     if (isSys) { loadStorage(); loadParser(); }   // 进面板时刷新存储 / 解析状态
-    if (isSch && !scholar) loadScholar();         // 首次进页签才拉一次
   }
   $("tabLlm").onclick = () => switchTab("llm");
   $("tabSys").onclick = () => switchTab("sys");
-  $("tabScholar").onclick = () => switchTab("scholar");
   $("tabAcc").onclick = () => switchTab("acc");
 
   /* ---- 账号管理：列表 / 新增 / 删除 / 切换 ---- */
@@ -1796,7 +2023,6 @@ function openLlmModal(tab) {
   load();
   if (tab === "acc") switchTab("acc");
   else if (tab === "sys") switchTab("sys");
-  else if (tab === "scholar") switchTab("scholar");
 }
 
 document.addEventListener("DOMContentLoaded", mountUserBar);

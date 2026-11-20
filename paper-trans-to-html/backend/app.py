@@ -28,13 +28,15 @@ from . import records
 from . import pdf_refs as refs_mod
 from .ai_read import (article_text, build_summary, clean_notes, clean_summary,
                       notes_fingerprint, summary_empty)
-from .agents.ai_read_agent import (add_summary_item, locate_page,
-                                   locate_text_block, reply_agent_stream)
 from .agents.llm import LlmClient, LlmUnavailable, probe_llm
+from .agents.skills.ai_read import (add_summary_item, locate_page,
+                                   locate_text_block, reply_agent_stream)
+from .agents.skills.note_out_image import run_note_out_image_agent
 from .db import StorageUnavailable, mongo
-from .note_out import (export_filename as note_out_filename,
-                       export_paper as build_note_out_export,
-                       to_json as note_out_json)
+from .notes_out import (export_filename as note_out_filename,
+                        export_paper as build_note_out_export,
+                        render_image as render_note_out_image,
+                        to_json as note_out_json)
 from .storage import build as build_storage
 from .storage import rebuild as rebuild_storage
 from .translate import (Translator, block_copy_text, cache_key, extract_outline,
@@ -641,7 +643,7 @@ async def api_test_llm(request: Request, payload: dict = Body(...)):
 
 # ---------------- 设置：学术库检索（按账号） ----------------
 def _scholar_agent_config(conf: dict) -> dict:
-    """`settings.scholar_merged()` → `note_out_agent` 认识的配置键名。"""
+    """`settings.scholar_merged()` → 笔记导出技能认识的配置键名。"""
     conf = conf or {}
     return {
         "OPENALEX_API_KEY": str(conf.get("openalex_key") or "").strip(),
@@ -706,11 +708,46 @@ def api_test_scholar(request: Request, payload: dict = Body(default=None)):
         raw = payload.get(field)
         if isinstance(raw, str) and raw.strip():
             conf[field] = raw.strip()
-    from .agents.note_out_agent import probe_scholar
+    from .agents.skills.note_out import probe_scholar
     try:
         return probe_scholar(_scholar_agent_config(conf))
     except Exception as exc:                  # 网络异常不应 500，按“不可用”回前端
         return {"ok": False, "message": f"⚠️ 测试失败：{exc}", "checks": []}
+
+
+# ---------------- 设置：绘图沙盒（按账号） ----------------
+@app.get("/api/settings/sandbox")
+def api_get_sandbox(request: Request):
+    """返回**当前账号**的绘图沙盒请求地址（Agent 笔记图片用）。
+
+    默认设置不变：没填时沿用安装级配置（环境变量 `DRAW_SANDBOX_URL` → 内置本地地址）；
+    填了就按账号存在 `users.prefs.sandbox` 里，只影响本账号的 Agent 图片导出。
+    """
+    user = _require_user(request)
+    return settings.sandbox_describe(user["username"])
+
+
+@app.post("/api/settings/sandbox")
+def api_save_sandbox(request: Request, payload: dict = Body(default=None)):
+    """保存**当前账号**的沙盒请求地址。
+
+    - `{"url": "http://host:8090"}`：允许只填到端口，后端会补成 `…/v1/run`；
+    - `{"url": ""}` 或 `{"reset": true}`：清掉本账号设置，回落到环境变量 / 内置默认。
+    """
+    user = _require_user(request)
+    name = user["username"]
+    payload = payload or {}
+    if payload.get("reset"):
+        settings.clear_sandbox(name)
+        return settings.sandbox_describe(name)
+    raw = payload.get("url")
+    if raw is None:
+        raise HTTPException(400, "缺少 url（传空串表示恢复默认）")
+    try:
+        settings.save_sandbox(name, str(raw), user=name)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return settings.sandbox_describe(name)
 
 
 # ---------------- 转换 ----------------
@@ -923,14 +960,22 @@ def api_doc_refs(request: Request, doc_id: str):
 @app.post("/api/doc/{doc_id}/note-out")
 async def api_note_out(request: Request, doc_id: str, download: bool = False,
                        payload: dict = Body(default=None)):
-    """笔记导出（JSON）：论文内容分节 + 笔记/高亮 + 分析报告。
+    """笔记导出：论文内容分节 + 笔记/高亮 + 分析报告（JSON 或 PNG 图片）。
 
-    `{"mode": "mechanical"}`（默认）= 机械导出，纯本地、零 LLM 成本；
-    `{"mode": "agent"}` = Agent 导出：核验参考文献、提取代码地址并形成报告
-    （需要当前账号配置了 OpenAI 兼容的 LLM）。`?download=1` 直接带回下载文件名。
+    * `{"mode": "mechanical"}`（默认）= 机械导出，纯本地、零 LLM 成本；
+    * `{"mode": "agent"}` = Agent 导出：核验参考文献、提取代码地址并形成报告
+      （需要当前账号配置了 OpenAI 兼容的 LLM）；Agent 图片会继续生成绘图代码并交给
+      `draw-sandbox` 执行（需配置 `DRAW_SANDBOX_URL`，可选 `DRAW_SANDBOX_API_KEY`）。
+
+    另有 `{"format": "json" | "image"}`（默认 JSON）与 `{"theme": "light" | "dark"}`
+    （图片导出的配色，跟阅读页当前主题一致）。`?download=1` 直接带回下载文件名。
+
+    机械图片导出使用三栏固定版式（概览 / 笔记与原文 / AI 整理笔记），
+    用 Matplotlib 的 XKCD 手绘风绘制；Agent 图片默认沿用此风格并在第一栏增加
+    文献核查摘要，可通过 `instructions` 改变风格或栏目。
 
     只读操作，有「只读」权限就能导出；数据对接（transfer key）以后再做，
-    现在先把导出结构固定下来，后续接入时直接复用 `note_out.export_paper()`。
+    现在先把导出结构固定下来，后续接入时直接复用 `notes_out.note_out.export_paper()`。
     """
     rec, _perm = _doc_access(request, doc_id)          # 导出只读，不被权限挡住
     user = _require_user(request)
@@ -938,6 +983,10 @@ async def api_note_out(request: Request, doc_id: str, download: bool = False,
     mode = str(payload.get("mode") or "mechanical").strip().lower()
     if mode not in ("mechanical", "agent"):
         raise HTTPException(400, "导出模式只能是 mechanical 或 agent")
+    fmt = str(payload.get("format") or "json").strip().lower()
+    if fmt not in ("json", "image"):
+        raise HTTPException(400, "导出格式只能是 json 或 image")
+    theme = "dark" if str(payload.get("theme") or "").strip().lower() == "dark" else "light"
     try:
         doc = store.read_doc(doc_id)
     except FileNotFoundError as exc:
@@ -963,10 +1012,34 @@ async def api_note_out(request: Request, doc_id: str, download: bool = False,
     except LlmUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
 
+    if fmt == "image":
+        try:
+            if mode == "agent":
+                data = await run_in_threadpool(
+                    run_note_out_image_agent, llm, export=export,
+                    instructions=str(payload.get("instructions") or ""),
+                    theme=theme,
+                    # 沙盒地址按账号取：没配过就用环境变量 / 内置默认，行为不变
+                    sandbox_url=settings.sandbox_url(user["username"]))
+            else:
+                data = await run_in_threadpool(
+                    render_note_out_image, export, theme=theme)
+        except RuntimeError as exc:            # 没装 matplotlib 时给出可读的提示
+            raise HTTPException(503, str(exc)) from exc
+        except LlmUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        name = note_out_filename(export.get("paper") or {},
+                                 export.get("mode") or "mechanical", "image")
+        ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name) or "note-export.png"
+        return Response(data, media_type="image/png", headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"{ascii_name}\"; "
+                f"filename*=UTF-8''{quote(name)}"),
+        })
     body = note_out_json(export)
     if not download:
         return JSONResponse(export)
-    name = note_out_filename(export.get("paper") or {})
+    name = note_out_filename(export.get("paper") or {}, export.get("mode") or "mechanical")
     ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", name) or "note-export.json"
     return Response(body, media_type="application/json; charset=utf-8", headers={
         "Content-Disposition": (

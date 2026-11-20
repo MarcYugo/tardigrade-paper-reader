@@ -1,6 +1,8 @@
-"""笔记导出 Agent：联网核验参考文献 + 提取代码仓库 + 形成分析报告。
+"""技能 · 笔记导出：联网核验参考文献 + 提取代码仓库 + 形成分析报告。
 
-这个模块只负责 **Agent 那一段**（`note_out.py` 的 agent 模式会调用它）：
+原 `agents/note_out_agent.py`，现在是挂在统一 Agent 运行时（`agents/agent.py`）
+上的一个技能：**只声明**「系统提示词 + 两个只读工具 + 工具实现 + 报告合成」，
+工具循环交给 `run_tool_loop()`（阻塞模式）。`note_out.py` 的 agent 模式会调用它：
 
 1. 带着论文标题 / 摘要 / 正文 / 参考文献 / 笔记，告诉模型可以调用两个**只读工具**：
    * `verify_reference`：按标题、作者、年份、DOI、arXiv 号，在 Crossref、OpenAlex、
@@ -28,8 +30,9 @@
 
 对外接口：
 
-| 函数 | 作用 |
+| 名字 | 作用 |
 | --- | --- |
+| `SKILL` | 技能声明（`name="note_out"`，提示词 + 两个只读工具） |
 | `run_note_out_agent()` | 跑工具循环 + 生成结构化报告，返回可序列化的 `report` 字典 |
 | `extract_code_links()` | 从任意文本里提取代码仓库地址（机械导出也会复用） |
 | `NOTE_OUT_TOOLS` | 工具声明（调试/测试用） |
@@ -48,8 +51,9 @@ from xml.etree import ElementTree
 
 import httpx
 
-from ..envfile import env_value as _env_value
-from .llm import LlmClient, LlmUnavailable
+from ...envfile import env_value as _env_value
+from ..agent import Skill, blocking_completion, run_tool_loop
+from ..llm import LlmClient, LlmUnavailable
 
 # 学术库密钥的配置名（`.env` / 进程环境变量 / 账号设置都用这三个名字）
 CFG_OPENALEX = "OPENALEX_API_KEY"
@@ -152,10 +156,14 @@ _REPORT_SYSTEM = (
     "findings（发现/结论数组）、limitations（局限数组，没有就给空数组）。\n"
     "4. `notes_analysis`：整理**用户的笔记**（不是复述论文）：overview（3~5 句）、"
     "themes（[{title, points[]}]）、connections（关联/冲突）、questions（还没想清楚）、"
-    "next（下一步可以做什么）。\n"
+    "next（下一步可以做什么）。**只要用户有笔记就必须写**（至少 overview + 1 个主题），"
+    "这是导出 JSON 与图片第三栏「AI 整理笔记」的唯一来源，不能返回空对象；"
+    "只有完全没有笔记时才全部留空。\n"
     "5. `references_review`：**只列需要人工复核的条目**（status 为 not_found / likely / "
     "unverified），每条 {id, status, note}；status 只能取这四个值且必须与证据一致，"
-    "不能自己改。verified 的条目由系统自动补全，你不要写。\n"
+    "不能自己改。verified 的条目由系统自动补全，你不要写。**note 只写结论/说明，"
+    "不要写相似度** —— 相似度（`similarity`）与相似度统计（`references_review_summary`）"
+    "由系统按证据自动补全。\n"
     "6. `code_repositories`：只写证据里出现过的仓库 {url, verified, note}；"
     "没有就返回空数组。\n"
     "7. `conclusion`：一段总结（100~200 字）；`next_steps`：3~6 条可执行建议。\n"
@@ -173,6 +181,15 @@ _REPORT_SYSTEM = (
     "\"references_review\":[{\"id\":1,\"status\":\"verified\",\"note\":\"…\"}],"
     "\"code_repositories\":[{\"url\":\"…\",\"verified\":true,\"note\":\"…\"}],"
     "\"conclusion\":\"…\",\"next_steps\":[]}"
+)
+
+SKILL = Skill(
+    name="note_out",
+    title="笔记导出",
+    description=("导出笔记前先核查一轮：核验参考文献是否真实存在、提取并确认代码仓库地址，"
+                 "再生成结构化分析报告。工具只读，联网失败不打断导出。"),
+    system_prompt=_AGENT_SYSTEM,
+    tools=tuple(NOTE_OUT_TOOLS),
 )
 
 
@@ -1311,7 +1328,10 @@ def _verify_all_references(sections: dict, state: dict, *,
 
 
 def _ref_note(ev: dict) -> str:
-    """证据 → 一句话说明（状态含义 + 对上的那条文献）。"""
+    """证据 → 一句话说明（状态含义 + 对上的那条文献）。
+
+    ⚠️ 相似度**不写进 note**：它单独放在 `similarity` 字段里（见 `_clean_ref_review`）。
+    """
     ev = ev if isinstance(ev, dict) else {}
     message = _s(ev.get("message"), 300)
     best = ev.get("best") if isinstance(ev.get("best"), dict) else {}
@@ -1322,54 +1342,41 @@ def _ref_note(ev: dict) -> str:
         bits.append(str(best.get("year")))
     if best.get("doi"):
         bits.append("DOI " + _s(best.get("doi"), 120))
-    if best.get("similarity"):
-        bits.append(f"相似度 {best.get('similarity')}")
     joined = "；".join(b for b in bits if b)
     return _s(f"{message}（{joined}）" if joined else message, 800)
 
 
-def _balanced_history(msgs: list[dict]) -> list[dict]:
-    """兜底修复工具消息历史：`tool_calls` 与 `tool` 消息必须严格成对。
+# 相似度分档：≥ HIGH 算“高相似度”，< LOW 算“低相似度”，中间算“中等”
+_SIM_HIGH = 0.90
+_SIM_LOW = 0.75
 
-    OpenAI 兼容后端（含 DeepSeek）要求 assistant 消息里的**每一个** `tool_call_id`
-    都紧跟一条对应的 tool 消息，少一条整轮请求就 400
-    （`insufficient tool messages following tool_calls message`）。这里按对重排：
 
-    * 没有 tool 消息回应的 tool_call 直接丢掉（若整条 assistant 因此变空、
-      但还有正文，就退化成一条普通 assistant 消息）；
-    * 找不到主人的 tool 消息丢掉。
-    """
-    out: list[dict] = []
-    i, total = 0, len(msgs)
-    while i < total:
-        m = msgs[i]
-        if not isinstance(m, dict):
-            i += 1
-            continue
-        role = m.get("role")
-        if role != "assistant" or not m.get("tool_calls"):
-            if role != "tool":                    # 孤儿 tool 消息丢掉
-                out.append(m)
-            i += 1
-            continue
-        calls = [c for c in m.get("tool_calls") or []
-                 if isinstance(c, dict) and str(c.get("id") or "").strip()]
-        answered: dict[str, dict] = {}
-        j = i + 1
-        while j < total and isinstance(msgs[j], dict) and msgs[j].get("role") == "tool":
-            cid = str(msgs[j].get("tool_call_id") or "").strip()
-            if cid and cid not in answered:
-                answered[cid] = msgs[j]
-            j += 1
-        kept = [c for c in calls if str(c.get("id")).strip() in answered]
-        if kept:
-            out.append({"role": "assistant", "content": m.get("content"),
-                        "tool_calls": kept})
-            out.extend(answered[str(c.get("id")).strip()] for c in kept)
-        elif (m.get("content") or "").strip():
-            out.append({"role": "assistant", "content": m.get("content")})
-        i = j
-    return out
+def _to_similarity(value: Any) -> float | None:
+    """把证据里的 similarity 归一成 0~1 的浮点数（无值/非法值返回 None）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num != num:                      # NaN
+        return None
+    return round(max(0.0, min(1.0, num)), 4)
+
+
+def _ev_similarity(ev: Any) -> float | None:
+    """证据里「对上的那条」的标题相似度（0~1）；没有就返回 None。"""
+    if not isinstance(ev, dict):
+        return None
+    best = ev.get("best") if isinstance(ev.get("best"), dict) else {}
+    sim = _to_similarity(best.get("similarity"))
+    if sim is not None:
+        return sim
+    # best 没给相似度时，退一步用候选里最高的那个（仅作参考）
+    scores = [_to_similarity((c or {}).get("similarity"))
+              for c in (ev.get("candidates") or []) if isinstance(c, dict)]
+    scores = [s for s in scores if s is not None]
+    return max(scores) if scores else None
 
 
 def run_note_out_agent(llm: LlmClient, *, paper: dict, sections: dict,
@@ -1397,56 +1404,23 @@ def run_note_out_agent(llm: LlmClient, *, paper: dict, sections: dict,
         # 全量核验放在进模型之前：既能让报告给出准确条数，
         # 也省掉「让模型自己挑哪几条去查」这一步（原本最多只能查 12 条）。
         _verify_all_references(sections, state, cfg=state["scholar"] or None)
-    system = _AGENT_SYSTEM
+    system = SKILL.system_prompt
     msgs: list[dict] = [{"role": "user",
                          "content": _agent_context(paper, sections, notes,
                                                    instructions, state)}]
-    calls_made = 0
-    for _ in range(MAX_TOOL_ROUNDS):
-        message = llm.chat_completion(
-            system, _balanced_history(msgs), tools=NOTE_OUT_TOOLS, temperature=0.3)
-        calls = message.get("tool_calls") if isinstance(message, dict) else None
-        if not isinstance(calls, list) or not calls:
-            break
-        # 关键：写回历史的 assistant 消息里有几个 tool_call，就必须补几条 tool 消息。
-        # 以前这里只处理 `calls[:4]`（超过 4 个并行的工具调用就漏回应），
-        # 上游下一轮直接 400；现在先筛掉「无法回应」的调用（非对象 / 没有 ID /
-        # 同一条消息里重复的 ID），再让 pending 与 tool 消息一一对应。
-        pending: list[dict] = []
-        seen_ids: set[str] = set()
-        for call in calls:
-            if not isinstance(call, dict):
-                continue
-            call_id = str(call.get("id") or "").strip()
-            if not call_id or call_id in seen_ids:   # 没有 ID 无法回应；重号只回应第一次
-                continue
-            seen_ids.add(call_id)
-            pending.append({**call, "id": call_id})
-        if not pending:
-            break
-        msgs.append({"role": "assistant", "content": message.get("content") or None,
-                     "tool_calls": pending})
-        for call in pending:                        # 不再截断，逐个回应
-            call_id = call["id"]
-            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
-            name = str(fn.get("name") or "")
-            if calls_made >= MAX_TOOL_CALLS:
-                result = {"ok": False, "message": "本次导出的工具调用次数已达上限"}
-            else:
-                calls_made += 1
-                try:
-                    raw_args = fn.get("arguments") or "{}"
-                    args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
-                    if not isinstance(args, dict):
-                        raise ValueError("工具参数必须是对象")
-                    result = _execute_tool(name, args, paper=paper, sections=sections,
-                                           notes=notes, state=state)
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    result = {"ok": False, "message": f"工具参数无效：{exc}"}
-            msgs.append({"role": "tool", "tool_call_id": call_id,
-                         "content": json.dumps(result, ensure_ascii=False)})
-        if calls_made >= MAX_TOOL_CALLS:
-            break
+
+    def execute_tool(name: str, args: dict) -> dict:
+        return _execute_tool(name, args, paper=paper, sections=sections,
+                             notes=notes, state=state)
+
+    # 循环（轮数 / 调用次数上限、tool_calls 与 tool 消息必须成对）在统一运行时里；
+    # 导出是**阻塞模式**，只关心工具对 state 的副作用，事件不往外发。
+    for _event in run_tool_loop(
+            complete=blocking_completion(llm), system=system, messages=msgs,
+            skill=SKILL, execute_tool=execute_tool,
+            max_rounds=MAX_TOOL_ROUNDS, max_calls=MAX_TOOL_CALLS,
+            temperature=0.3):
+        pass
 
     return _synthesize_report(llm, paper=paper, sections=sections,
                               notes=notes, state=state, instructions=instructions)
@@ -1531,6 +1505,7 @@ def _clean_ref_review(raw: Any, evidence: dict) -> list[dict]:
             continue
         seen.add(rid)
         rows.append({"id": rid, "status": status,
+                     "similarity": _ev_similarity(ev),
                      "note": _s(row.get("note"), 800)})
     # 证据里有、但模型没写的条目：按证据补上（状态以工具为准）
     for rid, ev in sorted(ev_map.items()):
@@ -1539,10 +1514,53 @@ def _clean_ref_review(raw: Any, evidence: dict) -> list[dict]:
         rows.append({
             "id": rid,
             "status": ev.get("status") if ev.get("status") in _STRONG_STATUS else "unverified",
+            "similarity": _ev_similarity(ev),
             "note": _ref_note(ev),
         })
     rows.sort(key=lambda r: r["id"])
     return rows
+
+
+def _ref_similarity_summary(rows: list[dict]) -> dict:
+    """`references_review` 的相似度分布统计（高 / 中 / 低各几条）。
+
+    阈值：`similarity >= 0.90` 高；`0.75 ~ 0.90` 中等；`< 0.75` 低。
+    没有相似度（没检索到结果 / 接口没回 similarity）的条数单独记在 `missing` 里。
+    """
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    sims = [float(r["similarity"]) for r in rows
+            if isinstance(r.get("similarity"), (int, float))
+            and not isinstance(r.get("similarity"), bool)]
+    high = sum(1 for s in sims if s >= _SIM_HIGH)
+    low = sum(1 for s in sims if s < _SIM_LOW)
+    medium = len(sims) - high - low
+    total = len(rows)
+    missing = total - len(sims)
+    avg = round(sum(sims) / len(sims), 4) if sims else None
+    lo = round(min(sims), 4) if sims else None
+    hi = round(max(sims), 4) if sims else None
+    if sims:
+        text = (f"共 {total} 条：高相似度（≥{_SIM_HIGH:.2f}）{high} 条、"
+                f"中等（{_SIM_LOW:.2f}–{_SIM_HIGH:.2f}）{medium} 条、"
+                f"低相似度（<{_SIM_LOW:.2f}）{low} 条；"
+                f"平均 {avg:.3f}，最低 {lo:.3f}，最高 {hi:.3f}。")
+        if missing:
+            text += f"另有 {missing} 条没有相似度（未检索到结果）。"
+    else:
+        text = "没有可统计的相似度（未检索到匹配文献）。"
+    return {
+        "total": total,
+        "with_similarity": len(sims),
+        "missing": missing,
+        "high": high,
+        "medium": medium,
+        "low": low,
+        "avg": avg,
+        "min": lo,
+        "max": hi,
+        "thresholds": {"high": _SIM_HIGH, "low": _SIM_LOW},
+        "text": text,
+    }
 
 
 def _clean_code_review(raw: Any, evidence: dict) -> list[dict]:
@@ -1611,6 +1629,7 @@ def _report_payload(paper: dict, sections: dict, notes: dict, state: dict,
                 "matched": _s(best.get("title"), 200),
                 "year": best.get("year"),
                 "doi": _s(best.get("doi"), 80),
+                "similarity": best.get("similarity"),
             })
         else:
             compact_refs.append(row)
@@ -1638,6 +1657,55 @@ def _report_payload(paper: dict, sections: dict, notes: dict, state: dict,
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _notes_analysis_empty(data: dict | None) -> bool:
+    data = data if isinstance(data, dict) else {}
+    return not any((data.get("overview"), data.get("themes"),
+                    data.get("connections"), data.get("questions"),
+                    data.get("next")))
+
+
+def _fallback_notes_analysis(notes: dict) -> dict:
+    """模型没给 `notes_analysis` 时的兜底：按页码把笔记**原样**归成主题。
+
+    只搬运（页码 + 笔记原文），不替用户下结论 —— 目的是让导出 JSON 和图片第三栏
+    在任何情况下都有「笔记整理」，而不是因为模型偷懒就整块缺失。
+    """
+    groups: dict[str, list[str]] = {}
+    count = 0
+    for n in (notes or {}).get("sentence_notes") or []:
+        if not isinstance(n, dict):
+            continue
+        text = _s(n.get("note"), 300)
+        if not text:
+            continue
+        page = n.get("page")
+        groups.setdefault(f"P{page}" if page else "未标页码", []).append(text)
+        count += 1
+        if count >= MAX_NOTES_ROWS:
+            break
+    for n in (notes or {}).get("free_notes") or []:
+        if not isinstance(n, dict):
+            continue
+        text = _s(n.get("text"), 300)
+        title = _s(n.get("title"), 120)
+        if not (text or title):
+            continue
+        groups.setdefault("独立笔记", []).append(
+            f"{title}：{text}" if title and text else (title or text))
+        count += 1
+        if count >= MAX_NOTES_ROWS + 40:
+            break
+    if not count:
+        return {"overview": "", "themes": [], "connections": [],
+                "questions": [], "next": []}
+    return {
+        "overview": f"共 {count} 条笔记，按页码归类如下。",
+        "themes": [{"title": title, "points": points[:8]}
+                   for title, points in list(groups.items())[:8]],
+        "connections": [], "questions": [], "next": [],
+    }
+
+
 def _synthesize_report(llm: LlmClient, *, paper: dict, sections: dict,
                        notes: dict, state: dict, instructions: str) -> dict:
     raw = llm.chat_json(
@@ -1645,12 +1713,18 @@ def _synthesize_report(llm: LlmClient, *, paper: dict, sections: dict,
         _report_payload(paper, sections, notes, state, instructions),
         temperature=0.2)
     data = raw if isinstance(raw, dict) else {}
+    ref_review = _clean_ref_review(data.get("references_review"), state)
+    notes_analysis = _notes_analysis(data.get("notes_analysis"))
+    if _notes_analysis_empty(notes_analysis):
+        # 模型没整理笔记：用原样笔记兜底，保证「笔记整理」不会整块缺失
+        notes_analysis = _fallback_notes_analysis(notes)
     report = {
         "summary": _s(data.get("summary"), 3000),
         "paper_overview": _paper_overview(data.get("paper_overview")),
-        "notes_analysis": _notes_analysis(data.get("notes_analysis")),
+        "notes_analysis": notes_analysis,
         "references_stats": _reference_stats(sections, state),
-        "references_review": _clean_ref_review(data.get("references_review"), state),
+        "references_review": ref_review,
+        "references_review_summary": _ref_similarity_summary(ref_review),
         "code_repositories": _clean_code_review(data.get("code_repositories"), state),
         "conclusion": _s(data.get("conclusion"), 2000),
         "next_steps": _list(data.get("next_steps"), 10, 500),

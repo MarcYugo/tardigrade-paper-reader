@@ -70,14 +70,19 @@
 15. **左侧目录栏**：建论文时就把 **PDF 自带书签**存进记录（`toc` / `toc_source="pdf"`，零成本、最准）；PDF 没书签时，首次展开目录会自动让 **LLM 读全文排一份目录**（每页只喂「候选标题行」，省 token，后端 `POST /api/doc/{id}/toc`，需写权限），结果存库、不重复花 token，底部有「重新提取」。点目录项直接跳页，滚动时自动高亮当前小节；目录与笔记栏打开时正文整体右移并自动适宽，不会被盖住。
 
 16. **笔记导出**：分为agent模式和机械导出模式，二者的相同功能点是将文章分为title/abstract/main text/references/appendix，但是agent模式可以通过agent调用工具搜索和检验references文献的有效性、提取项目代码地址，形成报告。agent数据对接接口，每个账号通过设置transfer key的方式使得其他agent，可以通过持有这个key来访问自己账户的笔记。
-    - **已实现（本阶段）**：`backend/note_out.py` 提供机械导出与 Agent 导出的统一 JSON 结构（论文五段分节 + 句子/独立笔记 + 高亮 + 分析报告）；`backend/agents/note_out_agent.py` 是 Agent 部分（只读工具：核验参考文献、提取并确认代码仓库地址，再生成报告）。网页走 `POST /api/doc/{id}/note-out`（`mode=mechanical|agent`，`?download=1` 直接下载 JSON）。
+    - **已实现（本阶段）**：`backend/notes_out/note_out.py` 提供机械导出与 Agent 导出的统一 JSON 结构（论文五段分节 + 句子/独立笔记 + 高亮 + 分析报告），`backend/notes_out/note_out_image.py` 提供文字导出（Matplotlib + XKCD 三栏平纸图片）；`backend/agents/skills/note_out.py` 是 Agent 部分（只读工具：核验参考文献、提取并确认代码仓库地址，再生成报告）。网页走 `POST /api/doc/{id}/note-out`（`mode=mechanical|agent`、`format=json|image`，`?download=1` 直接下载文件）。
+    - **Agent 图片（`backend/agents/skills/note_out_image.py`）**：绘图 Agent 按导出数据写 Matplotlib 代码，交给 `draw-sandbox` 执行并取回 `note.png`。有两个工具：**`read_notes`**（按页取成对的原文 / 笔记 / 同页整理要点）与 **`run_python`**（沙盒执行代码）。固定三栏：**概览 + 文献核查摘要 / 笔记与原文 / AI 整理笔记**。**第二栏与机械导出一致**：表头「原文 | 笔记」，按 `read_notes` 返回的 `note_pairs`（原句与笔记**成对**给出，带页码 / 句序标签）逐条渲染——左侧引号内是该条笔记对应的原句（不得改写/缩写），右侧是该条笔记正文，并可在其后附一句同一页的要点作为分析（不许张冠李戴）；成对数据也同时写进沙盒的 `note_export.json`（`image_hints.note_pairs` / `image_hints.page_points`），代码可直接读，模型无法把「A 的原文」配「B 的笔记」。第三栏的数据源按优先级取：`ai_summary.summary`（AI 辅助阅读面板里的整理）→ `report.notes_analysis`（本次 Agent 整理的笔记）→ 两者都空时按 `notes` 原样归纳成「总览 + 主题要点」；**系统提示里明确这一栏必须画、不能省略**，避免面板没整理过时图片缺一大块。配色直接用上下文给的 `theme_colors`（与阅读器 `light` / `dark` 同一份色板），避免只换底色留下看不见的字；**文字与背景对比不够（浅底白字 / 深底黑字 / 与卡片底色太接近）时改文字颜色**（浅底用 `ink` 深字、深底用 `ink` 浅字），而不是加描边补救。同时**禁止给文字加描边 / 发光 / 阴影 / `path_effects`**（`withStroke` 等会把字粘成一团白块），字号 ≥ 8.5、行距 ≥ 1.2 倍，宁可减内容也不要叠效果；出图后若整张几乎只有一种颜色（字根本看不见）会打回重画。**公式统一走沙盒里的 `note_image_utils.py`**（随请求下发，与 `note_export.json` 同目录）：`import note_image_utils as niu` → `niu.text(ax, x, y, 文本, ...)`，它把 `$$…$$` / `\[…\]` / `\(…\)` 转成 mathtext 行内 `$…$`（matplotlib 收到 `$$…$$` 会抛 ParseException），并对解析不了的公式自动降级成原文，不会让整张图失败；`\text{}` 会被换成 mathtext 支持的 `\mathrm{}`。另外 `ai_summary` / `notes_analysis` 都是**对象**（overview / themes / …），不能当字符串 `strip()`；要文本用 `niu.text_of(obj)`（自动拼 overview + themes[].points，容错），判断有无内容看 `has_ai_summary` / `has_notes_analysis`。页眉右上角与机械导出一致写「Agent 导出 · 导出时间」（`generated_at_text`，取自 `exported_at` 前 16 位，如 `2026-11-20 10:23`），页脚写「笔记 N 条 · 参考文献 M 条 + paper-trans-to-html」。配色与时间等都已放进沙盒文件 `note_export.json` 的 `image_hints`（`theme` / `theme_colors` / `generated_at_text` / `references_count` / `notes_total` / `note_pairs` / `page_points` / `ai_summary` / `notes_analysis` / `has_*`），代码统一读 `d["image_hints"]`，不要去猜文件顶层键。
+    - **Agent 的笔记整理（JSON 里的 `report.notes_analysis`）**：报告提示词要求「只要用户有笔记就必须写」（总览 / 主题 / 关联 / 疑问 / 下一步，不许返回空对象）；若模型仍然返回空，后端 `_fallback_notes_analysis()` 会按**页码 + 笔记原文**兜底归类（独立笔记单列一组），只做搬运、不替用户下结论 —— 所以导出 JSON 与图片第三栏都不会缺「笔记整理」。
+    - **沙盒设置（按账号，默认不变）**：导出弹窗里「🔗 学术库 Key」下面还有一个同样可折叠的「🧪 沙盒设置」，可改绘图沙盒的**请求地址**，存在 `users.prefs.sandbox = {url, updated_at, updated_by}`，只影响本账号。不填就沿用安装级默认（环境变量 `DRAW_SANDBOX_URL` → 内置 `http://127.0.0.1:8090/v1/run`），行为与以前一致；地址允许只填到端口（如 `http://host:8090`），后端统一补成 `…/v1/run`。`DRAW_SANDBOX_API_KEY` / 沙盒鉴权 Key 仍是安装级配置。
+    - **导出弹窗交互**：① 弹窗采用**顶部锚定**（与「⚙ 设置」弹窗同一个顶部位置 = 视口高 × 8%，内容变高只向下长高、顶部不动，超视口由卡片自己滚）；② **导出进行中弹窗锁住**：右上角 ×、遮罩、Esc、「关闭」按钮全部失效，导出方式表格也禁用，并注册 `beforeunload` 拦住刷新 / 关标签页（请求不会被“关弹窗”取消，但刷新会中断）；导出结束（成功或失败）自动解锁。
     - **待做**：`transfer key` 数据对接（其他 Agent 持 key 访问账号笔记）。
+
+17. **论文页的展示方式**：3D展示，类似现实中的一本书一样，多一个维度（斜向z轴），像看书一样看论文页，前面的页实在显示，后面的页虚化。
 
 ## 后续计划（尚未实现）
 
-- **参考文献真实性校验**：在阅读 Agent 里增加「联网搜索 / 学术库检索」工具，按 DOI / arXiv / 标题检索并标记参考文献是否真实存在（当前引用跳转是**纯本地**解析，不联网）。
-- **笔记导出**：把笔记/高亮导出为 JSON（带页码、句子原文、作者）或图片（当前只能逐条查看/复制）。
 - **AI 面板弹窗化**：把 AI 辅助阅读与笔记栏改为弹窗式 Agent，并支持把任意笔记块作为上下文继续检索（当前是视口底部悬浮卡片 + 「笔记整理」卡片写入）。
+- **笔记导出 · transfer key**：让其他 Agent 持账号的 transfer key 访问该账号的笔记（导出 JSON / 图片、参考文献核验已实现，见功能 16）。
 
 ## 项目结构
 
@@ -87,7 +92,7 @@ backend/           后端(FastAPI)
   db.py            模块六 · MongoDB 连接层(连接参数读 mongo_configuration/.env 或环境变量)
   mongo_store.py   模块七 · MongoDB 存储实现(集合/索引/各存储后端)
   storage.py       存储装配(按 APP_STORAGE 选 MongoDB 或本地 JSON 回退)
-  settings.py      模块五 · 运行时设置(LLM 服务地址/Key/模型；每账号最多 3 套可切换；译文目标语言)
+  settings.py      模块五 · 运行时设置(LLM 服务地址/Key/模型；每账号最多 3 套可切换；译文目标语言；学术库 Key；绘图沙盒地址)
   pdf_parser/      模块一 · 文档解析(PDF → 版式布局数据；文字版式 = PyMuPDF / Surya 2 / Unlimited-OCR)
     __init__.py    门面：设计说明 + 对外接口(parse_pdf / status) + 内部名字再导出
     options.py     解析配置 / OCR 服务探测 / status()
@@ -109,9 +114,11 @@ backend/           后端(FastAPI)
   translate.py     译文服务(翻译提示词 + 批量 + Google 兜底；对话/流式转发给 agents/llm.py)
   ai_read.py       模块八 · AI 辅助阅读(把笔记整理成主题/关联/疑问 + 带整篇正文(含每页公式 LaTeX)的对话，支持流式)
   agents/llm.py    LLM 接入层(LlmClient：OpenAI 兼容 chat/completions、流式与 tool_calls 解析、测试连接)
-  agents/ai_read_agent.py  AI 阅读 Agent(受限工具调用：写整理卡片 / 定位论文页·笔记；工具循环 + 事件收敛)
-  note_out.py      模块十 · 笔记导出(机械导出 / Agent 导出；论文分节 + 笔记/高亮 + 报告，统一 JSON)
-  agents/note_out_agent.py  笔记导出 Agent(核验参考文献真实性 / 提取代码仓库地址 / 生成报告；只读、离线失败不中断)
+  agents/agent.py  统一 Agent 运行时(技能声明 + 工具循环 + 事件收敛/历史卫生)
+  agents/skills/ai_read.py  技能 · 辅助阅读(受限工具调用：写整理卡片 / 定位论文页·笔记)
+  notes_out/       模块十 · 笔记导出子包：note_out.py（机械 / Agent 导出数据）+ note_out_image.py（Matplotlib + XKCD 三栏图片）
+  agents/skills/note_out.py  技能 · 笔记导出(核验参考文献真实性 / 提取代码仓库地址 / 生成报告；只读、离线失败不中断)
+  agents/skills/note_out_image.py  技能 · Agent 笔记图片(生成 matplotlib 绘图代码 → draw-sandbox 执行 → note.png；第三栏为笔记整理，自带优先级与兜底)
   pdf_refs/refs.py         模块九 · 引用跳转**线上实现**(按 parser 分发；`app.py` 从这里取 build_refs)
   pdf_refs/refs_pymupdf.py / pdf_refs/refs_unlimited_ocr.py  PyMuPDF / Unlimited-OCR 通用引用解析策略
   pdf_refs/refs_surya.py    Surya 引用解析策略（在 OCR 块内拆分多条参考文献）
@@ -123,7 +130,7 @@ frontend/          前端(原生 HTML/CSS/JS)
   reader.html      阅读器(版式还原 + 翻译/标注/笔记/目录/AI Agent)
   css/style.css    样式（CSS 变量双主题色板 + 各模块样式）
   js/
-    common.js      工具函数 / 登录态 / 顶栏用户区 / LLM 设置与共享弹窗
+    common.js      工具函数 / 登录态 / 顶栏用户区 / 设置·共享·导出弹窗（顶部锚定 + 导出中锁弹窗 + 沙盒设置面板）
     login.js       登录页 / 首次使用向导
     home.js        首页：上传 + 阅读记录列表 + 筛选 + 共享入口
     reader2.js     阅读器**装配入口**（把下面各模块拼起来，保持原有全局状态）
@@ -170,6 +177,8 @@ tests/             单元/集成测试（python -m unittest discover tests）
   test_ai_agent_notes.py   AI Agent 工具：写整理卡片 / 导航确认
   test_backend_local_convert.py / test_merge_formula_boxes.py / test_merge_line_runs_color.py
   test_backend_surya_font.py / test_parser_account_options.py / test_table_cell_text.py / test_vertical_text.py
+  test_note_out.py / test_note_out_image.py   笔记导出：分节 / 笔记 / 报告、Agent 笔记整理兜底、图片第二栏原文·笔记配对、第三栏数据源
+  test_sandbox_settings.py                    绘图沙盒地址：按账号存 + 回落环境变量 / 内置默认 + 技能透传
 ```
 
 ## 快速开始
@@ -274,6 +283,8 @@ API Key 只存在服务端，接口返回一律是打码串（`sk-4****8cca`）�
 | POST | `/api/settings/llm/test` | 用一次极小请求验证 地址/Key/模型 是否可用（表单值优先，没填 Key 时用所选配置已保存的那把） |
 | GET | `/api/settings/parser` | 当前 PDF 解析(OCR)后端状态（含真探测；结果缓存 15s） |
 | POST | `/api/settings/parser` | 切换**当前账号**的解析后端（`auto` / `pymupdf` / `surya` / `unlimited_ocr`），存 `users.prefs.parser.backend` |
+| GET | `/api/settings/sandbox` | 读**当前账号**的绘图沙盒请求地址（Agent 笔记图片用）：返回实际生效地址 `url`（已补 `/v1/run`）、本账号填的原样值 `raw_url`、内置默认 `default_url` 与来源（`account` / `env` / `default`） |
+| POST | `/api/settings/sandbox` | 保存**当前账号**的沙盒地址（`{url}`；允许只填到端口，后端自动补 `/v1/run`）。`url:""` 或 `{reset:true}` = 清除本账号设置，回落到环境变量 / 内置默认 |
 | GET | `/api/config` | 当前账号的翻译/解析/存储状态（翻译目标语言、解析后端就绪情况、存储后端） |
 | GET | `/api/docs` | 当前账号能看到的论文（自己的 + 共享给我的），带权限/共享数/我的阅读进度 |
 | POST | `/api/convert` | 上传 PDF 并解析转换（multipart） |
@@ -308,7 +319,7 @@ API Key 只存在服务端，接口返回一律是打码串（`sk-4****8cca`）�
 | DELETE | `/api/doc/{id}/share/{user}` | 取消某条共享（只能由所有者操作；顺手清掉那个人的阅读状态） |
 | POST | `/api/doc/{id}/share/leave` | 被共享的人**自己退出**（不需要所有者权限） |
 | POST | `/api/doc/{id}/ai/chat/reset` | 清空这篇的对话（整理结果保留） |
-| POST | `/api/doc/{id}/note-out` | 笔记导出（JSON）。`{mode:"mechanical"|"agent", instructions?}`：机械导出纯本地；Agent 导出会核验参考文献、提取代码地址并生成报告（需当前账号配置 OpenAI 兼容 LLM）。`?download=1` 返回带文件名的附件。只读权限即可导出；transfer key 数据对接待做 |
+| POST | `/api/doc/{id}/note-out` | 笔记导出。`{mode:"mechanical"|"agent", format:"json"|"image", theme:"light"|"dark", instructions?}`：机械导出纯本地；Agent 导出会核验参考文献、提取代码地址并生成报告（需当前账号配置 OpenAI 兼容 LLM），图片再交给 `draw-sandbox` 生成（地址按账号取 `settings.sandbox_url()`）。`?download=1` 返回带文件名的附件。只读权限即可导出；transfer key 数据对接待做 |
 
 > **AI 辅助阅读**的句子笔记上下文由前端提供（`[{id,sent,note,page}]`）—— 只有前端知道「这条笔记挂在哪句话上」；
 > 后端补入已保存的独立笔记，并负责收敛长度（条数/单条/总长都有上限）与拼提示词。摘要要求模型返回 **JSON**（而非 Markdown），
@@ -365,7 +376,7 @@ compose 目录改名了也不用改代码，还可以用 `MONGO_ENV_FILE=/path/t
 | `translations` | 译文缓存：**一段一条**（`{doc, h, zh}`，`h` 是「目标语言 + 文本」的哈希），可按论文统计/清理；换语言不会命中旧语言的缓存 |
 | `images.files` / `images.chunks` | **插图本体**（GridFS 桶）：`_id = "<doc_id>/<fname>"`，`metadata.doc_id` 上建了索引。插图也进库，服务重启/重建容器/换机器都不会丢，前端仍用 `/api/doc/{id}/img/{fname}` 取图（接口内部改成从存储后端读字节） |
 | `seltrans` | 「所选句译文」卡片（`{doc, key, item_id, si_from, text}`）—— 卡片的正文与锚点存这里，**刷新/重新登录后会自动恢复**（片段译文的 key 是片段文本哈希，不在 `translations`→块 的映射里，所以必须单独存锚点） |
-| `users` | 账号（口令 PBKDF2 加盐哈希）；`prefs` 子字段存该账号的偏好与配置 —— `prefs.llm`（该账号的 LLM 配置，含最多 3 套可切换的 `profiles` 与当前生效的 `active_id`）、`prefs.target_lang`（译文目标语言）、`prefs.parser.backend`（解析后端）、`prefs.hl_colors`（自定义高亮色）、`prefs.show_zh`（显示译文开关）、`prefs.theme`（`light` / `dark`） |
+| `users` | 账号（口令 PBKDF2 加盐哈希）；`prefs` 子字段存该账号的偏好与配置 —— `prefs.llm`（该账号的 LLM 配置，含最多 3 套可切换的 `profiles` 与当前生效的 `active_id`）、`prefs.target_lang`（译文目标语言）、`prefs.parser.backend`（解析后端）、`prefs.scholar`（学术库 Key：OpenAlex / Semantic Scholar / 邮箱）、`prefs.sandbox`（Agent 笔记图片的绘图沙盒地址）、`prefs.hl_colors`（自定义高亮色）、`prefs.show_zh`（显示译文开关）、`prefs.theme`（`light` / `dark`） |
 | `sessions` | 登录会话（带 TTL 索引自动过期） |
 | `settings` | **旧版**全局 LLM 配置（`_id="llm"`）；现在只在升级时读一次（自动归给最早创建的账号），不再写入 |
 

@@ -5,8 +5,8 @@ OpenAI 兼容后端就拒绝）、流式增量拼接、`tool_calls` 片段合并
 `LlmUnavailable`。
 
 它**不决定**问什么、要不要调工具、要不要再来一轮 —— 那是
-`agents/ai_read_agent.py` 与 `agents/note_out_agent.py` 的事；翻译业务的提示词与
-批量流程在 `translate.py`，整理/对话的提示词在 `ai_read.py`。
+`agents/agent.py` 的工具循环与 `agents/skills/ai_read.py`、`agents/skills/note_out.py`
+两个技能的事；翻译业务的提示词与批量流程在 `translate.py`，整理/对话的提示词在 `ai_read.py`。
 
 `translate.Translator` 把对话相关方法原样转发到 `LlmClient`（签名与报错保持历史形状），
 翻译自身（`translate()` + Google 兜底）仍留在 `Translator` 里；因此本模块不依赖任何
@@ -120,7 +120,7 @@ class LlmClient:
     """一次 HTTP 往返的 LLM 客户端。
 
     无状态：既没有对话历史，也没有「下一步做什么」的决策 —— 历史与系统提示词
-    每次由调用方传入，工具调用的循环在 `agents/ai_read_agent.py`。
+    每次由调用方传入，工具调用的循环在 `agents/agent.py`。
     """
 
     def __init__(self, config_file: Path | str | dict | None = None,

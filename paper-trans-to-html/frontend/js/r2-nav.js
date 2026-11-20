@@ -357,6 +357,7 @@ window.R2Nav = function (env) {
   if ($("zoomOut")) $("zoomOut").addEventListener("click", () => changeZoom(-1));
   if ($("zoomIn")) $("zoomIn").addEventListener("click", () => changeZoom(1));
   function changeZoom(d) { setZoomIdx(env.zoomIdx + d); }
+  let zoomSeq = 0;      // 每改一次档位 +1：「先 FLIP 再缩放」的接力一旦过期就不再启动缩放
   function setZoomIdx(ni) {
     ni = clamp(Math.round(ni), 0, ZOOMS.length - 1);
     if (ni === env.zoomIdx) { refreshZoomLabel(); return; }
@@ -365,11 +366,22 @@ window.R2Nav = function (env) {
        （以前每点一次缩放都整篇重建，38 页要卡一下，滚动位置还得靠 anchor 再摆回来）。
        固定浮层（页码胶囊 / AI 卡片）跟着 #pages 的尺寸变化由各自的 ResizeObserver 更新。 */
     env.zoomIdx = ni;
-    applyZoom();
-    refreshZoomLabel();
-    /* 视觉比例变了：批注栏预留宽（窗口的 25%）与「能不能并排」要按新视口重算。
+    /* 过渡动画在 applyZoom 里（r2-view.js，约 200ms：过渡期间不动 zoom，只给 #pages 套 GPU 的
+       transform:scale，结束时才一次性落位 —— 改 zoom 会整篇重排，实测一次 0.8~1.5s，逐帧改根本跑不动）。
+       ⚠️ 数值与重排都放在**落位之后**的回调里：期间 `<html>` zoom 还是旧档位（GZ() 也是旧值），
+          提前算会拿「旧视口宽 + 新档位」的混合口径，批注栏并排与否可能判错。
        relayoutAll 只在页面宽度或并排模式真的变了时才退回整体 render。 */
-    relayoutAll();
+    const seq = ++zoomSeq;
+    const start = () => {
+      if (seq !== zoomSeq) return;              // 等待期间又改了档位：这次让给新的那次
+      applyZoom(() => { refreshZoomLabel(); relayoutAll(); });
+    };
+    /* 这一档正好跨过「批注栏并排 ↔ 收回句子下方」的临界时：**先**把笔记卡 FLIP 到位，
+       动画收尾后再启动缩放过渡。否则 FLIP 只能排在缩放落位那次整篇重排之后才跑 ——
+       用户看到的是「缩放完了 ⇒ 冻一下 ⇒ 笔记卡才慢慢滑出去」（实测那段重排 0.7~1.8s）。
+       switchSideFor 会用目标档位预判（vpWAt），返回 false = 不用切，照旧立即缩放。 */
+    if (env.switchSideFor && env.switchSideFor(ZOOMS[ni], start)) return;
+    start();
   }
   function refreshZoomLabel() {
     // 右侧留出批注栏时页面会等比缩小(fit)，这里显示**实际**渲染比例，避免和看到的不一致。

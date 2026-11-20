@@ -61,6 +61,7 @@ python run.py                     # 打开 http://127.0.0.1:8000
 | 13 | **逐页加载** | 首屏按上次位置只请求可见的 3 页（文末则取倒数几页），同时用 `page_sizes` 建出**全篇占位壳**（页码、宽高、滚动高度第一帧即完整）；其余页按"离当前页最近优先"成批补齐（用 `requestIdleCallback` 让出主线程），每批只对本批页做收尾。目录跳页、笔记定位、AI 点亮文本框、翻译本页/全文都会按需先拉页。`needs_math` 为全文口径，避免首批切片漏判导致 KaTeX 拉不起来。 |
 | 14 | **暗夜模式** | 右上角一键切换。背景走枪灰（`#22262d`，卡片 `#2b3038`、页面 `#262b32`）、文字反近白；PDF 正文色是写死的，按"保留色相、反转明度"在 JS 换算（黑字→近白、彩色标题→同色系提亮），插图保持原样只压一点亮度。高亮改为**荧光**（很淡的同色底 + 高亮霓虹字 + `text-shadow` 外发光），调色盘色块同步发光。主题两级存储：`localStorage` 让首屏由 `<head>` 一行小脚本先套 class（不闪白），登录后以账号偏好 `theme` 为准。整套配色靠 CSS 变量双份语义色板，组件不再写死浅色。 |
 | 15 | **重排不跳页** | 缩放 / 窗口变化 / 目录栏与笔记栏开关都会改变页面尺寸进而**整页重建**；重建后按"页号 + 页内比例"还原滚动位置，目录跳转之后再缩放、拉窗口不会被弹回"上次读到的一页"。 |
+| 16 | **笔记图片导出** | 机械导出使用 Matplotlib + XKCD 三栏版式；Agent 图片在报告完成后生成 Python 绘图代码并交给 `draw-sandbox` 执行，默认沿用机械版风格且第一栏包含文献核查摘要，可通过 Agent 提示词调整风格与栏目。容器部署配置 `DRAW_SANDBOX_URL`（默认 `http://host.docker.internal:8090/v1/run`），可选 `DRAW_SANDBOX_API_KEY`；沙盒不要暴露公网。用户在导出弹窗的「🧪 沙盒设置」里可按账号改请求地址（存 `users.prefs.sandbox`，只影响本人；不填仍用环境变量 / 内置默认，可只填到端口，后端自动补 `/v1/run`）。 |
 
 ### 2.2 后续计划（尚未实现）
 
@@ -79,7 +80,7 @@ python run.py                     # 打开 http://127.0.0.1:8000
 FastAPI 单体后端（app.py：HTTP 接口 + AuthGate 登录门禁 + 前端静态托管）
    ├─ 解析层 pdf_parser              三条后端链，同一份 parse_pdf 契约
    ├─ LLM 层  agents/llm.py          OpenAI 兼容 chat/completions、流式、tool_calls
-   ├─ Agent 层 ai_read_agent.py      受限工具循环 + 事件收敛
+   ├─ Agent 层 agents/agent.py       统一工具循环 + 事件收敛（技能：辅助阅读 / 笔记导出 / Agent 笔记图片）
    ├─ 引用层 pdf_refs                按 parser 分发的纯本地映射
    └─ 存储层 storage / mongo_store   Mongo 优先，JSON 回退（支持热切换）
    ▼
@@ -120,7 +121,11 @@ paper-trans-to-html/            ← 应用本体（本 README 所在目录）
     translate.py                译文服务（提示词 + 批量 + Google 兜底；对话转发给 agents/llm.py）
     ai_read.py                  模块八 · AI 辅助阅读（结构化摘要 + 带全文的流式对话）
     agents/llm.py               LLM 接入层（LlmClient：流式、tool_calls、测试连接）
-    agents/ai_read_agent.py     AI 阅读 Agent（写整理卡片 / 定位页·笔记）
+    agents/agent.py             统一 Agent 运行时（技能声明 + 工具循环 + 历史卫生）
+    agents/skills/ai_read.py    技能 · 辅助阅读（写整理卡片 / 定位页·笔记）
+    agents/skills/note_out.py   技能 · 笔记导出（核验文献 / 提取代码仓库 / 生成报告）
+    agents/skills/note_out_image.py 技能 · Agent 笔记图片（生成绘图代码 / 调用沙盒）
+    notes_out/                  模块十 · 笔记导出（note_out.py 数据 / note_out_image.py 图片）
     pdf_refs/                   模块九 · 引用跳转线上实现（refs.py 分发 + 三套策略）
     refs.py                     早期副本（线上不再引用，改它不生效）
   frontend/                     原生前端

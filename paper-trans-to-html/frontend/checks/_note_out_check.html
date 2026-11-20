@@ -15,9 +15,12 @@
 <script>
 /* 自检页没有后端：把 common.js 会用到的那几个接口 mock 掉，
    这样顶栏用户区（含「⚙ 设置 / 📤 导出」）也能正常渲染出来。 */
-window.fetch = function (url) {
+window.fetch = function (url, opts) {
   const u = String(url);
   let body = {};
+  const sent = (() => {
+    try { return JSON.parse((opts && opts.body) || "{}"); } catch (e) { return {}; }
+  })();
   if (u.includes("/api/auth/status")) {
     body = { authenticated: true, initialized: true, username: "alice" };
   } else if (u.includes("/api/prefs")) {
@@ -25,6 +28,15 @@ window.fetch = function (url) {
   } else if (u.includes("/api/config")) {
     body = { storage: { backend: "mongo", preferred: "auto" } };
   } else if (u.includes("/note-out")) {
+    if (sent.format === "image") {
+      // 1×1 透明 PNG：只验证「选图片 → 下载 .png」这条路径
+      const png = Uint8Array.from(atob(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="),
+        c => c.charCodeAt(0));
+      return Promise.resolve(new Response(png, {
+        status: 200, headers: { "Content-Type": "image/png" },
+      }));
+    }
     body = {
       format: "tardigrade-note-export", mode: "mechanical",
       paper: { title: "示例论文：A Sample Paper" },

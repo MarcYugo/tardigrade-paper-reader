@@ -1,8 +1,66 @@
 # Tardigrade Paper Reader - Pdf 转 HTML 阅读应用
 
+**简体中文** | [English](./README_en.md)
+
 > AI 辅助工具为 Deepseek-v4-flash/Deepseek-v4.1-flash/GPT-6-Luna + VScode copilot
 
 ## 更新
+
+```mermaid
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Segoe UI, Microsoft YaHei, PingFang SC, sans-serif",
+    "fontSize": "14px",
+    "primaryColor": "#eef4fa",
+    "primaryTextColor": "#26333f",
+    "primaryBorderColor": "#d3e0ee",
+    "lineColor": "#c9d8e8",
+    "textColor": "#26333f",
+    "cScale0": "#e5eef8",
+    "cScale1": "#f7eee7",
+    "cScaleLabel0": "#26333f",
+    "cScaleLabel1": "#3b302a"
+  },
+  "themeCSS": ".timeline text { fill: #26333f !important; font-size: 14px !important; font-weight: 500 !important; line-height: 1.5 !important; } .timeline .section-title, .timeline text.sectionTitle, .timeline .section { fill: currentColor !important; opacity: 0.65 !important; font-weight: 600 !important; } .timeline-node circle { fill: #eef4fa !important; stroke: #bcd1e6 !important; } .timeline-node line, .timeline .lineWrapper line { stroke: currentColor !important; opacity: 0.25 !important; } .timeline-title, .timeline text.timeline-title, text.timeline-title, .chartTitleText, .flowchartTitleText, text.title { fill: currentColor !important; font-size: 17px !important; font-weight: 600 !important; }"
+}}%%
+timeline
+    title Tardigrade Paper Reader 更新时间表
+    section 2026-10
+        10/8 : surya 与 pymupdf 解析分离
+             : 解析与渲染路径独立
+             : 修复公式 / 图片重影
+             : 增加表格渲染
+             : 支持多种翻译语言
+             : AI 辅助阅读支持 Markdown
+        10/11 : 新增 Unlimited-OCR 解析路径
+              : 表格样式改为三线表
+        10/16 : 本地 / surya / OCR 三条路径
+              : 均支持参考文献链接显示
+        10/30 : 新增本地解析方案
+              : pymupdf + OXR + texify + SLANet
+              : 适合 LaTeX 编译的 PDF
+              : 参考文献卡片持久显示
+              : 支持作者-年份引用
+              : 翻译卡片支持公式
+    section 2026-11
+        11/7 : Unlimited-OCR 支持官网 API
+             : 新增 AI 辅助阅读 Agent
+             : 支持内容 / 笔记定位
+             : 支持辅助写入笔记
+             : 更换水熊虫风格 Logo
+        11/9 : Agent 功能拆分
+             : 新增笔记导出功能
+             : 支持参考文献校验
+             : AI 辅助阅读改为胶囊卡片
+        11/12 : 前端页面与元素排布调整
+              : 缩放改为 5% 间隔
+              : 支持滑轮 / 拖动缩放
+        11/20 : 学术检索迁移至导出界面
+              : 新增笔记图片导出
+              : 机械导出 + Agent 导出
+              : 缩放过渡动画
+```
 
 1. [26/10/8] surya 解析与pymupdf解析分离，解析pdf和渲染路径独立，解决了surya解析时公式和图片重影问题，增加表格渲染
    
@@ -36,6 +94,8 @@
 
 9. [26/11/12] 前端页面显示和元素排布调整，阅读界面缩放改为5%间隔的滑轮缩放/拖动缩放。
 
+10. [26/11/20] a. 学术检索界面迁移到导出界面中，agent合并转为一个agent的skills; b. 增加笔记图片导出功能（机械导出和Agent导出），示例见功能6; c. 增加缩放过度动画，包括论文页/设置和笔记缩进等动作;
+
  
 ## Pdf 解析模块
 
@@ -52,7 +112,7 @@
 
 ### 2. Surya
 
-接入 **Surya 2 推理服务**，由服务端做版面分析与整页识别（部署方式见 `surya_doc_parse_service`）。
+接入 **Surya 2 推理服务**，由服务端做版面分析与整页识别（部署方式见 `services/surya_doc_parse_service`）。
 
 - 按版面分块还原阅读顺序，插图自动裁剪保存；
 - 表格保留结构，公式识别为 LaTeX 并渲染成数学公式；
@@ -60,14 +120,14 @@
 
 ### 3. Unlimited-OCR
 
-接入 **Unlimited-OCR 推理服务**，Unlimited-OCR模型做版面分析、文本和图表的检测和识别（部署方式见 `unlimited_ocr_service`）。增加 Unlimited-OCR 2 的官网api调用，需要再百度智能云平台创建应用。程序检测本地部署不存在时自动切换至api调用模式。
+接入 **Unlimited-OCR 推理服务**，Unlimited-OCR模型做版面分析、文本和图表的检测和识别（部署方式见 `services/unlimited_ocr_service`）。增加 Unlimited-OCR 2 的官网api调用，需要再百度智能云平台创建应用。程序检测本地部署不存在时自动切换至api调用模式。
 
 - 逐页识别，文本、图片和表格
 - 需要配置 config.json 中的unlimited_ocr_online_api_key和unlimited_ocr_online_secret_key
 
 ## MongoDB 数据存储
 
-论文数据全部存放在 MongoDB（部署方式见 `mongo_configuration/`，Docker Compose 一键启动）。默认只监听本机，只有本机上的应用能连，更适合个人使用。
+论文数据全部存放在 MongoDB（部署方式见 `services/mongo_configuration/`，Docker Compose 一键启动）。默认只监听本机，只有本机上的应用能连，更适合个人使用。
 
 存放内容：
 
@@ -101,6 +161,12 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 <img src="./function_display/7.agent-location.gif" width=400px><img src="./function_display/8.agent-write-notes.gif" width=400px>
 
+### 6. 笔记导出功能（图片导出示例）
+
+Agent 导出笔记图片需要启动沙盒容器 `services/draw_sandbox_service`
+
+<img src="./function_display/note-out.png" width=300px><img src="./function_display/note-out-agent.png" width=400px><img src="./function_display/note-out-mecha.png" width=400px>
+
 ## TODO
 
 - [x] ~~公式解析优化，重影缺失等问题~~
@@ -111,5 +177,6 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 - [x] ~~unlimited-ocr解析后端优化~~
 - [x] ~~笔记导出功能~~
 - [ ] Agent功能优化
+- [ ] Agent通信模块设计
 
 <!-- https://github.com/MarcYugo/tardigrade-paper-reader -->

@@ -66,9 +66,9 @@
   const { hex2rgb, rgb2hsl, hsl2hex, invertInk, pageInk, hexToRgba } =
     R2Color({ inkCache, isDark });
   const { gapStats, fitLineEl, fitItemLines } = R2Fit();
-  const { ZOOM_OK, GZ, vpW, vpH, scrolled, toScrollTop, toScrollDelta, applyZoom, unit,
+  const { ZOOM_OK, GZ, vpW, vpWAt, vpH, scrolled, toScrollTop, toScrollDelta, applyZoom, unit,
           anchorProbe, pageAnchor, restoreAnchor, posValid, posIsTail,
-          restoreLastPos } = R2View({
+          restoreLastPos, flipCapture, flipPlay } = R2View({
     ZOOM, pages,
     get META() { return META; },
     get posRestored() { return posRestored; },
@@ -876,9 +876,11 @@
      · curPageW / noteSide / noteW / noteLeft 本段既读又写 → getter + setter；
      · notesCount / notesOfBlock / tocPanelOpen 来自更后面的 r2-notes、r2-nav 装配 →
        包一层转发；TOC_W 是常量，用 getter 延后取值。 */
-  const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, syncReadCenter, basePageW } = R2Layout({
-    $, CSS_W, ZOOM, ZOOM_OK, vpW, unit, NOTE_GAP, pages,
+  const { computePageTarget, applyNoteChrome, relayoutAll, relayoutPage, layoutAi, syncReadCenter,
+          basePageW, switchSideFor } = R2Layout({
+    $, CSS_W, ZOOM, ZOOM_OK, vpW, vpWAt, GZ, unit, NOTE_GAP, pages,
     keyParts, lineOfChar, sentRange, render, paintFormulaMarks,
+    flipCapture, flipPlay,        // 笔记栏并排 ↔ 内嵌切换时给笔记卡做 FLIP 过渡
     get DOC() { return DOC; },
     get curPageW() { return curPageW; }, set curPageW(v) { curPageW = v; },
     get noteSide() { return noteSide; }, set noteSide(v) { noteSide = v; },
@@ -933,6 +935,8 @@
     $, pages, docId, CSS_W, vpH, ZOOMS, pagesEl, ZOOM, GZ, toScrollDelta,
     baseW: (...a) => basePageW(...a),
     relayoutAll, applyZoom, pageAnchor, render,
+    // 缩放跨过「并排 ↔ 内嵌」临界时：先跑笔记卡的 FLIP，完了再启动缩放过渡（见 layout.js）
+    switchSideFor: (...a) => switchSideFor(...a),
     // 逐页加载：跳页/目录跳转时目标页只有页壳，先请求这一页的数据（函数声明，已提升）
     ensurePage: (...a) => ensurePage(...a),
     canWrite: (...a) => canWrite(...a),

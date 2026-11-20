@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from backend.agents import note_out_agent as agent
+from backend.agents.skills import note_out as agent
 from backend.settings import SettingsStore
 
 _ENV_NAMES = ("OPENALEX_API_KEY", "SEMANTIC_SCHOLAR_API_KEY", "SCHOLARLY_MAILTO")

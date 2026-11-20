@@ -135,6 +135,13 @@ SCHOLAR_LABELS = {
     "mailto": "联系邮箱（Crossref / OpenAlex polite pool）",
 }
 
+# ---------------- 绘图沙盒（Agent 笔记图片）配置 ----------------
+# 默认行为不变：先看环境变量 `DRAW_SANDBOX_URL`，没有就用内置的本地地址。
+# 用户可以在前端「沙盒设置」里改成别的 draw-sandbox 地址（比如另一个容器），
+# 按账号存在 `users.prefs.sandbox = {url, updated_at, updated_by}`，与论文数据同样隔离。
+SANDBOX_ENV = "DRAW_SANDBOX_URL"
+SANDBOX_DEFAULT_URL = "http://127.0.0.1:8090/v1/run"
+
 
 def mask_key(key: str) -> str:
     """`sk-abcdefghijkl` → `sk-a****ijkl`；太短则全打码。"""
@@ -144,6 +151,22 @@ def mask_key(key: str) -> str:
     if len(key) <= 10:
         return key[0] + "****"
     return f"{key[:4]}****{key[-4:]}"
+
+
+def normalize_sandbox_url(url: str) -> str:
+    """把用户填的沙盒地址补全成 `…/v1/run`；空串原样返回。
+
+    允许填 `http://host:8090`、`http://host:8090/v1` 或完整的 `…/v1/run`，
+    最终都请求到 `…/v1/run`（与 `draw_sandbox_service` 的路由一致）。
+    """
+    value = (url or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if value.endswith("/v1"):
+        return value + "/run"
+    if not value.endswith("/v1/run"):
+        return value + "/v1/run"
+    return value
 
 
 def _read_json(path: Path | str | None) -> dict:
@@ -683,3 +706,83 @@ class SettingsStore:
         if not self.prefs:
             raise RuntimeError("没有配置存储后端（prefs），无法修改学术库设置")
         self.prefs.set_prefs(username, {"scholar": {}})
+
+    # ---------------- 绘图沙盒（Agent 笔记图片）配置 ----------------
+    #
+    # 存在 `users.prefs.sandbox = {url, updated_at, updated_by}`：
+    # 默认设置不变（环境变量 `DRAW_SANDBOX_URL` → 内置本地地址），
+    # 本账号填了就只对本账号生效，别的账号看不到、也不会受影响。
+    def _account_sandbox(self, username: str) -> dict:
+        """本账号保存过的沙盒字段（没写过就是空 dict）。"""
+        if not self.prefs or not username:
+            return {}
+        try:
+            data = (self.prefs.get_prefs(username) or {}).get("sandbox") or {}
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: str(v) for k, v in data.items()
+                if k in ("url", "updated_at", "updated_by")}
+
+    def sandbox_merged(self, username: str) -> dict:
+        """该账号实际生效的沙盒地址。
+
+        - `url`：**实际用来请求的地址**（已补成 `…/v1/run`）；
+        - `raw_url`：用户填的原样值（没填过就是空串，前端回显用）；
+        - `source`：account / env / default。
+        """
+        account_url = (self._account_sandbox(username).get("url") or "").strip()
+        if account_url:
+            return {"raw_url": account_url,
+                    "url": normalize_sandbox_url(account_url) or SANDBOX_DEFAULT_URL,
+                    "source": SRC_ACCOUNT}
+        env_url = (env_value(SANDBOX_ENV) or "").strip()
+        if env_url:
+            return {"raw_url": env_url,
+                    "url": normalize_sandbox_url(env_url) or SANDBOX_DEFAULT_URL,
+                    "source": SRC_ENV}
+        return {"raw_url": "", "url": SANDBOX_DEFAULT_URL, "source": SRC_DEFAULT}
+
+    def sandbox_url(self, username: str) -> str:
+        """给绘图技能用的沙盒请求地址（`…/v1/run`）。"""
+        return self.sandbox_merged(username)["url"]
+
+    def sandbox_describe(self, username: str) -> dict:
+        """接口返回：实际生效地址 + 来源（前端「沙盒设置」用）。"""
+        merged = self.sandbox_merged(username)
+        account = self._account_sandbox(username)
+        src = merged["source"]
+        return {
+            "owner": username,
+            "url": merged["url"],                     # 实际请求地址（已补 /v1/run）
+            "raw_url": merged["raw_url"],             # 本账号填的原样值（没填为空）
+            "default_url": SANDBOX_DEFAULT_URL,
+            "env": SANDBOX_ENV,
+            "source": src,
+            "source_text": SRC_TEXT.get(src, src),
+            "from_ui": bool(account.get("url")),
+            "updated_at": account.get("updated_at"),
+            "updated_by": account.get("updated_by"),
+        }
+
+    def save_sandbox(self, username: str, url: str, user: str = "") -> dict:
+        """保存本账号的沙盒地址；`url=""` = 清空（回落到环境变量 / 内置默认）。"""
+        if not self.prefs:
+            raise RuntimeError("没有配置存储后端（prefs），无法保存沙盒设置")
+        value = (url or "").strip()
+        if value and not value.startswith(("http://", "https://")):
+            raise ValueError("沙盒地址必须是 http(s):// 开头")
+        if len(value) > 300:
+            raise ValueError("沙盒地址太长（最多 300 个字符）")
+        data = {"url": value,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_by": user or username}
+        self.prefs.set_prefs(username, {"sandbox": data})
+        return data
+
+    def clear_sandbox(self, username: str) -> None:
+        """删掉本账号的沙盒地址，回落到环境变量 / 内置默认。"""
+        if not self.prefs:
+            raise RuntimeError("没有配置存储后端（prefs），无法修改沙盒设置")
+        self.prefs.set_prefs(username, {"sandbox": {}})

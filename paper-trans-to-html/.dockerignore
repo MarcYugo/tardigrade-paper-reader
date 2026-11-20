@@ -1,0 +1,28 @@
+# 构建上下文是项目根目录（docker-compose.yml 里 context: ..），
+# 这个文件放在根目录才会生效：把运行时数据/机密/无关文件挡在镜像之外。
+
+# 运行时数据（图片、JSON 回退数据、临时文件）
+data/
+
+# 机密与本地配置（不要打进镜像！）
+config.json
+mongo_configuration/.env
+.env
+
+# 版本控制 / 虚拟环境 / 缓存
+.git/
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 文档与示例产物
+samples/
+*.md
+!docker/README.md
+
+# Docker 自身（Dockerfile 由 dockerfile: 指定，不需要进上下文）
+docker/docker-compose.yml
+docker/.env

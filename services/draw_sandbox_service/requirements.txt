@@ -1,0 +1,7 @@
+# 画图沙盒服务依赖（基础镜像 python:3.11-slim）
+# matplotlib 是硬要求：用户代码基本都靠它出图，同时它会带 numpy / pillow / fonttools 等
+matplotlib>=3.8,<4.0
+numpy>=1.26,<3.0
+
+fastapi>=0.110,<1.0
+uvicorn>=0.29,<1.0

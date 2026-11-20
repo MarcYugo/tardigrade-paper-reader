@@ -1,7 +1,8 @@
-"""模块八 · AI 辅助阅读的**阅读 Agent**（带受限工具的对话）
+"""技能 · 辅助阅读（带受限工具的论文对话）
 
-从 `ai_read.py` 拆出来的一层：只放「能动页面」的部分 —— 系统提示词、工具声明、
-工具循环，以及两个工具的后端实现（写整理卡片、按关键词定位页面 / 文本块）。
+从原 `agents/ai_read_agent.py` 迁来，现在是挂在统一 Agent 运行时
+（`agents/agent.py`）上的一个技能：**只声明**「系统提示词 + 两个工具 + 两个工具
+的后端实现」，工具循环交给 `run_tool_loop()`，前端事件契约保持不变。
 
 普通对话（`reply_chat` / `reply_chat_stream`）、笔记整理与上下文拼装仍在
 `backend/ai_read.py`；两边共用 `chat_payload()` / `clean_summary()` 等。
@@ -10,24 +11,29 @@
 
 | 函数 | 作用 |
 | --- | --- |
+| `SKILL` | 技能声明（`name="ai_read"`，提示词 + 两个工具） |
 | `reply_agent_stream()` | 带工具的流式对话：yield 正文增量、工具状态与页面动作 |
 | `add_summary_item()` | 执行 `add_note_to_summary`：把内容并进右侧「笔记整理」卡片 |
 | `locate_page()` | 按正文与公式 LaTeX 定位最相关的页面（从 1 开始） |
 | `locate_text_block()` | 在指定页内定位相关文本块 ID（供前端点亮） |
 
 工具本身由调用方注入（`execute_tool`）：HTTP 层（`app.py`）负责权限、落库与
-「先问用户是否跳转、确认后才执行」的状态机，本模块只做模型侧决策与事件收敛。
+「先问用户是否跳转、确认后才执行」的状态机，本技能只做提示词与工具后端。
 """
 from __future__ import annotations
 
-import json
 import re
 from typing import Iterator
 
-from ..ai_read import (EDIT_ITEM_CHARS, EDIT_TITLE_CHARS, MAX_REPLY_CHARS,
-                       chat_payload, clean_summary, summary_text)
-from ..translate import Translator
-from .llm import LlmUnavailable
+from ...ai_read import (EDIT_ITEM_CHARS, EDIT_TITLE_CHARS, MAX_REPLY_CHARS,
+                        chat_payload, clean_summary, summary_text)
+from ...translate import Translator
+from ..agent import Skill, run_tool_loop, stream_completion
+
+# 对话循环的上限：最多 4 轮、总共 4 次工具调用、单轮最多 4 个并行调用
+MAX_TOOL_ROUNDS = 4
+MAX_TOOL_CALLS = 4
+MAX_TOOL_PARALLEL = 4
 
 
 _AGENT_SYSTEM = (
@@ -97,16 +103,30 @@ AGENT_TOOLS = [
     },
 ]
 
+SKILL = Skill(
+    name="ai_read",
+    title="辅助阅读",
+    description=("论文阅读对话：把用户要求的内容写进右侧「笔记整理」卡片，"
+                 "或把阅读器定位到论文页 / 某条笔记（跳转前先征求用户确认）。"),
+    system_prompt=_AGENT_SYSTEM,
+    tools=tuple(AGENT_TOOLS),
+)
+
 
 def reply_agent_stream(translator: Translator, *, title: str, notes: list[dict],
                        summary: dict | None, history: list[dict], message: str,
                        article: str = "", execute_tool=None,
                        pending_navigation: dict | None = None,
                        navigation_answer: str | None = None) -> Iterator[dict]:
-    """带两个受限工具的 Agent 对话，事件是正文增量、工具状态与页面动作。"""
+    """带两个受限工具的 Agent 对话，事件是正文增量、工具状态与页面动作。
+
+    循环本身在 `agents/agent.py::run_tool_loop`；这里只负责：
+    拼上下文 + 技能提示词、把「上一轮待确认的导航」写进提示词、把通用的
+    `confirmation` 事件转成前端认识的 `confirm_navigation`。
+    """
     system, msgs = chat_payload(title=title, notes=notes, summary=summary,
                                 history=history, message=message, article=article)
-    system += _AGENT_SYSTEM
+    system += SKILL.system_prompt
     if pending_navigation:
         target = pending_navigation.get("target")
         destination = (f"论文第 {pending_navigation.get('page')} 页"
@@ -118,80 +138,16 @@ def reply_agent_stream(translator: Translator, *, title: str, notes: list[dict],
             + "只有用户明确同意时才调用 navigate_to_content，并且只能使用上一轮确认的同一目标；"
             "如果用户拒绝，就不要调用导航工具；如果回答不明确，就继续询问，不要跳转。"
         )
-    pending_confirmation = None
-    used_chars = 0
-    tool_count = 0
-    for _ in range(4):
-        response = None
-        response_text = []
-        for event in translator.chat_completion_stream(
-                system, msgs, tools=AGENT_TOOLS, temperature=0.5):
-            if event.get("type") == "delta":
-                piece = str(event.get("text") or "")[:max(0, MAX_REPLY_CHARS - used_chars)]
-                if piece:
-                    used_chars += len(piece)
-                    response_text.append(piece)
-                    yield {"type": "delta", "text": piece}
-            elif event.get("type") == "completion":
-                response = event.get("message")
-        if not isinstance(response, dict):
-            raise LlmUnavailable("模型没有返回有效的对话结果")
-        calls = response.get("tool_calls")
-        if not isinstance(calls, list) or not calls:
-            if pending_confirmation:
-                yield {"type": "confirm_navigation", "action": pending_confirmation}
-            return
-        if len(calls) > 4:
-            raise LlmUnavailable("模型返回的工具调用数超出限制")
-        msgs.append({"role": "assistant", "content": "".join(response_text) or None,
-                     "tool_calls": calls})
-        for call in calls:
-            if not isinstance(call, dict):
-                raise LlmUnavailable("模型返回了无效的工具调用")
-            call_id = str(call.get("id") or "")
-            fn = call.get("function") if isinstance(call, dict) else {}
-            name = fn.get("name") if isinstance(fn, dict) else ""
-            if not call_id:
-                raise LlmUnavailable("模型返回了缺少 ID 的工具调用")
-            if not isinstance(name, str) or name not in {
-                    "add_note_to_summary", "navigate_to_content"}:
-                result = {"ok": False, "message": "不支持的工具"}
-            elif tool_count >= 4:
-                result = {"ok": False, "message": "本轮工具调用次数已达上限"}
-            else:
-                tool_count += 1
-                yield {"type": "tool", "name": name, "status": "running"}
-                try:
-                    raw_args = fn.get("arguments") or "{}"
-                    args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
-                    if not isinstance(args, dict):
-                        raise ValueError("工具参数必须是对象")
-                    result = execute_tool(name, args) if execute_tool else {
-                        "ok": False, "message": "工具不可用"}
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    result = {"ok": False, "message": f"工具参数无效：{exc}"}
-                if not isinstance(result, dict):
-                    raise LlmUnavailable("工具执行返回了无效结果")
-                action = result.get("action")
-                if isinstance(action, dict):
-                    yield {"type": "action", "action": action}
-                confirmation = result.get("confirmation")
-                if isinstance(confirmation, dict):
-                    pending_confirmation = confirmation
-                yield {"type": "tool", "name": name,
-                       "status": "done" if result.get("ok") else "error",
-                       "message": str(result.get("message") or "")[:500]}
-            msgs.append({"role": "tool", "tool_call_id": call_id,
-                         "content": json.dumps(result, ensure_ascii=False)})
-
-    # 让模型在调用次数耗尽后仍能给用户自然语言总结，而不是暴露工具协议。
-    for event in translator.chat_completion_stream(system, msgs, temperature=0.5):
-        if event.get("type") != "delta":
-            continue
-        piece = str(event.get("text") or "")[:max(0, MAX_REPLY_CHARS - used_chars)]
-        if piece:
-            used_chars += len(piece)
-            yield {"type": "delta", "text": piece}
+    for event in run_tool_loop(
+            complete=stream_completion(translator), system=system, messages=msgs,
+            skill=SKILL, execute_tool=execute_tool, max_rounds=MAX_TOOL_ROUNDS,
+            max_calls=MAX_TOOL_CALLS, max_per_round=MAX_TOOL_PARALLEL,
+            max_chars=MAX_REPLY_CHARS, temperature=0.5, final_reply=True):
+        if event.get("type") == "confirmation":
+            # 运行时只认识通用的 confirmation；前端契约保持 confirm_navigation + action
+            yield {"type": "confirm_navigation", "action": event.get("confirmation")}
+        else:
+            yield event
 
 
 def locate_page(doc: dict, query: str) -> int | None:
@@ -300,3 +256,7 @@ def add_summary_item(summary: dict | None, args: dict) -> tuple[dict, dict]:
         return {"ok": False, "message": message}, clean_summary(summary, loose=True)
     return {"ok": True, "message": f"已写入右侧整理卡片的「{SUMMARY_SECTIONS[section]}」",
             "section": section}, merged
+
+
+__all__ = ["SKILL", "AGENT_TOOLS", "reply_agent_stream", "add_summary_item",
+           "locate_page", "locate_text_block", "SUMMARY_SECTIONS"]

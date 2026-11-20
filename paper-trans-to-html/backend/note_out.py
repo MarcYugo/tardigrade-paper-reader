@@ -8,8 +8,8 @@
 * **机械导出**（`mode="mechanical"`）：纯本地、零 LLM 成本，直接给分节内容、
   参考文献条目、句子笔记 / 独立笔记 / 高亮与一份统计报告；
 * **Agent 导出**（`mode="agent"`）：在机械导出的基础上，交给
-  `agents/note_out_agent.py` 调用只读工具（核验参考文献是否真实存在、提取并确认
-  项目代码地址），再形成一份分析报告。
+  `agents/skills/note_out.py`（技能「笔记导出」）调用只读工具（核验参考文献是否
+  真实存在、提取并确认项目代码地址），再形成一份分析报告。
 
 这里不碰数据库、也不做权限判断：`doc` / `rec` / `anno` 都由调用方（`app.py`）取好，
 本模块只做**纯数据转换**。这样后面接「transfer key 让别的 Agent 拿走笔记」时，
@@ -670,14 +670,105 @@ def _notes_by_page(notes_data: dict) -> list[dict]:
 
 
 def _code_links(text: str) -> list[str]:
-    # 从 Agent 模块复用同一套提取规则（机械导出与工具候选口径一致）
-    from .agents.note_out_agent import extract_code_links
+    # 从笔记导出技能复用同一套提取规则（机械导出与工具候选口径一致）
+    from .agents.skills.note_out import extract_code_links
     return extract_code_links(text)
 
 
 # =====================================================================
 #  导出入口
 # =====================================================================
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_AFFIL_RE = re.compile(
+    r"(?i)\b(university|institute|department|college|school|laboratory|lab|"
+    r"research|google|microsoft|meta|amazon|inc\.?|ltd\.?|corp\.?)\b")
+_AUTHOR_MARK_RE = re.compile(r"[\*†‡§¶∗⋆]|\^\{[^}]*\}|[_^]\{[^}]*\}|\d+\s*[,;]\s*\d+")
+_FRONT_NOISE_RE = re.compile(
+    r"(?i)\b(arxiv|doi|issn|isbn|copyright|©|preprint|under review|accepted|published)\b")
+
+
+def paper_authors(doc: dict, title: str = "", limit: int = 10) -> list[str]:
+    """从首页版式里猜作者（导出图片第一栏用）。
+
+    只取「标题块之后、摘要/引言之前」的文字块，每条只留**首行**
+    （作者块常是 `Name^{*}\\nAffiliation\\nemail` 的形态），去掉上标与邮箱；
+    识别不到就返回空列表 —— 不猜比猜错好。
+    """
+    pages = (doc or {}).get("pages") or []
+    if not pages or not isinstance(pages[0], dict):
+        return []
+    blocks = [b for b in pages[0].get("texts") or [] if isinstance(b, dict)]
+
+    def _y(block: dict) -> float | None:
+        try:
+            return float(block.get("y"))
+        except (TypeError, ValueError):
+            return None
+
+    title_y = None
+    for block in blocks:
+        if _same_title(_norm(block.get("text")), title):
+            title_y = _y(block)
+            break
+    if title_y is None:
+        return []
+
+    stop_y = title_y + 280.0
+    for block in blocks:
+        y = _y(block)
+        if y is None or y <= title_y:
+            continue
+        name, _tail = _section_of(block, _norm(block.get("text")))
+        if name in ("abstract", "intro") and y < stop_y:
+            stop_y = y
+
+    found: list[tuple[float, str]] = []
+    for block in blocks:
+        y = _y(block)
+        if y is None or y <= title_y + 2 or y >= stop_y:
+            continue
+        raw = str(block.get("text") or "")
+        if not raw:
+            continue
+        first = _norm(raw.split("\n")[0])
+        if not first or len(first) > 120 or _AFFIL_RE.search(first):
+            continue
+        if _EMAIL_RE.search(first):            # 作者块首行不带邮箱；带了就不是名字
+            continue
+        if _FRONT_NOISE_RE.search(first):      # 「arXiv:… / DOI 10.… / © 2024 …」这类页眉
+            continue
+        first = _norm(_AUTHOR_MARK_RE.sub(" ", first)).strip(" ,;:")
+        if not first or not re.search(r"[A-Za-z\u4e00-\u9fff]{2,}", first):
+            continue
+        found.append((y, first))
+
+    out: list[str] = []
+    for _y, name in sorted(found, key=lambda item: item[0]):
+        if name not in out:
+            out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def build_ai_summary(rec: dict | None) -> dict | None:
+    """AI 辅助阅读面板里的「整理笔记」（图片导出第三栏用）。
+
+    返回 `{"summary": {...}, "at": 整理时间, "edited_at": 手改时间}`，
+    从没整理过时返回 `None`。
+    """
+    ai = (rec or {}).get("ai") or {}
+    summary = ai.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    from .ai_read import clean_summary      # 延迟导入：只做结构收敛，不引入额外依赖
+    return {
+        "summary": clean_summary(summary, loose=True),
+        "at": ai.get("summary_at"),
+        "edited_at": ai.get("summary_edited_at"),
+    }
+
+
 def _paper_meta(doc: dict, rec: dict | None, *, username: str = "") -> dict:
     rec = rec or {}
     reading: dict = {}
@@ -685,9 +776,11 @@ def _paper_meta(doc: dict, rec: dict | None, *, username: str = "") -> dict:
         reading = (records.reading_of(rec, username) if username else
                    {key: rec.get(key) for key in records.READING_KEYS})
         reading = {key: value for key, value in reading.items() if value is not None}
+    title = _norm(rec.get("title") or (doc or {}).get("title"))
     return {
         "id": str(rec.get("id") or (doc or {}).get("id") or ""),
-        "title": _norm(rec.get("title") or (doc or {}).get("title")),
+        "title": title,
+        "authors": paper_authors(doc, title),
         "source": _norm(rec.get("source") or (doc or {}).get("source")),
         "num_pages": int(rec.get("num_pages") or len((doc or {}).get("pages") or []) or 0),
         "parser": _norm(rec.get("parser") or (doc or {}).get("parser")),
@@ -725,9 +818,13 @@ def export_paper(*, doc: dict, rec: dict | None = None, anno: dict | None = None
       },
       "notes": {"sentence_notes": [...], "free_notes": [...],
                 "highlights": [...], "stats": {...}},
+      "ai_summary": {"summary": {...}, "at": "…"} | null,
       "report": {...}
     }
     ```
+
+    `paper.authors` 是首页上猜到（也可能为空）的作者；`ai_summary` 是 AI 辅助阅读
+    面板里的「整理笔记」，图片导出第三栏直接用它。
     """
     mode = str(mode or "mechanical").strip().lower()
     if mode not in MODES:
@@ -738,7 +835,7 @@ def export_paper(*, doc: dict, rec: dict | None = None, anno: dict | None = None
     if mode == "agent":
         if llm is None:
             raise ValueError("Agent 导出需要可用的 LLM（请在设置里配置 OpenAI 兼容服务）")
-        from .agents.note_out_agent import run_note_out_agent
+        from .agents.skills.note_out import run_note_out_agent
         report = run_note_out_agent(llm, paper=paper, sections=sections,
                                     notes=notes_data, instructions=instructions,
                                     scholar=scholar)
@@ -752,6 +849,7 @@ def export_paper(*, doc: dict, rec: dict | None = None, anno: dict | None = None
         "paper": paper,
         "sections": sections,
         "notes": notes_data,
+        "ai_summary": build_ai_summary(rec),
         "report": report,
     }
 
@@ -761,15 +859,23 @@ def to_json(export: dict) -> str:
     return json.dumps(export, ensure_ascii=False, indent=2)
 
 
-def export_filename(paper: dict | None) -> str:
-    """下载文件名：`<论文标题>-note-export.json`（非法字符替换成 `_`）。"""
+def export_filename(paper: dict | None, mode: str = "mechanical",
+                    fmt: str = "json") -> str:
+    """下载文件名：`<论文标题>-note-export.json` / `.png`（非法字符替换成 `_`）。
+
+    Agent 导出会在文件名里带上 `-agent`：`<论文标题>-agent-note-export.json`；
+    `fmt="image"` 时扩展名是 `.png`。
+    """
     title = _norm((paper or {}).get("title")) or "paper"
     safe = re.sub(r'[\\/:*?"<>|]+', "_", title).strip(" ._")[:60] or "paper"
-    return f"{safe}-note-export.json"
+    tag = "-agent" if str(mode or "").strip().lower() == "agent" else ""
+    ext = "png" if str(fmt or "").strip().lower() == "image" else "json"
+    return f"{safe}{tag}-note-export.{ext}"
 
 
 __all__ = [
     "EXPORT_FORMAT", "EXPORT_VERSION", "MODES",
     "build_sections", "build_notes", "build_mechanical_report",
+    "build_ai_summary", "paper_authors",
     "export_paper", "to_json", "export_filename",
 ]
