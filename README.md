@@ -165,7 +165,7 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 Agent 导出笔记图片需要启动沙盒容器 `services/draw_sandbox_service`
 
-<img src="./function_display/note-out.png" width=300px><img src="./function_display/note-out-agent.png" width=400px><img src="./function_display/note-out-mecha.png" width=400px>
+<img src="./function_display/note-out.png" width=260px><img src="./function_display/note-out-agent.png" width=260px><img src="./function_display/note-out-mecha.png" width=260px>
 
 ## TODO
 
