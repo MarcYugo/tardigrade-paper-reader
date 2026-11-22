@@ -3,6 +3,7 @@
 **简体中文** | [English](./README_en.md)
 
 > AI 辅助工具为 Deepseek-v4-flash/Deepseek-v4.1-flash/GPT-6-Luna + VScode copilot
+> 自用，需要者自取
 
 ## 更新
 
