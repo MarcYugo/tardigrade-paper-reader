@@ -9,14 +9,21 @@
 
 **存储后端可插拔**（由 `storage.py` 装配）：
 
-| 后端 | 账号 | 会话 |
-| --- | --- | --- |
-| MongoDB | 集合 `users` | 集合 `sessions`（TTL 索引自动过期） |
-| 本地 JSON | `data/users.json` | `data/sessions.json` |
+| 后端 | 账号 | 会话 | transfer key |
+| --- | --- | --- | --- |
+| MongoDB | 集合 `users` | 集合 `sessions`（TTL 索引自动过期） | 集合 `transfer_keys` |
+| 本地 JSON | `data/users.json` | `data/sessions.json` | `data/transfer_keys.json` |
 
 本模块只定义“后端要提供哪些方法”（`users_count/users_all/user_get/user_put/user_delete`、
-`session_get/session_put/session_delete/sessions_prune/sessions_delete_user`），
-实现分别在 `mongo_store.MongoAuthBackend` 与下面的 `JsonAuthBackend`。
+`session_get/session_put/session_delete/sessions_prune/sessions_delete_user`、
+`transfer_list/transfer_add/transfer_remove/transfer_find/transfer_touch/
+ transfer_drop_user`），实现分别在 `mongo_store.MongoAuthBackend` 与下面的
+`JsonAuthBackend`。
+
+**transfer key**（「转交 Key」）：账号在导出弹窗里生成的一次性可见令牌，
+其他 Agent 拿着它（`Authorization: Bearer <key>`）就能读取**该账号**的论文阅读数据，
+不需要账号口令、也不占用登录会话。库里按账号存：`_id = 用户名(小写)`，
+`keys = [{id, name, key, created_at, last_used_at, uses}]`。
 
 只做单机自用场景的“够用”安全：口令加盐哈希 + HttpOnly/SameSite=Lax Cookie +
 登录限流；不含找回密码、邮箱验证、多角色权限（账号一律等同管理员）。
@@ -34,6 +41,9 @@ from pathlib import Path
 
 SESSION_COOKIE = "ptsid"          # 会话 Cookie 名
 SESSION_DAYS = 14                 # 会话有效期(天)
+TRANSFER_PREFIX = "ptk_"          # transfer key 前缀（与 agent_comm_service 的 tk: 区分）
+TRANSFER_MAX = 20                 # 每个账号最多同时存在多少把 transfer key
+TRANSFER_NAME_MAX = 40            # 备注名长度上限
 _PBKDF2_ROUNDS = 200_000
 _ALGO = "pbkdf2_sha256"
 MIN_PASSWORD = 8
@@ -117,9 +127,14 @@ class JsonAuthBackend:
         self.root.mkdir(parents=True, exist_ok=True)
         self.users_file = self.root / "users.json"
         self.sessions_file = self.root / "sessions.json"
+        self.transfer_file = self.root / "transfer_keys.json"
         self._lock = threading.RLock()
         self._users: dict[str, dict] = _read_json(self.users_file, {})
         self._sessions: dict[str, dict] = _read_json(self.sessions_file, {})
+        self._transfer: dict[str, dict] = _read_json(self.transfer_file, {})
+        if not self.transfer_file.exists():
+            # 与账号存储同时建好（MongoDB 版在 backend 初始化时 create_index 建集合）
+            _write_json(self.transfer_file, {})
 
     # ---- 账号 ----
     def users_count(self) -> int:
@@ -181,6 +196,66 @@ class JsonAuthBackend:
             if len(alive) != len(self._sessions):
                 self._sessions = alive
                 _write_json(self.sessions_file, self._sessions)
+
+    # ---- transfer key（_id = 用户名小写，keys = 该账号的多把 key）----
+    def transfer_list(self, username: str) -> list[dict]:
+        key = (username or "").strip().lower()
+        with self._lock:
+            doc = self._transfer.get(key) or {}
+            return [dict(k) for k in (doc.get("keys") or [])]
+
+    def transfer_add(self, username: str, rec: dict) -> list[dict]:
+        key = (username or "").strip().lower()
+        with self._lock:
+            doc = dict(self._transfer.get(key) or {})
+            doc.setdefault("username", username)
+            doc["keys"] = list(doc.get("keys") or []) + [dict(rec)]
+            self._transfer[key] = doc
+            _write_json(self.transfer_file, self._transfer)
+            return [dict(k) for k in doc["keys"]]
+
+    def transfer_remove(self, username: str, key_id: str) -> list[dict]:
+        key = (username or "").strip().lower()
+        with self._lock:
+            doc = dict(self._transfer.get(key) or {})
+            doc["keys"] = [k for k in (doc.get("keys") or [])
+                           if k.get("id") != key_id]
+            if doc.get("keys") or key in self._transfer:
+                self._transfer[key] = doc
+                _write_json(self.transfer_file, self._transfer)
+            return [dict(k) for k in doc["keys"]]
+
+    def transfer_find(self, token: str) -> dict | None:
+        token = (token or "").strip()
+        if not token:
+            return None
+        with self._lock:
+            for key, doc in self._transfer.items():
+                for rec in doc.get("keys") or []:
+                    if rec.get("key") == token:
+                        out = dict(rec)
+                        out["username"] = doc.get("username") or key
+                        return out
+        return None
+
+    def transfer_touch(self, token: str) -> None:
+        token = (token or "").strip()
+        if not token:
+            return
+        with self._lock:
+            for doc in self._transfer.values():
+                for rec in doc.get("keys") or []:
+                    if rec.get("key") == token:
+                        rec["uses"] = int(rec.get("uses") or 0) + 1
+                        rec["last_used_at"] = _now_iso()
+                        _write_json(self.transfer_file, self._transfer)
+                        return
+
+    def transfer_drop_user(self, username: str) -> None:
+        key = (username or "").strip().lower()
+        with self._lock:
+            if self._transfer.pop(key, None) is not None:
+                _write_json(self.transfer_file, self._transfer)
 
 
 class AuthStore:
@@ -261,6 +336,56 @@ class AuthStore:
         self.backend.user_put(u["username"].lower(), rec)
         return prefs
 
+    # ================= transfer key（给其它 Agent 读取本账号论文数据） =================
+    # 设计：**每个账号一行**（`_id` = 用户名小写），`keys` 是该账号下的多把 key。
+    # 明文 Key 存在库里（与 `users.prefs.llm.api_key` 同级别），因为所有者要能随时复制；
+    # 校验只认「库里存在 + 账号还在」，删除即立刻失效。
+    def list_transfer_keys(self, username: str) -> list[dict]:
+        """某个账号名下的全部 transfer key（含完整 Key，只给所有者本人看）。"""
+        return self.backend.transfer_list(username)
+
+    def create_transfer_key(self, username: str, name: str = "") -> dict:
+        """给账号新签一把 transfer key，返回刚建的那条 `{id, name, key, ...}`。"""
+        keys = self.backend.transfer_list(username)
+        if len(keys) >= TRANSFER_MAX:
+            raise AuthError(f"每个账号最多 {TRANSFER_MAX} 把 transfer key，请先删掉不用的")
+        rec = {
+            "id": secrets.token_hex(6),
+            "name": " ".join(str(name or "").split())[:TRANSFER_NAME_MAX],
+            "key": TRANSFER_PREFIX + secrets.token_urlsafe(32),
+            "created_at": _now_iso(),
+            "last_used_at": None,
+            "uses": 0,
+        }
+        self.backend.transfer_add(username, rec)
+        return rec
+
+    def delete_transfer_key(self, username: str, key_id: str) -> bool:
+        """吊销一把 key（按 `id` 定位）；不存在返回 False。"""
+        key_id = (key_id or "").strip()
+        if not key_id:
+            raise AuthError("缺少 transfer key 的 id")
+        if not any((k.get("id") or "") == key_id
+                   for k in self.backend.transfer_list(username)):
+            return False
+        self.backend.transfer_remove(username, key_id)
+        return True
+
+    def resolve_transfer_key(self, token: str) -> dict | None:
+        """transfer key → `{username, id, name}`；无效/账号已删返回 None（并累计用量）。"""
+        rec = self.backend.transfer_find(token)
+        if not rec:
+            return None
+        u = self._user(rec.get("username") or "")
+        if not u:                       # 账号已注销：key 立即视为无效
+            return None
+        try:
+            self.backend.transfer_touch(token)
+        except Exception:               # 统计失败不影响鉴权
+            pass
+        return {"username": u["username"], "id": rec.get("id") or "",
+                "name": rec.get("name") or ""}
+
     def delete_user(self, username: str, by: str | None = None) -> None:
         """删除账号（连同它的登录会话）。不允许删自己，也不允许删掉最后一个账号。"""
         name = (username or "").strip()
@@ -273,6 +398,7 @@ class AuthStore:
             raise AuthError("至少要保留一个账号")
         self.backend.user_delete(u["username"].lower())
         self.backend.sessions_delete_user(u["username"])
+        self.backend.transfer_drop_user(u["username"])   # 该账号的 transfer key 一并吊销
 
     def close_account(self, username: str, password: str,
                       confirm: str | None = None) -> dict:
@@ -294,6 +420,7 @@ class AuthStore:
             raise AuthError(f"请输入用户名 {u['username']} 以确认注销")
         self.backend.user_delete(u["username"].lower())
         self.backend.sessions_delete_user(u["username"])   # 该账号所有会话立即失效
+        self.backend.transfer_drop_user(u["username"])      # 该账号的 transfer key 一并吊销
         return u
 
     def change_password(self, username: str, old_password: str, new_password: str,

@@ -62,7 +62,11 @@ timeline
               : 新增笔记图片导出
               : 机械导出 + Agent 导出
               : 缩放过渡动画
+        11/28 : Agent 通信模块
 ```
+
+<details>
+<summary>📋 查看详细更新说明（点击展开）</summary>
 
 1. [26/10/8] surya 解析与pymupdf解析分离，解析pdf和渲染路径独立，解决了surya解析时公式和图片重影问题，增加表格渲染
    
@@ -98,49 +102,240 @@ timeline
 
 10. [26/11/20] a. 学术检索界面迁移到导出界面中，agent合并转为一个agent的skills; b. 增加笔记图片导出功能（机械导出和Agent导出），示例见功能6; c. 增加缩放过度动画，包括论文页/设置和笔记缩进等动作;
 
- 
+11. [26/11/28] 增加 Agent 通信模块。
+
+</details>
+
+
+## 架构设计
+架构设计详见 [paper-trans-to-html/README.md](./paper-trans-to-html/README.md)。
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'Inter, -apple-system, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif','fontSize':'13px','lineColor':'#8fa1b3','textColor':'#243447','primaryColor':'#ffffff','primaryTextColor':'#243447','primaryBorderColor':'#cfd8e3','edgeLabelBackground':'#ffffff','clusterBkg':'#ffffff','clusterBorder':'#d8e0ea'},'flowchart':{'curve':'basis','nodeSpacing':30,'rankSpacing':44,'padding':12}}}%%
+flowchart TB
+    subgraph FE["① 表示层 · 浏览器 —— 原生 HTML / CSS / JS · 无框架 · 无构建"]
+        FE1["登录 · 注册<br/>login.html / login.js"]
+        FE2["论文列表 · 共享<br/>index.html / home.js"]
+        FE3["阅读器装配<br/>reader.html / reader2.js"]
+        FE4["版式渲染 · 三后端<br/>core / items"]
+        FE5["切句缩放 · 选区翻译<br/>select / bar / translate"]
+        FE6["笔记 · AI · 引用 · 目录<br/>r2-notes / r2-ai / r2-refs / katex"]
+    end
+
+    subgraph AG["⑤ Agent 运行时 · backend/agents"]
+        AG1["运行时 agent.py<br/>工具循环 · 历史卫生"]
+        AG2["LLM 接入 llm.py<br/>流式 · tool_calls · 三套配置"]
+        AG3["技能 · 辅助阅读<br/>写整理卡片 · 定位页 / 笔记"]
+        AG4["技能 · 笔记导出<br/>核验文献 · 生成报告"]
+        AG5["技能 · 笔记图片<br/>生成绘图代码"]
+        AG6["技能 · 通信桥<br/>transfer key · 消费 / 回包"]
+        AG1 ~~~ AG2 ~~~ AG3 ~~~ AG4 ~~~ AG5 ~~~ AG6
+    end
+
+    subgraph CORE[" "]
+        subgraph CHAIN["⑥ 解析链 · 三后端互不牵连"]
+            direction LR
+            P1["本地方案<br/>pymupdf + OXR + texify + SLANet"]
+            P2["Surya 2<br/>推理服务 :8060"]
+            P3["Unlimited-OCR<br/>:9010 / 官网 API"]
+        end
+        subgraph CAP["③ 能力层 · 领域模块"]
+            C1["解析门面 pdf_parser<br/>统一契约 parse_pdf"]
+            C2["文档装配 converter<br/>documents + 插图"]
+            C3["引用映射 pdf_refs<br/>三套策略 · 纯本地"]
+            C4["翻译 translate<br/>批量 · 缓存 · 兜底"]
+            C5["AI 阅读 ai_read<br/>摘要 · 流式对话"]
+            C6["笔记导出 notes_out<br/>数据 · 图片 · 文献核验"]
+            C1 ~~~ C2 ~~~ C3 ~~~ C4 ~~~ C5 ~~~ C6
+        end
+        subgraph APP["② 应用层 · FastAPI 单体 app.py"]
+            A1["HTTP API + 静态托管<br/>AuthGate 门禁 · 302 / 401"]
+            A2["账号 / 会话 / 偏好<br/>auth.py · settings.py · PBKDF2"]
+            A3["接口分组<br/>docs · anno · translate · ai · share"]
+            A1 ~~~ A2 ~~~ A3
+        end
+        subgraph STOR["④ 存储层 · storage / mongo_store"]
+            S1["存储装配<br/>APP_STORAGE auto / mongo / json"]
+            S2["Mongo · GridFS<br/>集合读写 · 插图存取"]
+            S3["本地 JSON 回退<br/>data/ · 热切换"]
+            S1 ~~~ S2
+            S1 ~~~ S3
+        end
+    end
+
+    subgraph INFRA["⑦ 外部服务 · 沙盒 / 通信模块 / 数据库"]
+        I4["LLM 服务<br/>DeepSeek · OpenAI · Ollama"]
+        I1["draw-sandbox :8090<br/>绘图沙盒"]
+        I2["agent_comm_service<br/>Redis Streams · 通信网关"]
+        I5["学术检索<br/>OpenAlex · Semantic Scholar"]
+        I3[("MongoDB · GridFS<br/>九集合 + 插图本体")]
+    end
+
+    %% ── 表示层 → 应用层 ──
+    FE1 ==>|"HTTP"| A1
+    FE2 ==>|"fetch"| A1
+    FE3 ==>|"fetch / SSE"| A1
+
+    %% ── 应用层内部 ──
+    A1 ==>|"鉴权 / 偏好"| A2
+    A2 ==>|"路由分发"| A3
+
+    %% ── 应用层 → 能力层 ──
+    A1 ==>|"parse_pdf"| C1
+    A3 -->|"引用映射"| C3
+    A3 -->|"批量翻译"| C4
+    A3 -->|"摘要 / 对话"| C5
+    A3 -->|"笔记导出"| C6
+
+    %% ── 应用层 → 存储层 / Agent ──
+    A3 ==>|"会话 / 偏好读写"| S1
+    A1 ==>|"SSE / 报告"| AG1
+
+    %% ── 能力层内部 → 存储层 ──
+    C1 ==>|"版式 JSON"| C2
+    C2 -->|"documents / 插图"| S2
+    S1 ==>|"读写"| S2
+    S1 -.->|"自动回退"| S3
+
+    %% ── 解析链 → 能力层（A3 ~~~ P2 仅作布局约束：把解析链整体压在能力层上方；
+    %%    边的声明顺序决定链内左右次序：本地方案 / Surya 2 / Unlimited-OCR） ──
+    A3 ~~~ P2
+    P3 ==> C1
+    P2 ==> C1
+    P1 ==>|"按账号切换"| C1
+
+    %% ── Agent 内部 ──
+    AG1 ==>|"流式 / tool_calls"| AG2
+    AG1 ==> AG3
+    AG1 ==> AG4
+    AG1 ==> AG5
+    AG1 ==> AG6
+
+    %% ── Agent 技能 → 能力层（复用） ──
+    AG3 -.->|"复用 ai_read"| C5
+    AG4 -.->|"复用 notes_out"| C6
+
+    %% ── 外部服务 ──
+    AG2 -.->|"chat"| I4
+    AG5 -.->|"绘图代码"| I1
+    AG6 -.->|"消费 / 回包"| I2
+    C6 -.->|"文献核验"| I5
+    S2 ==>|"落库"| I3
+
+    %% ── 布局骨架（不可见） ──
+    AG6 ~~~ I4
+    C6 ~~~ I1
+    C6 ~~~ I2
+    C6 ~~~ I3
+
+    classDef feN fill:#f7f9fc,stroke:#c3cfdd,stroke-width:1.2px,color:#243447
+    classDef agN fill:#faf8f5,stroke:#d6c9b8,stroke-width:1.2px,color:#3d3428
+    classDef capN fill:#f4f7fa,stroke:#a8bccf,stroke-width:1.2px,color:#1f3242
+    classDef appN fill:#f5f7f9,stroke:#9db0c0,stroke-width:1.2px,color:#22303c
+    classDef stoN fill:#f2f5f4,stroke:#9fb5ab,stroke-width:1.2px,color:#22382f
+    classDef chN fill:#f3f7f4,stroke:#a3bfa8,stroke-width:1.2px,color:#26382c
+    classDef infN fill:#f4f3f1,stroke:#b8b0a4,stroke-width:1.2px,color:#33302a
+    classDef dbN fill:#2e3a45,stroke:#2e3a45,stroke-width:1.2px,color:#eef2f6
+
+    class FE1,FE2,FE3,FE4,FE5,FE6 feN;
+    class AG1,AG2,AG3,AG4,AG5,AG6 agN;
+    class C1,C2,C3,C4,C5,C6 capN;
+    class A1,A2,A3 appN;
+    class S1,S2,S3 stoN;
+    class P1,P2,P3 chN;
+    class I4,I1,I2,I5 infN;
+    class I3 dbN;
+
+    style FE fill:#fbfcfe,stroke:#dfe6ee,stroke-width:1.4px,color:#33475b
+    style AG fill:#fbfaf8,stroke:#e6ddcf,stroke-width:1.4px,color:#4a4034
+    style CORE fill:#ffffff,stroke:#d8e0ea,stroke-width:1.4px,color:#33475b
+    style CAP fill:#f8fafc,stroke:#c6d3e0,stroke-width:1.2px,color:#33475b
+    style APP fill:#f8f9fb,stroke:#c9d2dd,stroke-width:1.2px,color:#33475b
+    style STOR fill:#f7faf8,stroke:#c4d6cd,stroke-width:1.2px,color:#33475b
+    style CHAIN fill:#f8fbf8,stroke:#cfe0d2,stroke-width:1.4px,color:#33475b
+    style INFRA fill:#faf9f7,stroke:#ddd6cb,stroke-width:1.4px,color:#4a4034
+```
+
 ## Pdf 解析模块
 
 把论文 PDF 解析成**可还原原版式的数据**（文字块 + 插图，保留原坐标、字号、字体）。提供三种解析方式，输出结构一致，前端无需改动。
 
-### 1. 本地解析方案
-
-不依赖显卡和外部服务，装好即用，也是其他方式不可用时的**兜底**，解析latex代码编译生成的pdf效果最好。
-
-- 文字按 PDF 原始行框、字号、字体、颜色还原；
-- 自动提取插图（内嵌图片与矢量图表），过滤整页背景、过小贴图；
-- 数学公式（独立公式和行内公式）提取靠字体识别+texify转换。
-- 使用前需要下载，详情查看该模块中的 [local_parse_pipeline/README.md](./paper-trans-to-html/backend/pdf_parser/local_parse_pipeline/README.md)
-
-### 2. Surya
-
-接入 **Surya 2 推理服务**，由服务端做版面分析与整页识别（部署方式见 `services/surya_doc_parse_service`）。
-
-- 按版面分块还原阅读顺序，插图自动裁剪保存；
-- 表格保留结构，公式识别为 LaTeX 并渲染成数学公式；
-- 电子版论文仍以原始精确版式为准，扫描件用识别结果还原。
-
-### 3. Unlimited-OCR
-
-接入 **Unlimited-OCR 推理服务**，Unlimited-OCR模型做版面分析、文本和图表的检测和识别（部署方式见 `services/unlimited_ocr_service`）。增加 Unlimited-OCR 2 的官网api调用，需要再百度智能云平台创建应用。程序检测本地部署不存在时自动切换至api调用模式。
-
-- 逐页识别，文本、图片和表格
-- 需要配置 config.json 中的unlimited_ocr_online_api_key和unlimited_ocr_online_secret_key
+<table>
+	<thead>
+		<tr>
+			<th align="center" width="18%">解析方式</th>
+			<th align="center" width="24%">依赖与部署</th>
+			<th align="center">核心能力</th>
+			<th align="center" width="26%">适用场景 / 备注</th>
+		</tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td align="center"><strong>🖥️ 本地解析</strong><br><sub>pymupdf + OXR + texify + SLANet</sub></td>
+			<td>不依赖显卡和外部服务，装好即用<br><sub>模型需预先下载，见 <a href="./paper-trans-to-html/backend/pdf_parser/local_parse_pipeline/README.md">local_parse_pipeline/README.md</a></sub></td>
+			<td>
+				<ul>
+					<li>文字按 PDF 原始行框、字号、字体、颜色还原</li>
+					<li>自动提取插图（内嵌图片与矢量图表），过滤整页背景、过小贴图</li>
+					<li>独立公式与行内公式靠字体识别 + texify 转换</li>
+				</ul>
+			</td>
+			<td>其他方式不可用时的<strong>兜底</strong>；解析 LaTeX 编译生成的 PDF 效果最好</td>
+		</tr>
+		<tr>
+			<td align="center"><strong>📄 Surya</strong><br><sub>Surya 2 推理服务</sub></td>
+			<td>接入服务端版面分析与整页识别<br><sub>部署方式见 <code>services/surya_doc_parse_service</code></sub></td>
+			<td>
+				<ul>
+					<li>按版面分块还原阅读顺序，插图自动裁剪保存</li>
+					<li>表格保留结构，公式识别为 LaTeX 并渲染成数学公式</li>
+					<li>电子版论文以原始精确版式为准，扫描件用识别结果还原</li>
+				</ul>
+			</td>
+			<td>电子版与扫描件通用，版面结构还原能力强</td>
+		</tr>
+		<tr>
+			<td align="center"><strong>🔍 Unlimited-OCR</strong><br><sub>Unlimited-OCR 推理服务 / 官网 API</sub></td>
+			<td>本地服务部署见 <code>services/unlimited_ocr_service</code>；本地部署不存在时自动切换官网 API<br><sub>API 需在百度智能云平台创建应用，配置 <code>config.json</code> 中 <code>unlimited_ocr_online_api_key</code> 和 <code>unlimited_ocr_online_secret_key</code></sub></td>
+			<td>
+				<ul>
+					<li>Unlimited-OCR 模型做版面分析、文本和图表的检测与识别</li>
+					<li>逐页识别，覆盖文本、图片和表格</li>
+				</ul>
+			</td>
+			<td>扫描件 OCR 识别；支持 Unlimited-OCR 2 官网 API 调用</td>
+		</tr>
+	</tbody>
+</table>
 
 ## MongoDB 数据存储
 
-论文数据全部存放在 MongoDB（部署方式见 `services/mongo_configuration/`，Docker Compose 一键启动）。默认只监听本机，只有本机上的应用能连，更适合个人使用。
+论文数据全部存放在 MongoDB（部署方式见 `services/mongo_configuration/`）。默认只监听本机，只有本机上的应用能连，更适合个人使用。
 
 存放内容：
 
 - **论文** —— 元数据、页数、阅读进度与状态，以及论文归属的账号；
 - **版式数据与插图** —— 解析结果与论文插图，重启、重建容器、换机器都不会丢；
-- **高亮 / 笔记 / 译文** —— 标注与译文缓存，相同句子不重复翻译；
+- **高亮 / 笔记 / 译文 / 参考文献检查** —— 标注与译文缓存，相同句子不重复翻译；
 - **账号与会话** —— 登录账号（口令加盐哈希存储）、登录会话（过期自动清理）、每个账号各自的偏好与 LLM 配置。
 
 数据按账号隔离：每个账号只能看到并操作自己上传的论文。
 
 数据库没启动也能正常用：应用会自动回退到本地文件存储并在页面上提示，点「重试连接」即可切回数据库，不用重启服务。
+
+## Agent 通信模块
+使用Redis数据库存储消息和传递的数据，使用redis streams传递消息，外部agent通过持有transfer key通过通信应用发消息给 tardigrade reader agent 调取对应账户内的论文内容和笔记。
+通信模块必须在已部署 MongoDB 数据库（`services/mongo_configuration`）时使用（需要存放 transfer key）。
+部署见`services/agent_comm_service`，模块设计和该模块的压力测试详见 [agent-comm-service/README.md](./services/agent_comm_service/README.md)。
+
+使用其他agent产品与tardigrade 内置agent通信时需要配置skill，示例见 `opencode-sample`。
+
+<table>
+    <tr>
+        <td align="center"><img src="./function_display/agent_comm_export.png" width=400px></td>
+        <td align="center"><img src="./function_display/agent_comm.png" width=400px></td>
+    </tr>
+</table>
 
 ## LLM 设置
 LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，实现上来说没有固定base url，可以任意选择，能够保存的设置只有3套。
@@ -149,27 +344,51 @@ LLM 设置预设了OpenAI、Anthoripic、deepseek和本地模式可供选择，�
 
 ### 1. 多用户和设置
 
-<img src="./function_display/1.log-in-switch-out.gif" width=400px><img src="./function_display/2.config.gif" width=400px>
+<table>
+	<tr>
+		<td align="center"><img src="./function_display/1.log-in-switch-out.gif" width=400px></td>
+		<td align="center"><img src="./function_display/2.config.gif" width=400px></td>
+	</tr>
+</table>
 
 ### 3. 论文载入和删除、标注、笔记和翻译
 
-<img src="./function_display/3.paper-load-del.gif" width=400px><img src="./function_display/4.highlight-mark-translate.gif" width=400px>
+<table>
+	<tr>
+		<td align="center"><img src="./function_display/3.paper-load-del.gif" width=400px></td>
+		<td align="center"><img src="./function_display/4.highlight-mark-translate.gif" width=400px></td>
+	</tr>
+</table>
 
 ### 4. 笔记整理和AI辅助、笔记共享
 
-<img src="./function_display/5.note-ai-assitant.gif" width=400px><img src="./function_display/6.note-share.gif" width=400px>
+<table>
+	<tr>
+		<td align="center"><img src="./function_display/5.note-ai-assitant.gif" width=400px></td>
+		<td align="center"><img src="./function_display/6.note-share.gif" width=400px></td>
+	</tr>
+</table>
 
 ### 5. 笔记和内容定位、笔记添加
 
-<img src="./function_display/7.agent-location.gif" width=400px><img src="./function_display/8.agent-write-notes.gif" width=400px>
+<table>
+	<tr>
+		<td align="center"><img src="./function_display/7.agent-location.gif" width=400px></td>
+		<td align="center"><img src="./function_display/8.agent-write-notes.gif" width=400px></td>
+	</tr>
+</table>
 
 ### 6. 笔记导出功能（图片导出示例）
 
 Agent 导出笔记图片需要启动沙盒容器 `services/draw_sandbox_service`
 
-<img src="./function_display/note-out.png" width=200px>
-
-<img src="./function_display/note-out-agent.png" width=400px><img src="./function_display/note-out-mecha.png" width=400px>
+<table>
+	<tr>
+		<td align="center"><img src="./function_display/note-out.png" height=240px></td>
+		<td align="center"><img src="./function_display/note-out-agent.png" height=240px></td>
+		<td align="center"><img src="./function_display/note-out-mecha.png" height=240px></td>
+	</tr>
+</table>
 
 ## TODO
 
@@ -180,7 +399,9 @@ Agent 导出笔记图片需要启动沙盒容器 `services/draw_sandbox_service`
 - [x] ~~引用链接显示功能优化~~
 - [x] ~~unlimited-ocr解析后端优化~~
 - [x] ~~笔记导出功能~~
+- [x] ~~Agent通信模块设计~~
 - [ ] Agent功能优化
-- [ ] Agent通信模块设计
+- [ ] 应用内部代码优化
+- [ ] 笔记导入功能
 
 <!-- https://github.com/MarcYugo/tardigrade-paper-reader -->

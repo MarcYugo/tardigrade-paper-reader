@@ -59,14 +59,14 @@ from .backend.backend_pymupdf import local_status as local_parse_status
 # =====================================================================
 #  解析配置(后端选择 / 服务参数)
 # =====================================================================
-# 仓库根的 `config.json`（与 `app.py` 的 `CONFIG_FILE` 是**同一个文件**）。
+# 仓库根的 `config.json`（与 `backend/server/config.py` 的 `CONFIG_FILE` 是**同一个文件**）。
 # ⚠️ 拆包时在这里踩过坑：原来单文件 `backend/pdf_parser.py` 上溯 2 层正好是仓库根，
 #    拆成 `backend/pdf_parser/options.py` 后少了一层，指向了 `backend/config.json`
 #    —— 那个文件根本不存在。后果：网页面板“切换解析后端”写的是根 `config.json`，
 #    而解析时 `parse_pdf()` 读的是这个空路径（文件不存在就静默用默认值）→ 永远走
-#    `auto`。而 `app.py` 的 `status(CONFIG_FILE)` 传的是根路径，所以面板里显示的
+#    `auto`。而 `parser_config.status_cached()` 传的是根路径，所以面板里显示的
 #    是“已保存的值”，实际解析却是另一回事 —— 表现就是“手动选后端不生效”。
-#    改这里时顺手对一下 `app.py::CONFIG_FILE`（两者必须指向同一份）。
+#    改这里时顺手对一下 `backend/server/config.py::CONFIG_FILE`（两者必须指向同一份）。
 CONFIG_FILE = Path(__file__).resolve().parents[2] / "config.json"
 
 # 合法的后端取值。`auto` / `pymupdf` 都走本地解析方案。

@@ -312,13 +312,50 @@ window.R2Layout = function (env) {
       lastCenterX = v;
       document.documentElement.style.setProperty("--page-cx", v + "px");
     }
+    syncNoticeCenter();                              // 顶部提示条也跟着页面中线走
     return cx;
   }
+
+  /* ---------- 顶部提示条（.notice）对齐页面卡片中线 ----------
+     提示条是**流内**块级元素，`margin: 12px auto` 让它按 body 全宽居中；而页面卡片
+     居中在 `.reader-main` 的**内容盒**里。目录（左 300px）/ 笔记栏（右 384px）一开，
+     内容盒整体平移，页面跟着走、提示条却还停在窗口中线 —— 实测能差 150px+（截图里
+     就是这种错位）；放大到页面比内容盒宽、或横向滚动时同理。
+     做法与 --page-cx 同源：量**两者 rect**（同一坐标系）求中线差，再把差值写成
+     translateX。⚠️ rect 是视觉单位，转 CSS 长度要先 / unit().k（Firefox / Safari 的
+     rect 会把 zoom 乘进去，见 r2-view.js::unit）。
+     提示条的显隐/改字全走 common.js::showNotice，这里用 MutationObserver 兜住
+     （只监听 hidden 与文本，写自己的 style.transform 不会触发它，不会自激）。 */
+  function syncNoticeCenter() {
+    const noticeEl = $("notice");
+    if (!noticeEl || noticeEl.hidden) return;
+    const pagesEl = $("pages");
+    const target = pagesEl && (pagesEl.querySelector(".page") || pagesEl);
+    if (!target) return;
+    const k = env.unit ? (env.unit().k || 1) : 1;
+    noticeEl.style.transform = "";                   // 先清掉上次的位移，量到的才是布局位置
+    const nr = noticeEl.getBoundingClientRect();
+    const pr = target.getBoundingClientRect();
+    if (!nr.width || !pr.width) return;
+    const dx = (pr.left + pr.width / 2 - nr.left - nr.width / 2) / k;
+    if (Math.abs(dx) < 0.5) return;                  // 本来就对中：别留一个 0px 的 transform
+    noticeEl.style.transform = "translateX(" + dx.toFixed(2) + "px)";
+  }
+
   syncReadCenter();
   if ($("pages")) {
     // 预留宽度（目录 / 批注栏）变化会改变 #pages 的宽度；窗口缩放同理
     if (window.ResizeObserver) new ResizeObserver(syncReadCenter).observe($("pages"));
     window.addEventListener("resize", syncReadCenter);
+    // 提示条什么时候出现是「运行时」的（fetch 失败、AI 整理失败…）：盯住它的显隐与文案，
+    // 一出现就按当时的页面中线摆好，不用改 showNotice 的每个调用点
+    const noticeEl = $("notice");
+    if (noticeEl && window.MutationObserver) {
+      new MutationObserver(syncNoticeCenter).observe(noticeEl, {
+        attributes: true, attributeFilter: ["hidden"],
+        childList: true, characterData: true, subtree: true,
+      });
+    }
     // 页面比可视区宽时会出现横向滚动，中线要跟着内容走（竖向滚动不受影响，别每次滚动都量）
     let lastScrollX = window.scrollX;
     window.addEventListener("scroll", () => {

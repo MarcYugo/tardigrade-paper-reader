@@ -1680,6 +1680,34 @@ html.dark .ai-mark { filter: drop-shadow(0 0 5px rgba(150, 180, 255, .4)); }
 .no-fold-body .field:last-of-type { margin-bottom: 4px; }
 .no-fold-body .row-actions { margin-bottom: 10px; }
 .no-fold-body .form-err, .no-fold-body .form-ok { margin-bottom: 8px; }
+/* 导出弹窗「转交 Key」：一行一把 key（备注名 / 打码 Key / 时间 + 显示·复制·删除） */
+.tk-list { display: flex; flex-direction: column; gap: 8px; margin: 2px 0 12px; }
+.tk-empty { font-size: 12px; color: var(--mut); padding: 4px 2px 8px; }
+.tk-row {
+  display: flex; gap: 10px; align-items: center; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 9px; background: var(--field-bg);
+}
+.tk-row.new { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.tk-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.tk-name { font-size: 13px; font-weight: 600; }
+.tk-uses { font-size: 11px; font-weight: 400; color: var(--mut); margin-left: 6px; }
+.tk-key {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
+  font-size: 12px; line-height: 1.6; color: var(--ink);
+  background: rgba(127, 127, 127, .12); border-radius: 5px; padding: 2px 6px;
+  overflow-wrap: anywhere;
+}
+.tk-meta { font-size: 11.5px; color: var(--mut); }
+.tk-ops { flex: none; display: flex; gap: 6px; }
+.tk-ops .btn { padding: 4px 9px; font-size: 12px; }
+.tk-api { border-top: 1px dashed var(--line); padding-top: 10px; }
+.tk-api-title { font-size: 12px; color: var(--mut); margin-bottom: 6px; line-height: 1.7; }
+.tk-api pre {
+  margin: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--field-bg); color: var(--ink); font-size: 11.5px; line-height: 1.8;
+  overflow-x: auto; white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
+}
 /* 导出进行中（.modal-busy）：× / 遮罩 / 「关闭」都关不掉，仅做视觉弱化 */
 .modal-busy .modal-x { opacity: .4; cursor: not-allowed; }
 .modal-busy .modal-mask { cursor: progress; }

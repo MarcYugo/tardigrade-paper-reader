@@ -8,7 +8,7 @@
 | `note_out.py` | 机械导出 / Agent 导出：论文分节 + 笔记 + 统计报告（纯数据转换） |
 | `note_out_image.py` | 机械图片导出：Matplotlib + XKCD 三栏版式 PNG；Agent 绘图技能在沙盒运行生成代码 |
 
-对外只暴露 `note_out` 的公共函数（`app.py` 从这里 import）：
+对外只暴露 `note_out` 的公共函数（`server/api/export.py` / `server/api/transfer.py` 从这里 import）：
 
 ```python
 from backend.notes_out import export_paper, export_filename, to_json
@@ -20,11 +20,15 @@ from .note_out import (
     EXPORT_VERSION,
     MODES,
     build_ai_summary,
+    build_figures,
+    build_fulltext,
     build_mechanical_report,
     build_notes,
     build_sections,
+    check_references,
     export_filename,
     export_paper,
+    merge_agent_report,
     paper_authors,
     to_json,
 )
@@ -32,7 +36,8 @@ from .note_out_image import THEMES, render as render_image
 
 __all__ = [
     "EXPORT_FORMAT", "EXPORT_VERSION", "MODES",
-    "build_sections", "build_notes", "build_mechanical_report",
+    "build_sections", "build_fulltext", "build_figures", "check_references",
+    "build_notes", "build_mechanical_report", "merge_agent_report",
     "build_ai_summary", "paper_authors",
     "export_paper", "to_json", "export_filename",
     "render_image", "THEMES",

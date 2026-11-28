@@ -180,6 +180,10 @@ class Store:
     def seltrans_file(self, doc_id: str) -> Path:
         return self.doc_dir(doc_id) / "seltrans.json"
 
+    def refcheck_file(self, doc_id: str) -> Path:
+        """参考文献核验缓存：一次联网核验、之后导出直接复用（见 agents/skills/note_out.py）。"""
+        return self.root / "refcheck" / f"{doc_id}.json"
+
     # ---------------- 阅读记录(records.json) ----------------
     def _read_records(self) -> list[dict]:
         with self._lock:
@@ -259,6 +263,7 @@ class Store:
         self._doc_cache.pop(doc_id, None)
         if self.doc_dir(doc_id).exists():
             shutil.rmtree(self.doc_dir(doc_id), ignore_errors=True)
+        self.delete_refcheck(doc_id)
 
     # ---------------- 图片 ----------------
     # 接口与 `MongoStore` 对齐（那边存 GridFS，这边落盘）：`converter` 与
@@ -336,6 +341,23 @@ class Store:
     def _write_json(self, path: Path, data) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ---------------- 参考文献核验缓存 ----------------
+    # Agent 导出会把整张参考文献列表联网核验一遍（很慢）。核验结果按
+    # 「doc_id + 参考文献指纹」存一份，下次导出直接复用，不再重复打外部接口。
+    def get_refcheck(self, doc_id: str) -> dict | None:
+        """读该论文上次的参考文献核验结果；没有/损坏时返回 None。"""
+        data = self._read_json(self.refcheck_file(doc_id), None)
+        return data if isinstance(data, dict) else None
+
+    def set_refcheck(self, doc_id: str, data: dict) -> None:
+        self._write_json(self.refcheck_file(doc_id), data)
+
+    def delete_refcheck(self, doc_id: str) -> None:
+        try:
+            self.refcheck_file(doc_id).unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def get_annotations(self, doc_id: str) -> dict:
         anno = self._read_json(self.anno_file(doc_id),

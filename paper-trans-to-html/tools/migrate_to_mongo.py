@@ -11,6 +11,7 @@
 | `data/docs/<id>/translations.json` | `translations` 集合 |
 | `data/docs/<id>/seltrans.json` | `seltrans` 集合 |
 | `data/users.json` | `users` 集合（口令哈希原样搬，密码不变） |
+| `data/transfer_keys.json` | `transfer_keys` 集合（转交 Key，随账号一起搬） |
 | `data/llm.json` | `settings` 集合（`_id="llm"`） |
 
 插图也搬进库里（GridFS），所以迁完就只有 `documents.images` 一个来源，
@@ -92,6 +93,25 @@ def main() -> int:
         print("账号      ：按参数跳过")
     else:
         print("账号      ：无 users.json，跳过")
+
+    # ---------------- 转交 Key（跟着账号走） ----------------
+    tk_recs: list[tuple[str, dict]] = []
+    tkeys = _read_json(data_dir / "transfer_keys.json", {})
+    if isinstance(tkeys, dict):
+        for uname, doc in tkeys.items():
+            if not isinstance(doc, dict):
+                continue
+            for rec in doc.get("keys") or []:
+                tk_recs.append((doc.get("username") or uname, rec))
+    if tk_recs and not args.skip_users:
+        if users_be:
+            for uname, rec in tk_recs:
+                users_be.transfer_add(uname, rec)
+        print(f"转交 Key  ：transfer_keys.json → transfer_keys（{len(tk_recs)} 把）")
+    elif args.skip_users:
+        print("转交 Key  ：按参数跳过")
+    else:
+        print("转交 Key  ：无 transfer_keys.json，跳过")
 
     # ---------------- 论文 ----------------
     records = _read_json(data_dir / "records.json", [])

@@ -679,6 +679,32 @@ function openNoteExportModal(docId) {
             <div class="hint" id="sbNotes"></div>
           </div>
         </details>
+        <details class="no-fold" id="noTransfer">
+          <summary>🔑 转交 Key（让其它 Agent 读取本账号的论文数据）</summary>
+          <div class="no-fold-body">
+            <p class="hint" style="margin:0 0 12px">
+              生成的 <b>transfer key</b> 就像 LLM 的 API Key：其它 Agent 拿着它就能读取
+              <b>本账号</b>的论文列表与笔记（分节正文 / 句子笔记 / 独立笔记 / 高亮 / 分析报告），
+              不需要你的登录口令；在这里<b>删除即立刻失效</b>。
+            </p>
+            <div class="field">
+              <label for="tkName">备注名（可选，便于区分是给谁用的）</label>
+              <input id="tkName" maxlength="40" autocomplete="off" spellcheck="false"
+                     placeholder="例如：Obsidian 插件 / 我的检索 Agent">
+            </div>
+            <div class="row-actions">
+              <button class="btn primary" id="tkGen" type="button">生成新 Key</button>
+            </div>
+            <div class="form-err" id="tkErr" hidden></div>
+            <div class="form-ok" id="tkOk" hidden></div>
+            <div class="tk-list" id="tkList"></div>
+            <div class="tk-api">
+              <div class="tk-api-title">其它 Agent 这样调用（HTTP 头
+                <code>Authorization: Bearer &lt;key&gt;</code>）</div>
+              <pre id="tkApi"></pre>
+            </div>
+          </div>
+        </details>
         <div class="form-err" id="noErr" hidden></div>
         <div class="form-ok" id="noOk" hidden></div>
         <ul class="no-list">
@@ -937,6 +963,139 @@ function openNoteExportModal(docId) {
   /* 首次展开才去拉一次配置，不展开就不发请求 */
   sandboxBox.addEventListener("toggle", () => {
     if (sandboxBox.open && !sandbox) loadSandbox();
+  });
+
+  /* ---- 转交 Key（transfer key）：给其它 Agent 读取本账号论文数据 ----
+     与上面两个折叠面板同一套交互：展开才拉列表；生成/删除后服务端回整份列表，直接重绘。
+     Key 由服务端按账号存（MongoDB `transfer_keys` 集合），删除即立刻失效。 */
+  const transferBox = $("noTransfer");
+  let transfer = null;
+  const tkMsg = (node, msg) => { node.textContent = msg || ""; node.hidden = !msg; };
+  const tkErr = msg => tkMsg($("tkErr"), msg);
+  const tkOk = msg => tkMsg($("tkOk"), msg);
+  const tkTime = v => String(v || "").replace("T", " ").slice(0, 19);
+
+  async function tkCopy(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      /* http 非 localhost 下 clipboard 可能不可用，退回 execCommand */
+      const ta = el("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+      ta.remove();
+      return ok;
+    }
+  }
+
+  function tkRowHtml(k, isNew) {
+    const muted = k.key_masked || "";
+    const raw = k.key || "";
+    const meta = ["创建 " + (tkTime(k.created_at) || "—")];
+    if (k.last_used_at) meta.push("最近使用 " + tkTime(k.last_used_at));
+    return `<div class="tk-row${isNew ? " new" : ""}" data-id="${esc(k.id)}">
+      <div class="tk-main">
+        <div class="tk-name">${esc(k.name || "未命名")}` +
+        (k.uses ? `<span class="tk-uses">已用 ${k.uses} 次</span>` : "") + `</div>
+        <code class="tk-key" data-masked="${esc(muted)}" data-raw="${esc(raw)}"
+              data-hidden="1">${esc(muted)}</code>
+        <div class="tk-meta">${esc(meta.join(" · "))}</div>
+      </div>
+      <div class="tk-ops">
+        <button class="btn" type="button" data-act="reveal" title="显示 / 隐藏完整 Key">显示</button>
+        <button class="btn" type="button" data-act="copy">复制</button>
+        <button class="btn danger" type="button" data-act="del">删除</button>
+      </div>
+    </div>`;
+  }
+
+  function renderTransfer(d, newId) {
+    transfer = d || {};
+    const keys = transfer.keys || [];
+    $("tkList").innerHTML = keys.length
+      ? keys.map(k => tkRowHtml(k, k.id === newId)).join("")
+      : `<div class="tk-empty">还没有 transfer key，点上面的「生成新 Key」。</div>`;
+    // 刚生成的那把默认展开明文，方便立刻复制
+    if (newId) {
+      const row = $("tkList").querySelector('.tk-row[data-id="' + newId + '"]');
+      const code = row && row.querySelector(".tk-key");
+      const btn = row && row.querySelector('button[data-act="reveal"]');
+      if (code) { code.textContent = code.dataset.raw; code.dataset.hidden = ""; }
+      if (btn) btn.textContent = "隐藏";
+    }
+    const origin = location.origin;
+    $("tkApi").textContent =
+      `BASE  ${origin}\n` +
+      `GET /api/transfer/papers                        # 我的论文列表\n` +
+      `GET /api/transfer/papers/{doc_id}               # 笔记 JSON（正文/笔记/报告）\n` +
+      `GET /api/transfer/papers/{doc_id}?mode=agent    # 附 LLM 分析报告\n` +
+      `GET /api/transfer/whoami                        # 自检\n\n` +
+      `请求头：Authorization: Bearer <transfer key>\n` +
+      `（也支持 X-Transfer-Key 头或 ?key= 查询参数）`;
+  }
+
+  async function loadTransfer() {
+    tkErr(""); tkOk("");
+    try { renderTransfer(await api("/api/transfer-keys")); }
+    catch (e) { tkErr("读取失败：" + e.message); }
+  }
+
+  $("tkGen").onclick = async () => {
+    tkErr(""); tkOk("");
+    const btn = $("tkGen");
+    btn.disabled = true; btn.textContent = "生成中…";
+    try {
+      const r = await api("/api/transfer-keys",
+                          { method: "POST", json: { name: $("tkName").value.trim() } });
+      $("tkName").value = "";
+      renderTransfer(r, (r.created || {}).id);
+      tkOk("✅ 已生成新 Key，请点列表里的「复制」保存好（关闭弹窗后仍可再次显示）。");
+      toast("transfer key 已生成");
+    } catch (e) { tkErr(e.message); } finally {
+      btn.disabled = false; btn.textContent = "生成新 Key";
+    }
+  };
+
+  /* 列表里的操作：显示/隐藏、复制、删除（事件委托，重绘后不用重新绑定） */
+  $("tkList").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn) return;
+    const row = btn.closest(".tk-row");
+    const code = row && row.querySelector(".tk-key");
+    const act = btn.dataset.act;
+    if (act === "reveal" && code) {
+      const hidden = code.dataset.hidden === "1";
+      code.textContent = hidden ? code.dataset.raw : code.dataset.masked;
+      code.dataset.hidden = hidden ? "" : "1";
+      btn.textContent = hidden ? "隐藏" : "显示";
+    } else if (act === "copy" && code) {
+      const okCopy = await tkCopy(code.dataset.raw || "");
+      if (okCopy) { tkOk("✅ Key 已复制到剪贴板"); toast("Key 已复制"); }
+      else { tkErr("复制失败，请点「显示」后手动选中复制"); }
+    } else if (act === "del" && row) {
+      if (!confirm("删除这把 transfer key？\n\n删除后，正在使用它的 Agent 会立刻失去访问权限。")) return;
+      tkErr(""); tkOk("");
+      btn.disabled = true;
+      try {
+        renderTransfer(await api("/api/transfer-keys/" + encodeURIComponent(row.dataset.id),
+                                 { method: "DELETE" }));
+        tkOk("已删除该 transfer key");
+      } catch (err) {
+        btn.disabled = false;
+        tkErr(err.message);
+      }
+    }
+  });
+
+  /* 首次展开才去拉一次列表，不展开就不发请求 */
+  transferBox.addEventListener("toggle", () => {
+    if (transferBox.open && !transfer) loadTransfer();
   });
 
   $("noGo").onclick = async () => {
@@ -1418,8 +1577,11 @@ function openLlmModal(tab) {
   });
 
   function profileSub(p) {
-    return [p.provider_text || "", p.model || p.base_url || ""].filter(Boolean).join(" · ")
-      || "未填写服务地址";
+    // Google 免费兜底没有地址 / 模型：副标题别跟着显示上一套残留的模型名
+    const isGoogle = llmProviderKey(p.provider) === "google";
+    return [p.provider_text || "",
+            isGoogle ? "" : (p.model || p.base_url || "")].filter(Boolean).join(" · ")
+      || (isGoogle ? "无需地址与 Key" : "未填写服务地址");
   }
 
   function profileAvatar(p) {
@@ -1554,8 +1716,11 @@ function openLlmModal(tab) {
     }
     renderProfiles();
     const act = profiles.find(p => p.id === activeId);
+    const actTail = act
+      ? (llmProviderKey(act.provider) === "google" ? act.provider_text : (act.model || act.provider_text))
+      : "";
     $("lmProfileHint").innerHTML = act
-      ? `当前生效：<b>${esc(profileLabel(act))}</b>（${esc(act.model || act.provider_text || "")}）`
+      ? `当前生效：<b>${esc(profileLabel(act))}</b>（${esc(actTail || "")}）`
       : "本账号未保存配置，当前用安装级默认。";
   }
 
@@ -1620,10 +1785,13 @@ function openLlmModal(tab) {
 
   function payload() {
     const key = $("lmKey").value.trim();
+    const provider = $("lmProvider").value;
+    // Google 免费兜底不需要地址 / 模型：别把切换前残留的 deepseek-chat 等一起提交
+    const isGoogle = provider === "google";
     return {
-      provider: $("lmProvider").value,
-      base_url: $("lmBase").value.trim(),
-      model: $("lmModel").value.trim(),
+      provider,
+      base_url: isGoogle ? "" : $("lmBase").value.trim(),
+      model: isGoogle ? "" : $("lmModel").value.trim(),
       // 留空/未真输过=不改动(null)；勾选“清除”=传空串清空
       api_key: $("lmClearKey").checked ? "" : ((keyTouched && key !== "") ? key : null),
       profile_id: editingId || "new",   // 有 id 就改写那套，否则新建一套（服务端限制最多 3 套）

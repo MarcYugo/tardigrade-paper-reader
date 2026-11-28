@@ -112,10 +112,13 @@
 
   function payload() {
     const key = $("api_key").value.trim();
+    const provider = $("provider").value;
+    // Google 免费兜底不需要地址 / 模型：别把切换前残留的模型名一起提交
+    const isGoogle = provider === "google";
     return {
-      provider: $("provider").value,
-      base_url: $("base_url").value.trim(),
-      model: $("model").value.trim(),
+      provider,
+      base_url: isGoogle ? "" : $("base_url").value.trim(),
+      model: isGoogle ? "" : $("model").value.trim(),
       // 留空 = 沿用已保存的 Key（传 null），不是清空；
       // 没被用户输入过(浏览器自动填充)也当作“不改动”
       api_key: (keyTouched && key !== "") ? key : null,

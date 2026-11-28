@@ -17,8 +17,8 @@
 ### 快速开始
 
 ```bash
-# 0. 启动 MongoDB（同级目录 mongo_configuration；不启也能跑，会自动回退本地 JSON）
-cd ../mongo_configuration && cp .env.example .env && docker compose up -d && cd ../paper-trans-to-html
+# 0. 启动 MongoDB（同级目录 ../services/mongo_configuration；不启也能跑，会自动回退本地 JSON）
+cd ../services/mongo_configuration && cp .env.example .env && docker compose up -d && cd ../../paper-trans-to-html
 
 # 1. 依赖（建议虚拟环境）
 python -m venv .venv
@@ -62,6 +62,8 @@ python run.py                     # 打开 http://127.0.0.1:8000
 | 14 | **暗夜模式** | 右上角一键切换。背景走枪灰（`#22262d`，卡片 `#2b3038`、页面 `#262b32`）、文字反近白；PDF 正文色是写死的，按"保留色相、反转明度"在 JS 换算（黑字→近白、彩色标题→同色系提亮），插图保持原样只压一点亮度。高亮改为**荧光**（很淡的同色底 + 高亮霓虹字 + `text-shadow` 外发光），调色盘色块同步发光。主题两级存储：`localStorage` 让首屏由 `<head>` 一行小脚本先套 class（不闪白），登录后以账号偏好 `theme` 为准。整套配色靠 CSS 变量双份语义色板，组件不再写死浅色。 |
 | 15 | **重排不跳页** | 缩放 / 窗口变化 / 目录栏与笔记栏开关都会改变页面尺寸进而**整页重建**；重建后按"页号 + 页内比例"还原滚动位置，目录跳转之后再缩放、拉窗口不会被弹回"上次读到的一页"。 |
 | 16 | **笔记图片导出** | 机械导出使用 Matplotlib + XKCD 三栏版式；Agent 图片在报告完成后生成 Python 绘图代码并交给 `draw-sandbox` 执行，默认沿用机械版风格且第一栏包含文献核查摘要，可通过 Agent 提示词调整风格与栏目。容器部署配置 `DRAW_SANDBOX_URL`（默认 `http://host.docker.internal:8090/v1/run`），可选 `DRAW_SANDBOX_API_KEY`；沙盒不要暴露公网。用户在导出弹窗的「🧪 沙盒设置」里可按账号改请求地址（存 `users.prefs.sandbox`，只影响本人；不填仍用环境变量 / 内置默认，可只填到端口，后端自动补 `/v1/run`）。 |
+| 17 | **转交 Key（给其它 Agent 读取笔记）** | 导出弹窗的「🔑 转交 Key」分栏可生成 / 删除账号的 transfer key（`ptk_…`，每账号最多 20 把，带备注名、创建时间、最近使用与调用次数；列表里可显示 / 复制 / 删除）。其它 Agent 拿 key 以 `Authorization: Bearer <key>`（也支持 `X-Transfer-Key` 头或 `?key=`）读取**该账号**的论文列表与笔记数据，不需要账号口令。Key 存独立集合 `transfer_keys`（`_id` = 用户名小写，`keys` = 多个该账号下的 key），与 `users` 集合同一时间创建；删除即立刻失效，注销账号时一并清除。数据复用「笔记导出」同一份 JSON 结构（`GET /api/transfer/papers/{doc_id}`，可加 `?mode=agent` 带 LLM 报告）。 |
+| 18 | **通信桥技能（agent_comm）** | 作为 `agent_comm_service` 的 reader 侧：`XREADGROUP` 消费 `outside-in-stream`，按消息内容执行 **导出某篇论文笔记 / 阅读笔记列表 / 返回回答**，结果写回 `inside-out-stream`（由服务 dispatcher 落到 `agent:reply:{rid}`）并 `XACK`。**应用启动时自动托管**：后台线程每 `AGENT_COMM_PROBE_S`（默认 15s）探测通信服务 `/healthz`，**服务存在才轮询**，不在就等着（Redis 有积压也不取），服务回来自动恢复；`AGENT_COMM_AUTO=0` 可关闭。`--status` 体检服务与 Redis（流长度 / 积压）；回包超过 60KB（`export_notes` 则总是）把完整结果存通信服务 Redis（`agent:result:{rid}`），消息只回「摘要 + 引用」，用 `GET /v1/requests/{rid}/result` 取回完整笔记；账号归属**只认通信服务的盖章**（`envelope.owner` + `auth.mac`，密钥自动从同一个 MongoDB 的 `agent_gateway_meta` 读取），不再解析 `ptk_`、不看 `payload.user` / `AGENT_COMM_USER`，未盖章/验章失败直接回 `error`（本地调试可 `AGENT_COMM_ALLOW_UNSTAMPED=1` 回旧行为）。状态接口 `GET /api/agent-comm/status`；命令行 `python tools/comm_worker.py --status|--once`；LLM 侧工具 `comm_status` / `comm_poll` / `comm_reply`。 |
 
 ### 2.2 后续计划（尚未实现）
 
@@ -74,95 +76,347 @@ python run.py                     # 打开 http://127.0.0.1:8000
 ### 3.1 总体分层
 
 ```
-浏览器（原生 HTML/CSS/JS，无框架、无构建）
+浏览器（原生 HTML/CSS/JS，无框架、无构建；阅读器 core / items / select / r2-* 模块，内置离线 KaTeX）
    │  fetch / SSE
    ▼
-FastAPI 单体后端（app.py：HTTP 接口 + AuthGate 登录门禁 + 前端静态托管）
+FastAPI 后端（server/ 统一应用层：app.py 装配 + api/* 按域拆分路由 + AuthGate 登录门禁 + 前端静态托管）
+   ├─ 账号与会话 auth.py / settings.py  PBKDF2 口令、会话 TTL、限流、多套 LLM 配置与账号偏好
    ├─ 解析层 pdf_parser              三条后端链，同一份 parse_pdf 契约
+   ├─ 文档装配 converter              版式 JSON → documents + 插图（GridFS / 本地文件）
+   ├─ 引用层 pdf_refs                按 parser 分发的纯本地映射（三套策略）
+   ├─ 翻译层 translate               提示词 + 批量 + 译文缓存 + Google 兜底
+   ├─ AI 阅读 ai_read                结构化摘要 + 带全文公式的流式对话
    ├─ LLM 层  agents/llm.py          OpenAI 兼容 chat/completions、流式、tool_calls
-   ├─ Agent 层 agents/agent.py       统一工具循环 + 事件收敛（技能：辅助阅读 / 笔记导出 / Agent 笔记图片）
-   ├─ 引用层 pdf_refs                按 parser 分发的纯本地映射
+   ├─ Agent 层 agents/agent.py       统一工具循环 + 事件收敛（技能：辅助阅读 / 笔记导出 / Agent 笔记图片 / 通信桥）
+   ├─ 笔记导出 notes_out              导出数据 + Matplotlib 机械版图片
    └─ 存储层 storage / mongo_store   Mongo 优先，JSON 回退（支持热切换）
    ▼
-MongoDB（records / documents / highlights / notes / translations / seltrans /
-         users / sessions + GridFS images）
-外部可选服务：Surya 推理(8060) / Unlimited-OCR vLLM(9010) / 百度智能云在线解析
+MongoDB（records / documents / highlights / notes / translations / seltrans / refcheck /
+         users / transfer_keys / sessions + GridFS images）
+外部可选服务：Surya 推理(8060) / Unlimited-OCR vLLM(9010) / 百度智能云在线解析 / LLM 服务 /
+             draw-sandbox(8090) / OpenAlex·Semantic Scholar / agent_comm_service(Redis Streams)
+```
+
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'Inter, -apple-system, Segoe UI, PingFang SC, Microsoft YaHei, sans-serif','fontSize':'13px','lineColor':'#8fa1b3','textColor':'#243447','primaryColor':'#ffffff','primaryTextColor':'#243447','primaryBorderColor':'#cfd8e3','edgeLabelBackground':'#ffffff','clusterBkg':'#ffffff','clusterBorder':'#d8e0ea'},'flowchart':{'curve':'basis','nodeSpacing':30,'rankSpacing':44,'padding':12}}}%%
+flowchart TB
+    subgraph FE["① 表示层 · 浏览器 —— 原生 HTML / CSS / JS · 无框架 · 无构建"]
+        FE1["登录 · 注册<br/>login.html / login.js"]
+        FE2["论文列表 · 共享<br/>index.html / home.js"]
+        FE3["阅读器装配<br/>reader.html / reader2.js"]
+        FE4["版式渲染 · 三后端<br/>core / items"]
+        FE5["切句缩放 · 选区翻译<br/>select / bar / translate"]
+        FE6["笔记 · AI · 引用 · 目录<br/>r2-notes / r2-ai / r2-refs / katex"]
+    end
+
+    subgraph AG["⑤ Agent 运行时 · backend/agents"]
+        AG1["运行时 agent.py<br/>工具循环 · 历史卫生"]
+        AG2["LLM 接入 llm.py<br/>流式 · tool_calls · 三套配置"]
+        AG3["技能 · 辅助阅读<br/>写整理卡片 · 定位页 / 笔记"]
+        AG4["技能 · 笔记导出<br/>核验文献 · 生成报告"]
+        AG5["技能 · 笔记图片<br/>生成绘图代码"]
+        AG6["技能 · 通信桥<br/>transfer key · 消费 / 回包"]
+        AG1 ~~~ AG2 ~~~ AG3 ~~~ AG4 ~~~ AG5 ~~~ AG6
+    end
+
+    subgraph CORE[" "]
+        subgraph CHAIN["⑥ 解析链 · 三后端互不牵连"]
+            direction LR
+            P1["本地方案<br/>pymupdf + OXR + texify + SLANet"]
+            P2["Surya 2<br/>推理服务 :8060"]
+            P3["Unlimited-OCR<br/>:9010 / 官网 API"]
+        end
+        subgraph CAP["③ 能力层 · 领域模块"]
+            C1["解析门面 pdf_parser<br/>统一契约 parse_pdf"]
+            C2["文档装配 converter<br/>documents + 插图"]
+            C3["引用映射 pdf_refs<br/>三套策略 · 纯本地"]
+            C4["翻译 translate<br/>批量 · 缓存 · 兜底"]
+            C5["AI 阅读 ai_read<br/>摘要 · 流式对话"]
+            C6["笔记导出 notes_out<br/>数据 · 图片 · 文献核验"]
+            C1 ~~~ C2 ~~~ C3 ~~~ C4 ~~~ C5 ~~~ C6
+        end
+        subgraph APP["② 应用层 · FastAPI（server/app.py 装配 + api/* 路由）"]
+            A1["HTTP API + 静态托管<br/>AuthGate 门禁 · 302 / 401"]
+            A2["账号 / 会话 / 偏好<br/>auth.py · settings.py · PBKDF2"]
+            A3["接口分组<br/>docs · anno · translate · ai · share"]
+            A1 ~~~ A2 ~~~ A3
+        end
+        subgraph STOR["④ 存储层 · storage / mongo_store"]
+            S1["存储装配<br/>APP_STORAGE auto / mongo / json"]
+            S2["Mongo · GridFS<br/>集合读写 · 插图存取"]
+            S3["本地 JSON 回退<br/>data/ · 热切换"]
+            S1 ~~~ S2
+            S1 ~~~ S3
+        end
+    end
+
+    subgraph INFRA["⑦ 外部服务 · 沙盒 / 通信模块 / 数据库"]
+        I4["LLM 服务<br/>DeepSeek · OpenAI · Ollama"]
+        I1["draw-sandbox :8090<br/>绘图沙盒"]
+        I2["agent_comm_service<br/>Redis Streams · 通信网关"]
+        I5["学术检索<br/>OpenAlex · Semantic Scholar"]
+        I3[("MongoDB · GridFS<br/>九集合 + 插图本体")]
+    end
+
+    %% ── 表示层 → 应用层 ──
+    FE1 ==>|"HTTP"| A1
+    FE2 ==>|"fetch"| A1
+    FE3 ==>|"fetch / SSE"| A1
+
+    %% ── 应用层内部 ──
+    A1 ==>|"鉴权 / 偏好"| A2
+    A2 ==>|"路由分发"| A3
+
+    %% ── 应用层 → 能力层 ──
+    A1 ==>|"parse_pdf"| C1
+    A3 -->|"引用映射"| C3
+    A3 -->|"批量翻译"| C4
+    A3 -->|"摘要 / 对话"| C5
+    A3 -->|"笔记导出"| C6
+
+    %% ── 应用层 → 存储层 / Agent ──
+    A3 ==>|"会话 / 偏好读写"| S1
+    A1 ==>|"SSE / 报告"| AG1
+
+    %% ── 能力层内部 → 存储层 ──
+    C1 ==>|"版式 JSON"| C2
+    C2 -->|"documents / 插图"| S2
+    S1 ==>|"读写"| S2
+    S1 -.->|"自动回退"| S3
+
+    %% ── 解析链 → 能力层（A3 ~~~ P2 仅作布局约束：把解析链整体压在能力层上方；
+    %%    边的声明顺序决定链内左右次序：本地方案 / Surya 2 / Unlimited-OCR） ──
+    A3 ~~~ P2
+    P3 ==> C1
+    P2 ==> C1
+    P1 ==>|"按账号切换"| C1
+
+    %% ── Agent 内部 ──
+    AG1 ==>|"流式 / tool_calls"| AG2
+    AG1 ==> AG3
+    AG1 ==> AG4
+    AG1 ==> AG5
+    AG1 ==> AG6
+
+    %% ── Agent 技能 → 能力层（复用） ──
+    AG3 -.->|"复用 ai_read"| C5
+    AG4 -.->|"复用 notes_out"| C6
+
+    %% ── 外部服务 ──
+    AG2 -.->|"chat"| I4
+    AG5 -.->|"绘图代码"| I1
+    AG6 -.->|"消费 / 回包"| I2
+    C6 -.->|"文献核验"| I5
+    S2 ==>|"落库"| I3
+
+    %% ── 布局骨架（不可见） ──
+    AG6 ~~~ I4
+    C6 ~~~ I1
+    C6 ~~~ I2
+    C6 ~~~ I3
+
+    classDef feN fill:#f7f9fc,stroke:#c3cfdd,stroke-width:1.2px,color:#243447
+    classDef agN fill:#faf8f5,stroke:#d6c9b8,stroke-width:1.2px,color:#3d3428
+    classDef capN fill:#f4f7fa,stroke:#a8bccf,stroke-width:1.2px,color:#1f3242
+    classDef appN fill:#f5f7f9,stroke:#9db0c0,stroke-width:1.2px,color:#22303c
+    classDef stoN fill:#f2f5f4,stroke:#9fb5ab,stroke-width:1.2px,color:#22382f
+    classDef chN fill:#f3f7f4,stroke:#a3bfa8,stroke-width:1.2px,color:#26382c
+    classDef infN fill:#f4f3f1,stroke:#b8b0a4,stroke-width:1.2px,color:#33302a
+    classDef dbN fill:#2e3a45,stroke:#2e3a45,stroke-width:1.2px,color:#eef2f6
+
+    class FE1,FE2,FE3,FE4,FE5,FE6 feN;
+    class AG1,AG2,AG3,AG4,AG5,AG6 agN;
+    class C1,C2,C3,C4,C5,C6 capN;
+    class A1,A2,A3 appN;
+    class S1,S2,S3 stoN;
+    class P1,P2,P3 chN;
+    class I4,I1,I2,I5 infN;
+    class I3 dbN;
+
+    style FE fill:#fbfcfe,stroke:#dfe6ee,stroke-width:1.4px,color:#33475b
+    style AG fill:#fbfaf8,stroke:#e6ddcf,stroke-width:1.4px,color:#4a4034
+    style CORE fill:#ffffff,stroke:#d8e0ea,stroke-width:1.4px,color:#33475b
+    style CAP fill:#f8fafc,stroke:#c6d3e0,stroke-width:1.2px,color:#33475b
+    style APP fill:#f8f9fb,stroke:#c9d2dd,stroke-width:1.2px,color:#33475b
+    style STOR fill:#f7faf8,stroke:#c4d6cd,stroke-width:1.2px,color:#33475b
+    style CHAIN fill:#f8fbf8,stroke:#cfe0d2,stroke-width:1.4px,color:#33475b
+    style INFRA fill:#faf9f7,stroke:#ddd6cb,stroke-width:1.4px,color:#4a4034
 ```
 
 ### 3.2 目录结构
 
 ```
-paper-trans-to-html/            ← 应用本体（本 README 所在目录）
-  run.py                        启动入口
-  config.example.json           翻译服务 + PDF 解析配置示例
-  backend/                      FastAPI 后端
-    app.py                      HTTP 接口 + 登录门禁中间件 + 静态托管
-    auth.py                     模块四 · 账号与会话（PBKDF2 哈希、限流）
-    db.py                       模块六 · Mongo 连接层（读同级 .env 或环境变量）
-    mongo_store.py              模块七 · Mongo 存储实现（集合/索引/各存储后端）
-    storage.py                  存储装配（按 APP_STORAGE 选 Mongo 或 JSON 回退）
-    settings.py                 模块五 · 运行时设置（LLM 多套配置、目标语言、解析后端）
-    pdf_parser/                 模块一 · 文档解析（PDF → 版式布局数据）
-      __init__.py               门面：parse_pdf / status + 内部名字再导出
-      options.py                解析配置 / OCR 服务探测
-      text_layer.py             文字层抽取（字体族、行框、行内样式、空隙补空格、行级样式合并）
-      sentences.py              按句子重切块（一块 = 恰好一句）
-      images.py                 插图检测去重影 / 挖洞
-      links.py                  PDF 链接注释采集（引用跳转数据源）
-      math_text.py / math_font.py   公式文本工具 / 字体判据
-      entry.py                  parse_pdf 入口（+ 公式后处理挂载点）
-      backend/                  三条版式后端：backend_pymupdf / _surya / _unlimited_ocr
-      surya_parser.py           Surya 2 推理服务客户端
-      unlimited_ocr.py          Unlimited-OCR 推理服务客户端（只用标准库 + PyMuPDF）
-      unlimited_ocr_online.py   Unlimited-OCR 在线解析客户端（异步提交 + 轮询）
-      local_parse_pipeline/     本地方案模型与依赖
-    converter.py                模块二 · 解析结果落盘为论文文档 + 图片
-    records.py                  模块三 · 阅读记录（JSON 回退版）
-    translate.py                译文服务（提示词 + 批量 + Google 兜底；对话转发给 agents/llm.py）
-    ai_read.py                  模块八 · AI 辅助阅读（结构化摘要 + 带全文的流式对话）
-    agents/llm.py               LLM 接入层（LlmClient：流式、tool_calls、测试连接）
-    agents/agent.py             统一 Agent 运行时（技能声明 + 工具循环 + 历史卫生）
-    agents/skills/ai_read.py    技能 · 辅助阅读（写整理卡片 / 定位页·笔记）
-    agents/skills/note_out.py   技能 · 笔记导出（核验文献 / 提取代码仓库 / 生成报告）
-    agents/skills/note_out_image.py 技能 · Agent 笔记图片（生成绘图代码 / 调用沙盒）
-    notes_out/                  模块十 · 笔记导出（note_out.py 数据 / note_out_image.py 图片）
-    pdf_refs/                   模块九 · 引用跳转线上实现（refs.py 分发 + 三套策略）
-    refs.py                     早期副本（线上不再引用，改它不生效）
-  frontend/                     原生前端
-    login.html / index.html / reader.html
-    css/style.css               CSS 变量双主题色板 + 各模块样式
-    js/
-      common.js                 工具函数 / 登录态 / 顶栏用户区 / 设置与共享弹窗
-      login.js / home.js        登录向导 / 首页列表与共享入口
-      reader2.js                阅读器装配入口（拼合各模块，保留全局状态）
-      core/                     r2-text（切句/字符区间，与后端同口径）、r2-color（HSL/暗夜反色）、
-                                r2-fit（逐行横向压缩）、r2-view（缩放/坐标/滚动还原）
-      items/                    item-local / item-surya / item-unlimited（三后端各一套，互不牵连）
-      select/                   selection（取句/拖拽/公式锚定）、bar（调色盘+工具条+所选句译文卡）、
-                                translate（段落/页/全文翻译）
-      layout.js                 摆位：页面宽度与批注栏、卡片顶开、笔记避让、AI 面板堆叠
-      r2-nav.js                 页码 / 目录 / 进度 / 缩放
-      r2-math.js                KaTeX 公式渲染（公式框、行内对齐、复制为 LaTeX）
-      r2-md.js                  自带 Markdown 渲染器（无第三方库、无构建）
-      r2-notes.js               句子笔记与独立笔记、右侧笔记栏
-      r2-ai.js                  AI 面板（流式对话 + 工具状态）
-      r2-refs.js                引用标记与参考文献卡片
-      vendor/katex/             内置 KaTeX v0.16.11（离线，按需懒加载）
-      checks/                   自检页（_refs_check / _surya_check / _unlimited_check）
-    logo/                       图标
-  tools/                        make_sample_pdf / migrate_to_mongo / mongo_check / relink_images /
-                                reparse_layout / refresh_font_size / split_ref_blocks / selftest
-  tests/                        test_refs / test_ai_agent_notes / 版式后处理与解析单测
-  docker/                       应用容器化（compose + Dockerfile + .env）
-  data/                         运行时数据（连上 Mongo 后基本只剩上传临时目录）
+paper-trans-to-html/                        ← 应用本体（本 README 所在目录；另有 .gitignore / .dockerignore）
+├── run.py                                 启动入口
+├── config.example.json                    翻译服务 + PDF 解析配置示例（复制为 config.json 生效）
+├── requirements.txt                       依赖清单（先锁 CPU 版 torch/torchvision 再装 surya-ocr）
+├── note.md                                完整实现细节 / 踩坑记录 / 排障说明
+├── backend/                               FastAPI 后端
+│   ├── server/                            Web/API 层（唯一应用层目录）
+│   │   ├── app.py                         应用入口：装配中间件 + 挂载路由 + 前端静态托管
+│   │   ├── config.py                      安装级常量（数据/前端目录、注册开关、解析后端枚举）
+│   │   ├── runtime.py                     运行时存储三件套（store/auth/settings）+ 热切换 + 状态
+│   │   ├── deps.py                        请求级依赖（当前账号、论文权限、transfer key、会话签发）
+│   │   ├── views.py                       视图拼装（论文行、共享状态、按页切片、key 列表）
+│   │   ├── security.py                    登录门禁中间件 + 静态资源 no-cache
+│   │   ├── lifecycle.py                   应用生命周期 + 通信桥托管
+│   │   ├── migrate.py                     启动/换后端迁移（历史论文归属、旧版 LLM 配置）
+│   │   ├── parser_config.py               账号级解析后端选项 + 状态探测缓存
+│   │   ├── factories.py                   按账号装配翻译服务 / LLM 客户端
+│   │   ├── ai_chat.py                     AI 对话管道（导航校验、工具执行、SSE 落库）
+│   │   └── api/                           业务路由（路径与响应结构与拆分前完全一致）
+│   │       ├── auth.py                    登录 / 注册 / 注销 / 账号列表
+│   │       ├── settings.py                偏好 / LLM 多套配置 / 学术检索 / 解析后端
+│   │       ├── papers.py                  论文列表 / 上传转换 / 重命名 / 删除 / 重解析
+│   │       ├── reading.py                 进度 / 目录 / 标注与笔记
+│   │       ├── sharing.py                 论文级共享与退出共享
+│   │       ├── toc.py                     目录（PDF 书签 / LLM 提取 / 重新提取）
+│   │       ├── ai.py                      AI 摘要 / 流式对话 / 重置
+│   │       ├── export.py                  笔记导出 + Agent 报告 + 笔记图片
+│   │       ├── transfer.py                transfer key 管理 + 其它 Agent 读取
+│   │       ├── translate.py               批量翻译 / 全文译文 / 所选句译文
+│   │       └── system.py                  配置 / 存储状态与热切换 / 通信桥状态
+│   ├── app.py                             兼容入口（re-export server.app，旧命令 backend.app:app 仍可用）
+│   ├── envfile.py                         极简 .env 读取（环境变量优先，文件改动自动重读）
+│   ├── auth.py                            模块四 · 账号与会话（PBKDF2 哈希、限流）
+│   ├── db.py                              模块六 · Mongo 连接层（读 `.env` 或环境变量）
+│   ├── mongo_store.py                     模块七 · Mongo 存储实现（集合 / 索引 / 各存储后端）
+│   ├── storage.py                         存储装配（按 APP_STORAGE 选 Mongo 或 JSON 回退）
+│   ├── settings.py                        模块五 · 运行时设置（LLM 多套配置、目标语言、解析后端）
+│   ├── pdf_parser/                        模块一 · 文档解析（PDF → 版式布局数据）
+│   │   ├── __init__.py                    门面：parse_pdf / status + 内部名字再导出
+│   │   ├── entry.py                       parse_pdf 入口（+ 公式后处理挂载点）
+│   │   ├── options.py                     解析配置 / OCR 服务探测
+│   │   ├── text_layer.py                  文字层抽取（字体族、行框、行内样式、空隙补空格、行级样式合并）
+│   │   ├── sentences.py                   按句子重切块（一块 = 恰好一句）
+│   │   ├── images.py                      插图检测去重影 / 挖洞
+│   │   ├── links.py                       PDF 链接注释采集（引用跳转数据源）
+│   │   ├── math_text.py                   公式文本工具
+│   │   ├── math_font.py                   公式字体判据
+│   │   ├── backend/                       三条版式后端（互不牵连）
+│   │   │   ├── backend_pymupdf.py         本地方案 · PyMuPDF 文字层
+│   │   │   ├── backend_surya.py           Surya 2 整页 OCR
+│   │   │   └── backend_unlimited_ocr.py   Unlimited-OCR 整页 OCR
+│   │   ├── surya_parser.py                Surya 2 推理服务客户端
+│   │   ├── unlimited_ocr.py               Unlimited-OCR 推理服务客户端（只用标准库 + PyMuPDF）
+│   │   ├── unlimited_ocr_online.py        Unlimited-OCR 在线解析客户端（异步提交 + 轮询）
+│   │   └── local_parse_pipeline/          本地方案模型与依赖（pipeline / 取图取表 / 公式转 LaTeX / models / merge_modules / utils）
+│   ├── converter.py                       模块二 · 解析结果落盘为论文文档 + 图片
+│   ├── records.py                         模块三 · 阅读记录（JSON 回退版）
+│   ├── translate.py                       译文服务（提示词 + 批量 + Google 兜底；对话转发给 agents/llm.py）
+│   ├── ai_read.py                         模块八 · AI 辅助阅读（结构化摘要 + 带全文的流式对话）
+│   ├── agents/                            统一 Agent 运行时
+│   │   ├── llm.py                         LLM 接入层（LlmClient：流式、tool_calls、测试连接）
+│   │   ├── agent.py                       统一 Agent 运行时（技能声明 + 工具循环 + 历史卫生）
+│   │   └── skills/                        技能实现
+│   │       ├── ai_read.py                 技能 · 辅助阅读（写整理卡片 / 定位页·笔记）
+│   │       ├── note_out.py                技能 · 笔记导出（核验文献 / 提取代码仓库 / 生成报告）
+│   │       ├── note_out_image.py          技能 · Agent 笔记图片（生成绘图代码 / 调用沙盒）
+│   │       └── agent_comm.py              技能 · 通信桥（消费 agent_comm_service 的 Redis Streams 并回包）
+│   ├── notes_out/                         模块十 · 笔记导出（数据转换 + 机械版图片）
+│   │   ├── note_out.py                    分节 / 笔记 / 高亮 / 统计报告的数据转换
+│   │   └── note_out_image.py              Matplotlib + XKCD 三栏机械版图片
+│   ├── pdf_refs/                          模块九 · 引用跳转线上实现
+│   │   ├── refs.py                        分发 + 标准链接 / 编号策略
+│   │   ├── refs_pymupdf.py                PyMuPDF 后端策略
+│   │   ├── refs_surya.py                  Surya 后端策略（按行首拆多条文献）
+│   │   └── refs_unlimited_ocr.py          Unlimited-OCR 后端策略
+│   ├── note_out.py                        早期单文件版笔记导出（线上走 notes_out/，改它不生效）
+│   └── refs.py                            早期引用副本（线上不再引用，改它不生效）
+├── frontend/                              原生前端（无框架、无构建）
+│   ├── login.html                         登录 / 注册页
+│   ├── index.html                         论文列表页
+│   ├── reader.html                        阅读器页
+│   ├── css/
+│   │   └── style.css                      CSS 变量双主题色板 + 各模块样式
+│   ├── js/                                阅读器前端脚本
+│   │   ├── common.js                      工具函数 / 登录态 / 顶栏用户区 / 设置与共享弹窗
+│   │   ├── login.js                       登录向导与首次配置
+│   │   ├── home.js                        首页列表与共享入口
+│   │   ├── reader2.js                     阅读器装配入口（拼合各模块，保留全局状态）
+│   │   ├── core/                          渲染底座
+│   │   │   ├── r2-text.js                 切句 / 字符区间（与后端同口径）
+│   │   │   ├── r2-color.js                HSL 换算 / 暗夜反色
+│   │   │   ├── r2-fit.js                  逐行横向压缩
+│   │   │   └── r2-view.js                 缩放 / 坐标 / 滚动还原
+│   │   ├── items/                         三后端各一套，互不牵连
+│   │   │   ├── item-local.js              本地方案 · 逐行绝对定位 + 行宽适配
+│   │   │   ├── item-surya.js              Surya · 块级绝对定位 + 块内流式排版
+│   │   │   └── item-unlimited.js          Unlimited-OCR · 独立一套（CSS 类名不共用）
+│   │   ├── select/                        选区与翻译
+│   │   │   ├── selection.js               取句 / 拖拽 / 公式锚定
+│   │   │   ├── bar.js                     调色盘 + 工具条 + 所选句译文卡
+│   │   │   └── translate.js               段落 / 页 / 全文翻译
+│   │   ├── layout.js                      摆位：页面宽度与批注栏、卡片顶开、笔记避让、AI 面板堆叠
+│   │   ├── r2-nav.js                      页码 / 目录 / 进度 / 缩放
+│   │   ├── r2-math.js                     KaTeX 公式渲染（公式框、行内对齐、复制为 LaTeX）
+│   │   ├── r2-md.js                       自带 Markdown 渲染器（无第三方库、无构建）
+│   │   ├── r2-notes.js                    句子笔记与独立笔记、右侧笔记栏
+│   │   ├── r2-ai.js                       AI 面板（流式对话 + 工具状态）
+│   │   └── r2-refs.js                     引用标记与参考文献卡片
+│   ├── vendor/
+│   │   └── katex/                         内置 KaTeX v0.16.11（katex.min.js / css / fonts，离线懒加载）
+│   ├── checks/                            自检页与对照组
+│   │   ├── _refs_check.html               引用映射自检
+│   │   ├── _surya_check.html              Surya 后端自检
+│   │   ├── _unlimited_check.html          Unlimited-OCR 后端自检
+│   │   ├── _note_out_check.html           笔记导出自检
+│   │   └── _gt_words.json                 切句对照词表
+│   └── logo/                              图标（tardigrade / cockroach 系列 SVG·PNG）
+├── tools/                                 运维 / 自检脚本
+│   ├── make_sample_pdf.py                 生成样例 PDF
+│   ├── selftest.py                        纯本地校验「文档解析」模块（--backend 可切后端）
+│   ├── mongo_check.py                     Mongo 连接体检（--create-user 补建业务账号）
+│   ├── migrate_to_mongo.py                本地 JSON → Mongo 迁移（--dry-run 预演 / --skip-images）
+│   ├── reparse_layout.py                  只换版式，笔记 / 高亮 / 译文 / 进度不动
+│   ├── relink_images.py                   补回丢失插图（只补图，不刷新版式）
+│   ├── refresh_font_size.py               按现有版式刷新字号
+│   ├── split_ref_blocks.py                只重做参考文献分块（--all 全量）
+│   └── comm_worker.py                     通信桥手工 worker（--status / --once）
+├── tests/                                 全量测试（python -m unittest discover tests）
+│   ├── test_refs.py                       引用映射
+│   ├── test_ai_agent_notes.py             AI Agent 整理卡片
+│   ├── test_agent_comm.py                 通信桥消息与盖章校验
+│   ├── test_app_routes.py                 路由契约与权限
+│   ├── test_transfer_keys.py              转交 Key 生命周期
+│   ├── test_note_out.py                   笔记导出数据
+│   ├── test_note_out_image.py             笔记图片渲染
+│   ├── test_backend_local_convert.py      本地方案转换
+│   ├── test_backend_surya_font.py         Surya 后端字号
+│   ├── test_merge_formula_boxes.py        公式框合并
+│   ├── test_merge_line_runs_color.py      行内 run 合并与颜色
+│   ├── test_table_cell_text.py            表格单元格文字
+│   ├── test_vertical_text.py              旋转 / 竖排文字
+│   ├── test_llm_json.py                   LLM 输出 JSON 容错
+│   ├── test_parser_account_options.py     账号级解析后端选项
+│   ├── test_sandbox_settings.py           绘图沙盒设置
+│   └── test_scholar_settings.py           学术检索设置
+├── docker/                                应用容器化
+│   ├── docker-compose.yml                 compose（同名网络 paper-mongo-net + 命名卷）
+│   ├── Dockerfile                         镜像构建（先锁 CPU 版 torch 再装 surya-ocr）
+│   ├── .env.example                       环境变量样例
+│   └── .env                               本机实际使用的环境变量
+├── data/                                  运行时数据（连上 Mongo 后基本只剩上传临时目录）
+│   ├── docs/                              论文版式 JSON
+│   ├── tmp/                               上传 / 解析临时文件
+│   ├── records.json                       JSON 回退：论文记录与进度
+│   ├── users.json                         JSON 回退：账号与偏好
+│   ├── sessions.json                      JSON 回退：登录会话
+│   └── transfer_keys.json                 JSON 回退：转交 Key
+└── samples/                               样例文件
+    └── latex_sample.pdf                   含公式的样例 PDF（selftest / 联调用）
 
 同级目录（应用仓库之外，按相对路径被读取）：
-  ../mongo_configuration/       MongoDB compose + 连接参数 .env + 使用说明
-  ../surya_doc_parse_service/   Surya 2 推理服务端
-  ../unlimited_ocr_service/     Unlimited-OCR 推理服务端
-  ../local_parse_pipeline/      本地解析方案（模型 / 依赖）
-  ../oxr_parse_service/         OXR（D-FINE）版面分析服务
+../services/
+├── mongo_configuration/                   MongoDB compose + 连接参数 .env + 使用说明
+├── agent_comm_service/                    外部 Agent 通信网关（Redis Streams；通信桥技能消费它的流）
+├── surya_doc_parse_service/               Surya 2 推理服务端（:8060）
+├── unlimited_ocr_service/                 Unlimited-OCR 推理服务端（:9010）
+└── draw_sandbox_service/                  绘图沙盒（draw-sandbox :8090，Agent 笔记图片）
 ```
+
+本地方案（PyMuPDF 文字层 / OXR 版面 / SLANet 表格 / texify 公式）的模型与依赖在应用内的
+`backend/pdf_parser/local_parse_pipeline/`，不单独起服务；OXR 版面服务可按需单独部署。
 
 ### 3.3 核心数据流
 
@@ -214,10 +468,11 @@ paper-trans-to-html/            ← 应用本体（本 README 所在目录）
 | `seltrans` | 所选句译文卡片的正文与锚点 `{doc, key, item_id, si_from, text}` —— 刷新/重登后自动恢复 |
 | `images.files` / `images.chunks` | **插图本体（GridFS）**，`_id = "<doc_id>/<fname>"`，`metadata.doc_id` 建索引。重启、重建容器、换机器都不丢图；备份只需一条 `mongodump`。前端仍走 `/api/doc/{id}/img/{fname}` |
 | `users` | 账号（口令 PBKDF2 加盐哈希）+ `prefs`（见 3.5） |
+| `transfer_keys` | **转交 Key**：一个账号一行（`_id` = 用户名小写），`keys = [{id, name, key, created_at, last_used_at, uses}]`。与 `users` 集合同一时间创建；其它 Agent 持 key（`Authorization: Bearer`）读取该账号的论文数据 |
 | `sessions` | 登录会话，TTL 索引自动过期 |
 | `settings` | **旧版**全局 LLM 配置，仅升级时读一次并自动归给最早创建的账号，之后不再写入 |
 
-**回退与运维**：`APP_STORAGE=auto`（默认，能连就用 Mongo，连不上回退本地 JSON，日志 + 登录页 + 设置弹窗都会提示）、`mongo`（强制，连不上直接启动报错，避免"以为在写库其实写了文件"）、`json`（轻量场景）。回退后把库起起来，点「⚙ 设置 → 存储 / OCR → 重试连接」即**热切换**回库（不用重启；旧会话在新库不存在会自动跳登录）。已有本地数据用 `tools/migrate_to_mongo.py --dry-run` 预演，正式迁移会连账号/设置/插图一并搬（`--skip-images` 可跳过）。连接参数优先级：`MONGO_URI` > 分散环境变量（`MONGO_HOST/PORT/USER/PASSWORD/DB/AUTH_DB`）> `mongo_configuration/.env`（可用 `MONGO_ENV_FILE` 插到最前）> 内置默认；默认用只具 readWrite 的**业务账号**连接。`Authentication failed` 是最常见故障（旧数据卷导致初始化脚本被跳过、业务账号根本没建），跑 `python tools/mongo_check.py` 会打印实际生效的连接串与来源文件并给出修复步骤，`--create-user` 可按 `.env` 里的 root 账号补建。
+**回退与运维**：`APP_STORAGE=auto`（默认，能连就用 Mongo，连不上回退本地 JSON，日志 + 登录页 + 设置弹窗都会提示）、`mongo`（强制，连不上直接启动报错，避免"以为在写库其实写了文件"）、`json`（轻量场景）。回退后把库起起来，点「⚙ 设置 → 存储 / OCR → 重试连接」即**热切换**回库（不用重启；旧会话在新库不存在会自动跳登录）。已有本地数据用 `tools/migrate_to_mongo.py --dry-run` 预演，正式迁移会连账号/设置/插图一并搬（`--skip-images` 可跳过）。连接参数优先级：`MONGO_URI` > 分散环境变量（`MONGO_HOST/PORT/USER/PASSWORD/DB/AUTH_DB`）> `../services/mongo_configuration/.env`（可用 `MONGO_ENV_FILE` 插到最前）> 内置默认；默认用只具 readWrite 的**业务账号**连接。`Authentication failed` 是最常见故障（旧数据卷导致初始化脚本被跳过、业务账号根本没建），跑 `python tools/mongo_check.py` 会打印实际生效的连接串与来源文件并给出修复步骤，`--create-user` 可按 `.env` 里的 root 账号补建。
 
 ### 3.7 接口概览
 
@@ -231,14 +486,64 @@ paper-trans-to-html/            ← 应用本体（本 README 所在目录）
 | 引用 | `GET /api/doc/{id}/refs`（纯本地现算，不缓存） |
 | AI | `GET /api/doc/{id}/ai`；`POST ai/summary`、`ai/summary/save`（手工编辑整份覆盖）、`ai/chat`（SSE 流式，导航需 `pending_navigation` + `navigation_answer` 续问）、`ai/chat/reset` |
 | 共享 | `POST/GET /api/doc/{id}/share`、`DELETE share/{user}`、`POST share/leave` |
+| 转交 Key | 管理（登录态）：`GET/POST /api/transfer-keys`、`DELETE /api/transfer-keys/{id}`；Agent 读取（`Authorization: Bearer <key>`）：`GET /api/transfer/whoami`、`/api/transfer/papers`、`/api/transfer/papers/{id}?mode=mechanical|agent&download=1` |
 | 存储 | `GET /api/storage/status`、`POST /api/storage/reconnect` |
+
+其它 Agent 用 transfer key 读取本账号数据（key 在导出弹窗「🔑 转交 Key」里生成）：
+
+```bash
+curl -H "Authorization: Bearer ptk_xxx" http://127.0.0.1:8000/api/transfer/whoami
+curl -H "Authorization: Bearer ptk_xxx" http://127.0.0.1:8000/api/transfer/papers
+curl -H "Authorization: Bearer ptk_xxx" http://127.0.0.1:8000/api/transfer/papers/<doc_id>
+curl -H "Authorization: Bearer ptk_xxx" "http://127.0.0.1:8000/api/transfer/papers/<doc_id>?mode=agent"
+```
+
+（也支持 `X-Transfer-Key: ptk_xxx` 头或 `?key=ptk_xxx`；删除该 key 后立即 401。）
+
+#### 通信桥（`backend/agents/skills/agent_comm.py`）
+
+外部 Agent 也可以**不直连 HTTP**：请求经同级目录 `../services/agent_comm_service/` 鉴权 / 检测后落到
+`outside-in-stream`，本技能就是该流的 reader 侧。
+
+**默认自动运行**：`backend/server/lifecycle.py` 在 FastAPI `startup` 时调 `agent_comm.skills.agent_comm.start_auto()`
+起后台守护线程，每 `AGENT_COMM_PROBE_S`（默认 15s）探测通信服务 `/healthz` ——
+**服务在才消费**，不在就等着（Redis 有积压也不取），服务恢复自动继续；`shutdown` 停线程，
+存储热切换后重建。`AGENT_COMM_AUTO=0` 关闭，改用手工 `python tools/comm_worker.py`。
+`GET /api/agent-comm/status` 返回线程状态 + 实时链路体检。
+
+| 消息字段 | 作用 |
+| --- | --- |
+| `envelope.owner` + `envelope.auth` | **归属账号的唯一来源**：通信服务校验账号 transfer key 后盖的章（含 HMAC）；本技能只读它 |
+| `payload.action` | `export_notes` / `list_notes` / `answer` / `status`（优先于 `intent`） |
+| `intent` | `paper.note.export` → 导出笔记；`paper.note.list` → 笔记列表；`paper.section.query` / `paper.insight.validate` → 回答 |
+| `payload.doc_id` / `payload.title` | 定位论文（都不给且账号只有一篇时自动用它） |
+| `payload.user`（由网关写入） | 网关把章上的账号归一化到这里；调用方不要自报，不一致会被网关 403 |
+
+**准入只在通信服务**：reader 不再解析 `ptk_`、不看 `payload.user` / `AGENT_COMM_USER`、
+也不做“单账号自动”。收到的消息必须带有效盖章（`mac` 用与通信服务共享的密钥校验，
+默认从同一个 MongoDB 的 `agent_gateway_meta` 自动读取），且 `payload` 已被网关归一化
+（无 `transfer_key`）。任何一项不满足都直接回 `error`，不降级、不猜账号——这样即使有人
+绕过网关直连 Redis 塞消息也拿不到数据。本地调试可设 `AGENT_COMM_ALLOW_UNSTAMPED=1`
+回到旧行为。
+
+回包先 `ack` 再 `final` / `error` 写入 `inside-out-stream`，由服务 dispatcher 落到
+`agent:reply:{rid}`。**每条回包都带 `owner` + `sig`**（HMAC，密钥与网关盖章同一份，
+从 MongoDB `agent_gateway_meta` 自动读取），dispatcher 验不过就进 `agent:dlq:out`——
+所以“能写 Redis 就能伪造回包”行不通。**导出一定完整**：`export_notes` 每次都把完整 JSON（正文全文 +
+原格式块 + 全部笔记 + 高亮 + 报告）写进通信服务同一个 Redis 的 `agent:result:{rid}`
+（>32KB 用 `gzip+base64`），消息里只带「摘要 + `result_url`」；外部 agent 用
+`GET /v1/requests/{rid}/result`（SDK `fetch_result()`，`ask()` 默认自动取回）拿全量。
+`list_notes` / `answer` 仍是超过 `AGENT_COMM_INLINE_KB`（默认 60KB）才落库；
+`AGENT_COMM_RESULT_BLOB=0` 可退回原来的逐级裁剪；`AGENT_COMM_RESULT_TTL`（默认 3600s）
+控制保留时间。**前提：本技能与服务端连同一个 Redis**（`AGENT_COMM_REDIS_URL` = 服务
+`REDIS_URL`）。所有参数都可用 `AGENT_COMM_*` 环境变量 / `.env` 覆盖（见该模块文档）。
 
 **配置优先级**：LLM 逐字段 = 本账号设置 > 环境变量（`DEEPSEEK_API_KEY/BASE_URL/MODEL`、`TRANSLATOR_BACKEND`）> `config.json`（安装级默认）> 内置默认（DeepSeek 官方 + `deepseek-chat`）。解析后端 = `parse_pdf(backend=…)` > `PDF_PARSER_BACKEND`（**仅在设了非空值时才参与**）> 账号偏好 `users.prefs.parser.backend` > `config.json`。
 
 ### 3.8 部署形态
 
 - **本地运行**：见「一、简介 · 快速开始」。
-- **Docker**：`cd ../mongo_configuration && docker compose up -d` 起库，`cd ../docker && docker compose up -d --build` 起应用；两份 compose 声明**同名网络** `paper-mongo-net`（谁先起谁创建，后起的直接加入），应用里就能用 `mongo:27017` 连库、看到同一份数据；运行时文件在命名卷 `paper-app-data`（容器内 `/app/data`）。容器内默认**没有** `config.json`（Dockerfile 只 COPY 示例），`parser` 段靠环境变量注入；想用文件配置需自行挂载。
+- **Docker**：`cd ../services/mongo_configuration && docker compose up -d` 起库，`cd docker && docker compose up -d --build` 起应用；两份 compose 声明**同名网络** `paper-mongo-net`（谁先起谁创建，后起的直接加入），应用里就能用 `mongo:27017` 连库、看到同一份数据；运行时文件在命名卷 `paper-app-data`（容器内 `/app/data`）。容器内默认**没有** `config.json`（Dockerfile 只 COPY 示例），`parser` 段靠环境变量注入；想用文件配置需自行挂载。
 - **Surya 在容器里**要**同时**满足两条：① 服务连得上（默认 `SURYA_INFERENCE_URL=http://host.docker.internal:8060/v1` + `extra_hosts: host-gateway`）；② 应用进程里装了 `surya-ocr` + `Pillow`（推理在服务端，但渲染页面、构造请求、解析 block 都在本地）。只满足一条会**静默回退 PyMuPDF**，最容易被误认为"配置没生效"。`requirements.txt` 先锁 CPU 版 `torch==2.14.0+cpu` / `torchvision==0.29.0+cpu` 再装 `surya-ocr`，避免从 PyPI 拉到 554MB 的 CUDA 轮子与一堆 `nvidia-*` 依赖。Unlimited-OCR 同理走 `http://host.docker.internal:9010/v1`。
 - **自检与测试**：
 

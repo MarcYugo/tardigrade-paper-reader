@@ -19,6 +19,7 @@ _CANDIDATES = (
     Path(__file__).resolve().parents[1] / ".env",                    # paper-trans-to-html/.env
     Path(__file__).resolve().parents[1] / "docker" / ".env",
     Path(__file__).resolve().parents[2] / "mongo_configuration" / ".env",
+    Path(__file__).resolve().parents[2] / "services" / "mongo_configuration" / ".env",
 )
 _CACHE: dict = {"key": None, "data": {}}
 

@@ -345,14 +345,16 @@ class Translator:
             f"当前翻译服务（{self.status_text}）不支持{what}，"
             f"请到「⚙ 设置 → LLM 服务」配置 OpenAI 兼容服务与 API Key")
 
-    def chat_json(self, system: str, user: str, *, temperature: float = 0.1) -> dict:
+    def chat_json(self, system: str, user: str, *, temperature: float = 0.1,
+                  max_tokens: int | None = None) -> dict:
         """做一次结构化对话，返回解析出来的 JSON 对象（提取目录这类任务用）。
 
         只有 OpenAI 兼容后端能做（Google 兜底只能逐句翻译），不能用就抛
         `LlmUnavailable`，前端会提示去配置 LLM。
         """
         self._require_llm("这类任务")
-        return self.llm.chat_json(system, user, temperature=temperature)
+        return self.llm.chat_json(system, user, temperature=temperature,
+                                  max_tokens=max_tokens)
 
     def chat(self, system: str, messages: list[dict], *, temperature: float = 0.3) -> str:
         """普通多轮对话，返回助手正文文本（AI 辅助阅读的聊天用）。

@@ -3,7 +3,7 @@ import unittest
 
 from backend.agents.skills.note_out import (extract_code_links, run_note_out_agent)
 from backend.notes_out import (build_notes, build_sections, export_filename,
-                               export_paper, to_json)
+                               export_paper, merge_agent_report, to_json)
 
 
 def _block(block_id, text, kind="text"):
@@ -149,6 +149,45 @@ class NoteOutExportTest(unittest.TestCase):
             export_paper(doc=_sample_doc(), mode="agent")
 
 
+class MergeAgentReportTest(unittest.TestCase):
+    """Agent 导出 = 机械导出打底 + AI 总结/核验补充（模型不重写整份报告）。"""
+
+    def _mechanical(self):
+        return export_paper(
+            doc=_sample_doc(),
+            rec={"id": "doc1", "title": "A Sample Paper",
+                 "owner": "alice", "num_pages": 2},
+            anno={"notes": [{"id": "n1", "block_id": "p0b4#0", "text": "my note"}],
+                  "free_notes": [], "highlights": {}},
+            mode="mechanical", username="alice")["report"]
+
+    def test_mechanical_structure_survives_ai_overlay(self):
+        mechanical = self._mechanical()
+        merged = merge_agent_report(mechanical, {
+            "summary": "AI 总结",
+            "notes_analysis": {"overview": "笔记总览"},
+            "references_stats": {"total": 2},
+            "paper_overview": {},          # 空对象不覆盖（机械报告里也没有）
+            "conclusion": "",             # 空字符串不覆盖
+        })
+        self.assertEqual(merged["mode"], "agent")
+        self.assertEqual(merged["summary"], "AI 总结")
+        self.assertIn("机械导出", merged["mechanical_summary"])
+        self.assertEqual(merged["notes_analysis"]["overview"], "笔记总览")
+        self.assertEqual(merged["references_stats"], {"total": 2})
+        self.assertNotIn("conclusion", merged)
+        # 确定性字段一个都不能丢
+        for key in ("stats", "section_overview", "references",
+                    "reference_check", "code_links", "figures", "notes_by_page"):
+            self.assertEqual(merged[key], mechanical[key], key)
+
+    def test_ai_without_summary_keeps_mechanical_summary(self):
+        mechanical = self._mechanical()
+        merged = merge_agent_report(mechanical, {})
+        self.assertEqual(merged["summary"], mechanical["summary"])
+        self.assertEqual(merged["mechanical_summary"], mechanical["summary"])
+
+
 class _FakeTranslator:
     """只模拟 Agent 需要的两个方法：工具循环 + 结构化报告。"""
 
@@ -286,6 +325,99 @@ class NoteOutFullVerifyTest(unittest.TestCase):
         self.assertEqual(stats["not_checked"], 0)
         self.assertEqual([(r["id"], r["status"]) for r in report["references_review"]],
                          [(1, "verified"), (2, "not_found")])
+
+
+class RefVerifyCacheTest(unittest.TestCase):
+    """参考文献核验只做一次：第二次导出直接复用落库结果（不再联网）。"""
+
+    def test_second_export_reuses_cached_verification(self):
+        import tempfile
+
+        import backend.agents.skills.note_out as agent
+        from backend import records
+
+        calls = []
+
+        def fake_verify(rid, *, title, authors, year, doi, arxiv, query, cfg=None):
+            calls.append(rid)
+            ok = rid == 1
+            return {"ok": True, "reference_id": rid,
+                    "status": "verified" if ok else "not_found",
+                    "message": "stub",
+                    "best": {"title": title, "year": year,
+                             "similarity": 0.95 if ok else 0.2},
+                    "candidates": [], "errors": []}
+
+        original = agent._verify_reference
+        agent._verify_reference = fake_verify
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                store = records.Store(tmp)
+                kwargs = dict(
+                    doc=_sample_doc(),
+                    rec={"id": "doc1", "title": "A Sample Paper", "num_pages": 2},
+                    mode="agent", llm=_QuietTranslator(),
+                    store=store, doc_id="doc1")
+
+                first = export_paper(**kwargs)
+                self.assertEqual(sorted(calls), [1, 2])     # 第一次全量核验
+                self.assertIsNotNone(store.get_refcheck("doc1"))
+                self.assertEqual(first["report"]["references_stats"]["reused"], 0)
+
+                calls.clear()
+                second = export_paper(**kwargs)
+                self.assertEqual(calls, [])                 # 第二次不再联网
+                stats = second["report"]["references_stats"]
+                self.assertEqual(stats["reused"], 2)
+                self.assertEqual(stats["matched"], 1)
+                self.assertEqual(stats["not_found"], 1)
+
+                calls.clear()
+                export_paper(**kwargs, refresh_references=True)   # 强制重查
+                self.assertEqual(sorted(calls), [1, 2])
+        finally:
+            agent._verify_reference = original
+
+    def test_cache_invalidated_when_references_change(self):
+        import tempfile
+
+        import backend.agents.skills.note_out as agent
+        from backend import records
+
+        calls = []
+
+        def fake_verify(rid, *, title, authors, year, doi, arxiv, query, cfg=None):
+            calls.append(rid)
+            return {"ok": True, "reference_id": rid, "status": "verified",
+                    "message": "stub", "best": {"title": title},
+                    "candidates": [], "errors": []}
+
+        original = agent._verify_reference
+        agent._verify_reference = fake_verify
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                store = records.Store(tmp)
+                doc = _sample_doc()
+                kwargs = dict(rec={"id": "doc1", "title": "A Sample Paper"},
+                              mode="agent", llm=_QuietTranslator(),
+                              store=store, doc_id="doc1")
+                export_paper(doc=doc, **kwargs)
+                calls.clear()
+                export_paper(doc=doc, **kwargs)
+                self.assertEqual(calls, [])                 # 参考文献没变：复用
+                # 参考文献内容变了（重解析/换论文）→ 指纹变化 → 重新核验
+                changed = json.loads(json.dumps(doc))
+                changed["pages"][1]["texts"] = [
+                    _block("p1b0", "References", "heading"),
+                    _block("p1b1", "[1] C. Lee. A totally new paper. 2022."),
+                    _block("p1b2", "[2] B. Jones. Second cited paper. 2021."),
+                    _block("p1b3", "Appendix A", "heading"),
+                    _block("p1b4", "Extra details live in the appendix."),
+                ]
+                export_paper(doc=changed, **kwargs)
+                self.assertTrue(calls)
+        finally:
+            agent._verify_reference = original
 
 
 class CodeLinkTest(unittest.TestCase):

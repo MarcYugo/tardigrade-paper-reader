@@ -17,7 +17,7 @@
 | `locate_page()` | 按正文与公式 LaTeX 定位最相关的页面（从 1 开始） |
 | `locate_text_block()` | 在指定页内定位相关文本块 ID（供前端点亮） |
 
-工具本身由调用方注入（`execute_tool`）：HTTP 层（`app.py`）负责权限、落库与
+工具本身由调用方注入（`execute_tool`）：HTTP 层（`backend/server/api/ai.py`）负责权限、落库与
 「先问用户是否跳转、确认后才执行」的状态机，本技能只做提示词与工具后端。
 """
 from __future__ import annotations

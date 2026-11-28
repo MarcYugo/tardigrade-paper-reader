@@ -24,7 +24,7 @@ def main() -> None:
         host = args[args.index("--host") + 1]
     if "--port" in args:
         port = int(args[args.index("--port") + 1])
-    uvicorn.run("backend.app:app", host=host, port=port, reload=reload)
+    uvicorn.run("backend.server.app:app", host=host, port=port, reload=reload)
 
 
 if __name__ == "__main__":

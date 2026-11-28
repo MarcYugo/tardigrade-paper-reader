@@ -14,6 +14,7 @@
 | `translations` | `doc_id\\|译文缓存键` | 译文缓存，一条一段；键 = 「目标语言 + 文本」的哈希（见 `translate.cache_key`），所以同一段文的不同语言译文并存、互不覆盖 |
 | `images.files` / `images.chunks` | `"<doc_id>/<fname>"` | **插图本体**（GridFS 桶）：解析出来的 PNG 也进库，服务重启/换容器/换机器都不会再丢图 |
 | `users` | 用户名(小写) | 账号，口令为 PBKDF2 加盐哈希 |
+| `transfer_keys` | 用户名(小写) | **转交 Key**：`keys = [{id, name, key, created_at, last_used_at, uses}]`，一个账号一把或多把；其它 Agent 持 key（`Authorization: Bearer`）读取该账号论文数据 |
 | `sessions` | 会话 token | 登录会话，带 TTL 索引自动过期 |
 | `settings` | `"llm"` | LLM 服务配置（对应原来的 llm.json） |
 
@@ -82,6 +83,8 @@ class MongoStore:
         self.notes = db["notes"]
         self.translations = db["translations"]
         self.seltrans = db["seltrans"]
+        # 参考文献核验缓存：一次联网核验、之后导出直接复用（_id = doc_id）
+        self.refcheck = db["refcheck"]
         # 插图：GridFS 桶（images.files + images.chunks），_id = "<doc_id>/<fname>"
         self.fs = gridfs.GridFS(db, self.IMG_BUCKET)
         self.img_files = db[self.IMG_BUCKET + ".files"]
@@ -218,6 +221,7 @@ class MongoStore:
         self.notes.delete_many({"doc": doc_id})
         self.translations.delete_many({"doc": doc_id})
         self.seltrans.delete_many({"doc": doc_id})
+        self.refcheck.delete_one({"_id": doc_id})
         with self._lock:
             self._doc_cache.pop(doc_id, None)
         self.delete_images(doc_id)          # 插图在 GridFS，别漏删
@@ -270,6 +274,23 @@ class MongoStore:
                 self._doc_cache.pop(doc_id, None)
             else:
                 self._doc_cache.clear()
+
+    # ---------------- 参考文献核验缓存 ----------------
+    # Agent 导出会把整张参考文献列表联网核验一遍（很慢）。核验结果按
+    # 「doc_id + 参考文献指纹」存一份，下次导出直接复用，不再重复打外部接口。
+    def get_refcheck(self, doc_id: str) -> dict | None:
+        """读该论文上次的参考文献核验结果；没有/损坏时返回 None。"""
+        row = self.refcheck.find_one({"_id": doc_id})
+        data = (row or {}).get("data")
+        return data if isinstance(data, dict) else None
+
+    def set_refcheck(self, doc_id: str, data: dict) -> None:
+        self.refcheck.replace_one(
+            {"_id": doc_id},
+            {"data": data, "at": _now()}, upsert=True)
+
+    def delete_refcheck(self, doc_id: str) -> None:
+        self.refcheck.delete_one({"_id": doc_id})
 
     # ---------------- 标注与笔记 ----------------
     def get_annotations(self, doc_id: str) -> dict:
@@ -432,7 +453,12 @@ class MongoAuthBackend:
         db = self.m.db()
         self.users = db["users"]
         self.sessions = db["sessions"]
+        # transfer key：与账号集合同一时间建好（create_index 会让空集合也真实存在），
+        # 文档结构：{_id: 用户名(小写), username, keys: [{id, name, key, created_at,
+        #            last_used_at, uses}]} —— 一个账号一行，多把 key 存在 keys 数组里。
+        self.transfer = db["transfer_keys"]
         self.users.create_index([("username", 1)])
+        self.transfer.create_index([("keys.key", 1)])
         # TTL：会话按 expires_at 自动清理（代码里也会显式校验过期）
         try:
             self.sessions.create_index("expire_at", expireAfterSeconds=0)
@@ -457,6 +483,50 @@ class MongoAuthBackend:
 
     def user_delete(self, key: str) -> bool:
         return self.users.delete_one({"_id": key}).deleted_count > 0
+
+    # ---------------- transfer key（_id = 用户名小写） ----------------
+    def transfer_list(self, username: str) -> list[dict]:
+        doc = self.transfer.find_one({"_id": (username or "").strip().lower()}) or {}
+        return [dict(k) for k in (doc.get("keys") or [])]
+
+    def transfer_add(self, username: str, rec: dict) -> list[dict]:
+        key = (username or "").strip().lower()
+        self.transfer.update_one(
+            {"_id": key},
+            {"$setOnInsert": {"username": username},
+             "$push": {"keys": dict(rec)}},
+            upsert=True)
+        return self.transfer_list(username)
+
+    def transfer_remove(self, username: str, key_id: str) -> list[dict]:
+        key = (username or "").strip().lower()
+        self.transfer.update_one({"_id": key},
+                                 {"$pull": {"keys": {"id": key_id}}})
+        return self.transfer_list(username)
+
+    def transfer_find(self, token: str) -> dict | None:
+        token = (token or "").strip()
+        if not token:
+            return None
+        doc = self.transfer.find_one({"keys.key": token}, {"username": 1, "keys.$": 1})
+        if not doc:
+            return None
+        one = (doc.get("keys") or [{}])[0]
+        out = dict(one)
+        out["username"] = doc.get("username") or doc.get("_id") or ""
+        return out
+
+    def transfer_touch(self, token: str) -> None:
+        token = (token or "").strip()
+        if not token:
+            return
+        self.transfer.update_one(
+            {"keys.key": token},
+            {"$inc": {"keys.$.uses": 1},
+             "$set": {"keys.$.last_used_at": _now()}})
+
+    def transfer_drop_user(self, username: str) -> None:
+        self.transfer.delete_one({"_id": (username or "").strip().lower()})
 
     # ---------------- 会话 ----------------
     def session_get(self, token: str) -> dict | None:

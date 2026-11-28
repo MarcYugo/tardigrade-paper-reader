@@ -5,7 +5,10 @@
 
 * `skills/ai_read.py` —— 辅助阅读技能：流式对话 + 写整理卡片 + 定位论文页 / 笔记；
 * `skills/note_out.py` —— 笔记导出技能：只读工具（核验参考文献 / 找代码仓库）+
-  结构化分析报告。
+  结构化分析报告；
+* `skills/note_out_image.py` —— Agent 笔记图片：生成绘图代码并交给 draw-sandbox 执行；
+* `skills/agent_comm.py` —— 通信桥：消费 `agent_comm_service` 的 Redis Streams，
+  按消息导出笔记 / 列笔记 / 回答并回包。
 
 技能只声明「系统提示词 + 工具 + 工具执行器 + 怎么收尾」，循环本身（轮数 / 调用次数
 上限、`tool_calls` 与 `tool` 消息成对、正文截断、页面动作与待确认事件）只在这里实现

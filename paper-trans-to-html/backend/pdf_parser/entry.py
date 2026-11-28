@@ -26,7 +26,7 @@
     `parser_info["unlimited_ocr_route"]`（`local` / `online`）。
 
 对外签名与返回结构**保持不变**(仍是 `parser` / `parser_info` / `toc` /
-`warnings`)，所以 `converter.py` / `app.py` / `tools/*` 都不用改；
+`warnings`)，所以 `converter.py` / `backend/server/api/*` / `tools/*` 都不用改；
 每个页面**新增** `pages[].links`（PDF 链接注释，后端统一采集，见 `links.py`）
 —— 它是“引用跳转”（正文引用标记 → 参考文献条目，`backend/pdf_refs/refs.py`）的数据源。
 """

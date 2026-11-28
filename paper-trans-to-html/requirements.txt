@@ -10,6 +10,9 @@ httpx>=0.27
 PyMuPDF>=1.24
 # 数据存储：论文/标注/笔记/译文/账号/LLM 配置都存在 MongoDB（见 mongo_configuration/）
 pymongo==4.18.0
+# 可选：通信桥技能 backend/agents/skills/agent_comm.py 直接消费 Redis Streams
+# （agent_comm_service 的 outside-in-stream / inside-out-stream）；不装只影响该技能
+redis>=5.0
 # 可选：未配置 DeepSeek Key 时，可安装此包作为免费兜底翻译源
 deep-translator>=1.11
 # 可选：笔记导出为图片（Matplotlib + XKCD 手绘风三栏版式，见 backend/notes_out/）

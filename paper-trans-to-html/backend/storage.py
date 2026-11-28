@@ -1,6 +1,6 @@
 """存储装配：按 `APP_STORAGE` 选择 MongoDB 或本地 JSON
 
-`app.py` 只调用一次 `build()`，拿到 `(store, auth, settings, backend_name)`：
+`server/runtime.py` 只调用一次 `build()`，拿到 `(store, auth, settings, backend_name)`：
 
 | `APP_STORAGE` | 行为 |
 | --- | --- |

@@ -1,0 +1,50 @@
+[info] 配置来源：/root/workspace/agent_comm_service/.env
+[info] 自动选用论文：Unlimited OCR Works（08fc1159676c410a9b4963a3525f022b）
+[info] 已签发信封 transfer_key：key_id=0552b4a090efc937 expires_in=3600s
+[info] 压测参数：--mode scientific --no-mock-reader --intents paper.note.export --levels 8,16,32,64 --rounds 1 --base-url http://127.0.0.1:9500 --agent-ids research-agent-v1 --api-key *** --transfer-key tk:v2.0552b4a090efc9… --paper-id 08fc1159676c410a9b4963a3525f022b --record-jsonl /root/workspace/agent_comm_service/reports/stress_notes_20261127-135122.jsonl --record-max-chars 8000
+==============================================================================
+agent_comm_service 并发压力测试
+==============================================================================
+模式       : scientific（scientific=科研侧；reader=reader 侧；mixed=两方同时；both=先后跑）
+服务       : http://127.0.0.1:9500
+Redis      : (未使用)
+agents     : research-agent-v1
+设备       : 压测机 CPU 4C/8T Intel(R) Xeon(R) Gold 6133 CPU @ 2.50GHz | 内存 15.6 GiB（可用 12.4 GiB） | Linux 6.2.0-37-generic (x86_64)
+             （服务地址为本机；若服务在容器中且未设 cgroup 限额，规格与压测机一致）
+档位/轮次  : [8, 16, 32, 64] x 1
+intents    : paper.note.export  request_timeout=180s
+transfer_key: tk:v2.0552b4a090efc9…（放进信封，由服务端校验）
+paper_id   : 08fc1159676c410a9b4963a3525f022b
+mock reader: 未启用（等待应用侧真实 reader 回包）
+SLO        : 成功率 >= 99.0%，p99 等待 <= 10.0s（scientific/mixed）
+run_id     : faeb53cd0335
+
+[record] reader 回复逐条写入：/root/workspace/agent_comm_service/reports/stress_notes_20261127-135122.jsonl
+[warmup] 单请求全链路检查 ... ok
+
+latency: sub95=提交p95(ms)，p50/p99/max=等待时延(s)
+rps 含提交准入；429=配额重试；waiters=放行前已登记/应登记
+pending=消费组未 ACK 数，可能含历史残留
+conc  req   ok fail  succ%    rps  sub95    p50    p99    max  429 waiters ok?
+------------------------------------------------------------------------------
+   8    8    8    0  100.0    8.4   36.7   0.69   0.79   0.79    0       - YES
+  16   16   16    0  100.0   13.9   67.5   0.51   0.92   0.93    0       - YES
+  32   32   32    0  100.0   14.2  111.6   0.45   0.91   0.92   12       - YES
+  64   64   64    0  100.0   11.6  175.3   0.77   2.34   2.38   72       - YES
+
+==============================================================================
+结论
+==============================================================================
+最大稳定并发: 64
+所有测试档位均稳定，可继续提高 --levels 探测上限。
+服务端计数增量: ingest.accepted=+121, guard.pass=+121, dispatch.final=+121, dispatch.ack=+121, ingest.cancelled=+1
+stream 长度（累计，仅参考）: outside-in-raw=7763 outside-in-stream=7768 inside-out-stream=9921 agent:dlq:in=18 agent:dlq:out=0
+提示:
+  - 出现 429 重试：提交速率受 QUOTA_QPS 限制，可加 --submit-qps 15 隔离配额影响。
+  - 最高档位仍稳定，建议用更高的 --levels 继续探测。
+[record] 已记录 120 条 reader 回复 → /root/workspace/agent_comm_service/reports/stress_notes_20261127-135122.jsonl
+[record] 汇总 → /root/workspace/agent_comm_service/reports/stress_notes_20261127-135122.summary.json
+[info] 已吊销测试 transfer_key：key_id=0552b4a090efc937
+[info] reader 回复记录：/root/workspace/agent_comm_service/reports/stress_notes_20261127-135122.jsonl
+[info] 回复汇总：/root/workspace/agent_comm_service/reports/stress_notes_20261127-135122.summary.json
+[info] 总耗时 10.1s

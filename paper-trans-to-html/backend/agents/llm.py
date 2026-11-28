@@ -25,11 +25,20 @@ OpenAI 兼容后端就拒绝）、流式增量拼接、`tool_calls` 片段合并
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Iterable, Iterator
 
 import httpx
+
+log = logging.getLogger(__name__)
+
+# 结构化 JSON 的输出上限：导出报告这类长输出用服务端默认（常见的 4096）会被截断，
+# 截断后 `json.loads` 必然失败；这里显式给足，配置 `max_tokens` / `max_output_tokens`
+# 可以覆盖（<=0 视为用默认）。
+DEFAULT_JSON_MAX_TOKENS = 8192
+MAX_JSON_MAX_TOKENS = 32768
 
 
 class LlmUnavailable(Exception):
@@ -46,21 +55,86 @@ class LlmUnavailable(Exception):
 TranslationUnavailable = LlmUnavailable
 
 
-def extract_json(content: str):
-    """从模型输出里挖出 JSON：容忍 ``` 围栏、前后废话，失败返回 `None`。"""
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", content).strip()
-    try:
-        return json.loads(content)
-    except Exception:
-        m = re.search(r"\[.*\]", content, re.S)
-        if m:
+_FENCE_RE = re.compile(r"```[A-Za-z0-9_+-]*\s*|\s*```")
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+def _loads_lenient(text: str):
+    """尽量把一段文本当成 JSON 解析（容忍尾随逗号与字符串里的裸换行）。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    for candidate in (text, _TRAILING_COMMA_RE.sub(r"\1", text)):
+        for strict in (True, False):      # strict=False：容忍字符串里的控制字符
             try:
-                return json.loads(m.group(0))
+                return json.loads(candidate, strict=strict)
             except Exception:
-                pass
+                continue
     return None
+
+
+def _balanced_slice(text: str, opener: str, closer: str) -> str | None:
+    """从第一个 `opener` 截到括号配平的位置（模型在 JSON 前后写了废话时用）。"""
+    start = text.find(opener)
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None                              # 没闭合（被截断）：交给调用方判失败
+
+
+def extract_json(content: str):
+    """从模型输出里挖出 JSON：容忍 ``` 围栏、前后废话、尾随逗号，失败返回 `None`。
+
+    依次尝试：整段 → 去掉围栏后整段 → 第一对 `{}` / `[]` 配对区间。
+    被 `max_tokens` 截断的半截 JSON 无法修复，会返回 `None`（由调用方重试）。
+    """
+    raw = str(content or "")
+    for candidate in (raw.strip(), _FENCE_RE.sub("", raw).strip()):
+        data = _loads_lenient(candidate)
+        if data is not None:
+            return data
+    text = _FENCE_RE.sub("", raw).strip()
+    best: tuple[int, str] | None = None          # 取「最靠前的那个」括号区间
+    for opener, closer in (("{", "}"), ("[", "]")):
+        chunk = _balanced_slice(text, opener, closer)
+        if not chunk:
+            continue
+        start = text.find(opener)
+        if best is None or start < best[0]:
+            best = (start, chunk)
+    if best is None:
+        return None
+    return _loads_lenient(best[1])
+
+
+def _first_message(data: dict) -> tuple[dict, str]:
+    """从 chat/completions 响应里取 `(assistant message, finish_reason)`。"""
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return {}, ""
+    if not isinstance(choice, dict):
+        return {}, ""
+    message = choice.get("message")
+    return (message if isinstance(message, dict) else {}), str(choice.get("finish_reason") or "")
 
 
 def _delta_text(value) -> str:
@@ -147,6 +221,8 @@ class LlmClient:
                      or "https://api.deepseek.com").rstrip("/")
         self.model = cfg.get("model") or cfg.get("deepseek_model") or "deepseek-chat"
         self.timeout = float(cfg.get("timeout") or 120)
+        # 结构化 JSON 的输出上限（0/未配置 → `DEFAULT_JSON_MAX_TOKENS`）
+        self.max_tokens = cfg.get("max_tokens") or cfg.get("max_output_tokens") or 0
         # 有 Key 且不是显式选 Google → 一律按 OpenAI 兼容接口调用；否则退免费兜底
         self.backend = "google" if (self.provider == "google" or not key) else "openai"
 
@@ -195,27 +271,74 @@ class LlmClient:
         except Exception as exc:
             raise LlmUnavailable(f"模型响应解析失败：{exc}") from exc
 
-    def chat_json(self, system: str, user: str, *, temperature: float = 0.1) -> dict:
-        """做一次结构化对话，返回解析出来的 JSON 对象（提取目录这类任务用）。
+    def _json_max_tokens(self, override: int | None) -> int:
+        """本次结构化请求的输出上限：显式参数 → 配置 → `DEFAULT_JSON_MAX_TOKENS`。"""
+        value = override if override is not None else self.max_tokens
+        try:
+            value = int(value or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value <= 0:
+            value = DEFAULT_JSON_MAX_TOKENS
+        return max(256, min(MAX_JSON_MAX_TOKENS, value))
+
+    def chat_json(self, system: str, user: str, *, temperature: float = 0.1,
+                  max_tokens: int | None = None) -> dict:
+        """做一次结构化对话，返回解析出来的 JSON 对象（目录 / 导出报告这类任务用）。
 
         只有 OpenAI 兼容后端能做（Google 兑底只能逐句翻译），不能用就抛
         `LlmUnavailable`，前端会提示去配置 LLM。
+
+        稳健性（导出的 agent 模式依赖这里，一次格式抖动不该让整份报告降级）：
+
+        * 显式带 `max_tokens`（默认 8192）：导出报告是长 JSON，用服务端默认
+          （常见 4096）会被截断成非法 JSON；
+        * 解析失败自动**重试一次**：截断 → 提示精简输出，其他 → 提示「只输出一个
+          JSON 对象、不要代码块 / 尾随逗号」；
+        * 服务端不认 `response_format`（400/422）时去掉该字段再发一次。
         """
         if not self.ready or self.backend != "openai":
             raise LlmUnavailable(
                 f"当前 LLM 服务（{self.status_text}）不可用，"
                 f"请到「⚙ 设置 → LLM 服务」配置 OpenAI 兼容服务与 API Key")
-        content = self.post_chat({
-            "model": self.model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
-            "temperature": temperature,
-            "response_format": {"type": "json_object"},
-        })
-        data = extract_json(content)
-        if not isinstance(data, dict):
-            raise LlmUnavailable("返回结果不是合法 JSON，请重试")
-        return data
+        limit = self._json_max_tokens(max_tokens)
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user}]
+        reason, finish = "", ""
+        for attempt in range(2):
+            body = {"model": self.model, "messages": messages,
+                    "temperature": temperature,
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": limit}
+            try:
+                data = self.post_chat_payload(body)
+            except LlmUnavailable as exc:
+                if "response_format" not in body or not re.search(r"\b(400|422)\b", str(exc)):
+                    raise
+                log.info("服务端不支持 response_format，去掉该字段重试：%s", exc)
+                body.pop("response_format")
+                data = self.post_chat_payload(body)
+            message, finish = _first_message(data)
+            content = _delta_text(message.get("content"))
+            parsed = extract_json(content)
+            if isinstance(parsed, dict):
+                return parsed
+            if finish == "length":
+                reason = f"模型输出被截断（max_tokens={limit}）"
+                hint = ("上一次输出被长度上限截断。请输出**更精简**的 JSON：缩短 summary / "
+                        "conclusion 等文字、减少数组条目数量，但 JSON 结构必须完整可解析。")
+            elif not content.strip():
+                reason = "模型返回了空内容"
+                hint = "上一次没有返回内容。请直接输出一个 JSON 对象，不要输出任何其他文字。"
+            else:
+                reason = "返回结果不是合法 JSON"
+                hint = ("上一次输出不是合法 JSON。请只输出**一个** JSON 对象：不要加解释文字、"
+                        "不要用 ``` 代码块、不要有尾随逗号，字符串里的换行与引号要正确转义。")
+            log.warning("chat_json 第 %d 次解析失败（%s，finish_reason=%s），重试中",
+                        attempt + 1, reason, finish or "unknown")
+            messages = messages + [{"role": "user", "content": hint + " 只输出 JSON。"}]
+        raise LlmUnavailable(f"返回结果不是合法 JSON，请重试（{reason}，"
+                             f"finish_reason={finish or 'unknown'}，max_tokens={limit}）")
 
     def chat(self, system: str, messages: list[dict], *, temperature: float = 0.3) -> str:
         """普通多轮对话，返回助手正文文本（AI 辅助阅读的聊天用）。

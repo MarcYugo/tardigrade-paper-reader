@@ -7,11 +7,12 @@
   逐段带 `x/y/w/h` + `bbox`，以及行内公式区间与表格 HTML）；
 * **机械导出**（`mode="mechanical"`）：纯本地、零 LLM 成本，直接给分节内容、
   参考文献条目、句子笔记 / 独立笔记 / 高亮与一份统计报告；
-* **Agent 导出**（`mode="agent"`）：在机械导出的基础上，交给
+* **Agent 导出**（`mode="agent"`）：**机械导出打底**，再由
   `agents/skills/note_out.py`（技能「笔记导出」）调用只读工具（核验参考文献是否
-  真实存在、提取并确认项目代码地址），再形成一份分析报告。
+  真实存在、提取并确认项目代码地址），把「AI 总结 + 笔记整理 + 联网核验结论」
+  合并进机械报告（`merge_agent_report()`）—— 不是让大模型重写整份报告。
 
-这里不碰数据库、也不做权限判断：`doc` / `rec` / `anno` 都由调用方（`app.py`）取好，
+这里不碰数据库、也不做权限判断：`doc` / `rec` / `anno` 都由调用方（`server/api/export.py` / `server/api/transfer.py`）取好，
 本模块只做**纯数据转换**。这样后面接「transfer key 让别的 Agent 拿走笔记」时，
 数据对接层可以直接复用同一份导出结构。
 
@@ -20,7 +21,11 @@
 | 函数 | 作用 |
 | --- | --- |
 | `build_sections()` | 把版式文档拆成五个部分（另带 `front_matter`） |
+| `build_fulltext()` | 整篇论文的**纯文本**（按分节顺序拼接，**不含 x/y/w/h/bbox**） |
+| `build_figures()` | 论文配图：文件信息 + 图注 + **base64 `data_url`** |
+| `check_references()` | 参考文献检查：正文引用 vs 列表条目（缺失 / 未被引用 / 重复 / DOI·arXiv·链接） |
 | `build_notes()` | 把笔记 / 高亮解析成「页码 + 原句」，并补作者 |
+| `merge_agent_report()` | Agent 导出：机械报告 + AI 分析 / 联网核验结论合并 |
 | `paper_authors()` | 从首页标题之后猜作者（图片导出第一栏用） |
 | `build_ai_summary()` | 取 AI 辅助阅读面板的「整理笔记」（图片导出第三栏用） |
 | `export_paper()` | 生成完整导出 JSON（机械 / Agent） |
@@ -29,9 +34,11 @@
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from .. import records
@@ -238,6 +245,330 @@ def _collect(blocks: list[tuple[int, dict, str]], start: int, end: int, *,
         entries.append(_block_view(page, blk, text))
     return {"text": " ".join(parts).strip(), "pages": sorted(set(pages)),
             "blocks": entries}
+
+
+# =====================================================================
+#  整篇纯文本（不含任何版式字段）
+# =====================================================================
+_SECTION_ORDER = ("title", "front_matter", "abstract", "main_text",
+                  "references", "appendix")
+_SECTION_LABELS = {
+    "title": "标题", "front_matter": "首页信息", "abstract": "摘要",
+    "main_text": "正文", "references": "参考文献", "appendix": "附录",
+}
+
+
+def _plain_block(section: str, block: dict) -> dict:
+    """段落块的**去版式**视图：只留 分节 / id / 页码 / 类型 / 文本。
+
+    刻意**不带** `x` / `y` / `w` / `h` / `bbox` —— 这是「完整论文文本」的段落口径，
+    要几何信息请用 `sections[*].blocks`（原格式块）。
+    """
+    return {
+        "section": section,
+        "id": str(block.get("id") or ""),
+        "page": block.get("page"),
+        "kind": str(block.get("kind") or ""),
+        "label": str(block.get("label") or ""),
+        "text": _block_content(block),
+    }
+
+
+def build_fulltext(sections: dict, *, limit_chars: int = 0) -> dict:
+    """整篇论文的**纯文本**：按 标题 → 首页信息 → 摘要 → 正文 → 参考文献 → 附录 拼接。
+
+    * `text`：所有段落用空行连起来的完整正文（**没有任何 bbox / 坐标**）；
+    * `paragraphs`：逐段 `{section, id, page, kind, label, text}`（同样不含几何）；
+    * `sections`：分节目录（页码 / 字数 / 在 `text` 里的 `start`\~`end` 偏移）；
+    * `limit_chars > 0` 时只截 `text`（`truncated=True`），`paragraphs` 保持完整。
+
+    几何信息仍在 `build_sections()` 的 `blocks` 里，两者互不干扰。
+    """
+    chunks: list[str] = []
+    paragraphs: list[dict] = []
+    outline: list[dict] = []
+    offset = 0
+    for name in _SECTION_ORDER:
+        sec = (sections or {}).get(name)
+        if not isinstance(sec, dict):
+            continue
+        rows = [_plain_block(name, block)
+                for block in (sec.get("blocks") or []) if isinstance(block, dict)]
+        rows = [row for row in rows if row["text"]]
+        body = "\n\n".join(row["text"] for row in rows)
+        if not body:
+            continue
+        outline.append({"name": name, "title": _SECTION_LABELS.get(name, name),
+                        "pages": sec.get("pages") or [], "chars": len(body),
+                        "paragraphs": len(rows), "start": offset,
+                        "end": offset + len(body)})
+        chunks.append(body)
+        offset += len(body) + 2
+        paragraphs.extend(rows)
+
+    text = "\n\n".join(chunks)
+    out: dict[str, Any] = {
+        "chars": len(text),
+        "text": text,
+        "sections": outline,
+        "paragraphs": paragraphs,
+        "plain": True,          # 明确标记：这里不含任何版式 / bbox 字段
+        "bbox": False,
+    }
+    if limit_chars and len(text) > int(limit_chars):
+        out["text"] = text[:int(limit_chars)]
+        out["truncated"] = True
+    return out
+
+
+# =====================================================================
+#  配图（插图 + base64）
+# =====================================================================
+_IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+}
+_CAPTION_KINDS = ("caption", "figure_caption", "image_caption", "table_caption",
+                  "figcaption")
+
+
+def _caption_for(page: dict, image: dict) -> str:
+    """给一张插图找最近的图注（同页 caption 类块：横向重叠、纵向最近）。"""
+    try:
+        ix = float(image.get("x") or 0)
+        iy = float(image.get("y") or 0)
+        iw = float(image.get("w") or 0)
+        ih = float(image.get("h") or 0)
+    except (TypeError, ValueError):
+        return ""
+    best_gap: float | None = None
+    best_text = ""
+    for block in page.get("texts") or []:
+        if not isinstance(block, dict):
+            continue
+        kind = str(block.get("kind") or "").strip().lower()
+        label = str(block.get("label") or "").strip().lower()
+        if kind not in _CAPTION_KINDS and label not in _CAPTION_KINDS:
+            continue
+        text = _block_content(block)
+        if not text:
+            continue
+        try:
+            bx = float(block.get("x") or 0)
+            by = float(block.get("y") or 0)
+            bw = float(block.get("w") or 0)
+            bh = float(block.get("h") or 0)
+        except (TypeError, ValueError):
+            continue
+        if bx + bw < ix - 8 or bx > ix + iw + 8:      # 横向完全不重叠
+            continue
+        gap = max(0.0, by - (iy + ih), iy - (by + bh))
+        if best_gap is None or gap < best_gap:
+            best_gap, best_text = gap, text
+    return best_text
+
+
+def build_figures(doc: dict, *, store=None, doc_id: str = "",
+                  images_dir: str | Path | None = None,
+                  include_data: bool = True, max_images: int = 60,
+                  max_image_kb: int = 4096, max_total_kb: int = 24576) -> dict:
+    """论文配图：逐张给出文件信息、图注和 **base64 `data_url`**。
+
+    * 图片来源：`pages[].images[]`（解析器裁好落盘的插图）；
+    * 字节来源：优先 `store.get_image(doc_id, file)`（MongoDB 走 GridFS），
+      没有 `store` 时退回 `images_dir/file` 磁盘文件；
+    * `data_url` 形如 `data:image/png;base64,…`，可直接被 Agent / 前端当图片用；
+    * 单张超过 `max_image_kb`、或总数超过 `max_total_kb` 的图**不带 base64**
+      （仍然列出文件与图注，`skipped` 里写明原因），避免导出体积失控。
+    """
+    def _read(fname: str) -> bytes | None:
+        if store is not None and doc_id:
+            try:
+                data = store.get_image(doc_id, fname)
+            except Exception:
+                data = None
+            if data:
+                return data
+        if images_dir:
+            try:
+                return (Path(images_dir) / fname).read_bytes()
+            except OSError:
+                return None
+        return None
+
+    items: list[dict] = []
+    skipped: list[dict] = []
+    total_bytes = 0
+    with_data = 0
+    for page_no, page in enumerate((doc or {}).get("pages") or [], start=1):
+        if not isinstance(page, dict):
+            continue
+        for image in page.get("images") or []:
+            if not isinstance(image, dict):
+                continue
+            fname = str(image.get("file") or "").strip()
+            if not fname:
+                continue
+            entry: dict[str, Any] = {
+                "page": page_no,
+                "file": fname,
+                "kind": str(image.get("class_name") or "Figure"),
+                "source": str(image.get("source") or ""),
+                "cache_key": str(image.get("cache_key") or ""),
+                "size": {"w": image.get("w"), "h": image.get("h")},
+                "caption": _caption_for(page, image),
+            }
+            if not include_data:
+                items.append(entry)
+                continue
+            if len(items) >= max(1, int(max_images)):
+                skipped.append({"page": page_no, "file": fname,
+                                "reason": "max_images"})
+                continue
+            raw = _read(fname)
+            if not raw:
+                entry["bytes"] = 0
+                skipped.append({"page": page_no, "file": fname, "reason": "missing"})
+                items.append(entry)
+                continue
+            entry["bytes"] = len(raw)
+            if len(raw) > max(1, int(max_image_kb)) * 1024:
+                skipped.append({"page": page_no, "file": fname,
+                                "reason": "too_large", "bytes": len(raw)})
+                items.append(entry)
+                continue
+            if total_bytes + len(raw) > max(1, int(max_total_kb)) * 1024:
+                skipped.append({"page": page_no, "file": fname,
+                                "reason": "total_budget", "bytes": len(raw)})
+                items.append(entry)
+                continue
+            mime = _IMAGE_MIME.get(Path(fname).suffix.lower(), "image/png")
+            entry["mime"] = mime
+            entry["data_url"] = (f"data:{mime};base64,"
+                                 + base64.b64encode(raw).decode("ascii"))
+            total_bytes += len(raw)
+            with_data += 1
+            items.append(entry)
+
+    return {"count": len(items), "with_data": with_data,
+            "bytes": total_bytes, "items": items, "skipped": skipped,
+            "truncated": bool(skipped)}
+
+
+# =====================================================================
+#  参考文献检查
+# =====================================================================
+_RE_BRACKET_CITE = re.compile(
+    r"\[(\d{1,3}(?:\s*[,;，、]\s*\d{1,3}|\s*[–—-]\s*\d{1,3})*)\]")
+_RE_DOI = re.compile(r"\b10\.\d{4,9}/[^\s\"'<>]+", re.I)
+_RE_ARXIV = re.compile(r"\barxiv\s*[:：]?\s*(\d{4}\.\d{4,5}(?:v\d+)?)", re.I)
+_RE_URL = re.compile(r"https?://[^\s\"'<>]+", re.I)
+
+
+def _expand_cite(group: str) -> list[int]:
+    """`"3, 5-7"` → `[3, 5, 6, 7]`（只在括号内展开，避免误伤普通数字）。"""
+    out: list[int] = []
+    for part in re.split(r"[,;，、]", group or ""):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^(\d{1,3})\s*[–—-]\s*(\d{1,3})$", part)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if 0 < lo <= hi <= 999 and hi - lo <= 60:
+                out.extend(range(lo, hi + 1))
+            continue
+        if part.isdigit():
+            out.append(int(part))
+    return out
+
+
+def _cited_numbers(text: str) -> list[int]:
+    """正文里出现过的引用编号（`[12]` / `[3, 5]` / `[7–9]`）。"""
+    found: list[int] = []
+    for m in _RE_BRACKET_CITE.finditer(str(text or "")):
+        found.extend(_expand_cite(m.group(1)))
+    return sorted(set(found))
+
+
+def check_references(sections: dict) -> dict:
+    """参考文献检查（**纯本地**，不联网）：正文引用与列表条目是否对得上。
+
+    * `count` / `numbers`：列表条目数与编号；
+    * `cited`：正文里出现过的编号；`missing`：引用了但列表里没有；
+    * `uncited`：列表里有但正文没引用；
+    * `duplicates`：疑似重复条目（按归一化文本比对）；
+    * `links`：条目里带 DOI / arXiv / URL 的；`with_link` 是条数；
+    * `ok`：没有 `missing` 也没有 `duplicates` 时为 True。
+
+    联网核验（Crossref / OpenAlex / S2 / arXiv）在 Agent 模式下由
+    `agents/skills/note_out.py` 完成，结论写在 `report.references_stats` 里；
+    本函数只给「结构层面的检查」。
+    """
+    refs = (sections or {}).get("references") or {}
+    entries = [e for e in (refs.get("entries") or []) if isinstance(e, dict)]
+
+    numbers: list[int] = []
+    for pos, entry in enumerate(entries, start=1):
+        try:
+            num = int(entry.get("index") or pos)
+        except (TypeError, ValueError):
+            num = pos
+        numbers.append(num if num > 0 else pos)
+
+    body_parts: list[str] = []
+    for key in ("abstract", "main_text", "appendix", "front_matter", "title"):
+        sec = (sections or {}).get(key)
+        if isinstance(sec, dict):
+            body_parts.append(str(sec.get("text") or ""))
+    body = "\n".join(body_parts)
+    cited = _cited_numbers(body)
+    known = set(numbers)
+    missing = [num for num in cited if num not in known]
+    uncited = [num for num in numbers if num not in set(cited)]
+
+    seen: dict[str, int] = {}
+    duplicates: list[dict] = []
+    links: list[dict] = []
+    for num, entry in zip(numbers, entries):
+        text = str(entry.get("text") or "")
+        key = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text.lower())[:120]
+        if len(key) >= 20:
+            if key in seen:
+                duplicates.append({"index": num, "same_as": seen[key]})
+            else:
+                seen[key] = num
+        uri = str(entry.get("uri") or "").strip()
+        doi = _RE_DOI.search(text)
+        arxiv = _RE_ARXIV.search(text)
+        url = uri or (doi.group(0) if doi else "")
+        if arxiv and not url:
+            url = "https://arxiv.org/abs/" + arxiv.group(1)
+        if not url:
+            hit = _RE_URL.search(text)
+            url = hit.group(0).rstrip(".,;)") if hit else ""
+        if url:
+            links.append({"index": num, "url": url,
+                          "kind": ("arxiv" if arxiv else
+                                   "doi" if doi else "url")})
+
+    ok = not missing and not duplicates
+    style = "numeric" if cited else "unknown"
+    if not cited:
+        # 作者-年份制（或扫描 PDF 丢了引用括号）：不做「未被引用」对账，避免误报
+        uncited = []
+        note = "正文里没找到 [n] 形式的引用编号（可能是作者-年份制），未做引用对账"
+    else:
+        note = ""
+    summary = (f"参考文献 {len(entries)} 条；正文引用 {len(cited)} 个编号；"
+               f"缺失 {len(missing)} 条、未被引用 {len(uncited)} 条、"
+               f"疑似重复 {len(duplicates)} 条；带 DOI/arXiv/链接 {len(links)} 条。")
+    return {"ok": ok, "summary": summary, "style": style, "note": note,
+            "count": len(entries), "numbers": numbers,
+            "cited": cited, "cited_count": len(cited),
+            "missing": missing, "uncited": uncited,
+            "duplicates": duplicates, "links": links,
+            "with_link": len(links)}
 
 
 # =====================================================================
@@ -603,7 +934,10 @@ def build_notes(anno: dict | None, doc: dict, rec: dict | None = None) -> dict:
 # =====================================================================
 #  机械报告
 # =====================================================================
-def build_mechanical_report(paper: dict, sections: dict, notes_data: dict) -> dict:
+def build_mechanical_report(paper: dict, sections: dict, notes_data: dict, *,
+                           figures: dict | None = None,
+                           reference_check: dict | None = None,
+                           code_links: list[str] | None = None) -> dict:
     """机械导出的「分析报告」：不调用 LLM，只做结构与统计。"""
     stats = notes_data.get("stats") or {}
     refs = (sections.get("references") or {})
@@ -612,7 +946,9 @@ def build_mechanical_report(paper: dict, sections: dict, notes_data: dict) -> di
         for key in ("title", "abstract", "main_text", "references", "appendix"))
     all_text += "\n" + "\n".join(
         f"{n.get('title')} {n.get('text')}" for n in notes_data.get("free_notes") or [])
-    code_links = _code_links(all_text)
+    links = list(code_links) if code_links is not None else _code_links(all_text)
+    figures = figures or {}
+    ref_check = reference_check or {}
 
     has = {
         "abstract": bool((sections.get("abstract") or {}).get("text")),
@@ -627,11 +963,14 @@ def build_mechanical_report(paper: dict, sections: dict, notes_data: dict) -> di
     summary = (
         f"《{paper.get('title') or '未命名论文'}》共 {paper.get('num_pages') or '?'} 页；"
         f"按 {' / '.join(structure)} 分节；"
-        f"参考文献 {refs.get('count') or 0} 条；"
-        f"句子笔记 {stats.get('sentence_notes', 0)} 条、"
+        + (f"{ref_check.get('summary').rstrip('。')}；"
+           if ref_check.get("summary") else f"参考文献 {refs.get('count') or 0} 条；")
+        + f"句子笔记 {stats.get('sentence_notes', 0)} 条、"
         f"独立笔记 {stats.get('free_notes', 0)} 条、"
         f"高亮 {stats.get('highlights', 0)} 处"
-        + (f"；正文/笔记里提到 {len(code_links)} 个代码地址" if code_links else "")
+        + (f"；配图 {figures.get('count')} 张（{figures.get('with_data', 0)} 张带 base64）"
+           if figures.get("count") else "")
+        + (f"；正文/笔记里提到 {len(links)} 个代码地址" if links else "")
         + "。本报告为机械导出（未调用 LLM）。"
     )
     return {
@@ -657,7 +996,20 @@ def build_mechanical_report(paper: dict, sections: dict, notes_data: dict) -> di
                         if isinstance(e, dict)],
             "pages": (sections.get("references") or {}).get("pages") or [],
         },
-        "code_links": code_links,
+        "code_links": links,
+        "figures": {"count": figures.get("count") or 0,
+                    "with_data": figures.get("with_data") or 0,
+                    "bytes": figures.get("bytes") or 0},
+        "reference_check": {
+            "ok": ref_check.get("ok"),
+            "style": ref_check.get("style") or "unknown",
+            "count": ref_check.get("count") or 0,
+            "cited_count": ref_check.get("cited_count") or 0,
+            "missing": ref_check.get("missing") or [],
+            "uncited": ref_check.get("uncited") or [],
+            "duplicates": ref_check.get("duplicates") or [],
+            "with_link": ref_check.get("with_link") or 0,
+        },
         "notes_by_page": _notes_by_page(notes_data),
     }
 
@@ -675,6 +1027,41 @@ def _code_links(text: str) -> list[str]:
     # 从笔记导出技能复用同一套提取规则（机械导出与工具候选口径一致）
     from ..agents.skills.note_out import extract_code_links
     return extract_code_links(text)
+
+
+# =====================================================================
+#  Agent 导出：机械报告打底 + AI 分析补充
+# =====================================================================
+# AI 只负责「文字分析与联网核验结论」；分节结构、统计、参考文献结构检查、
+# 配图、代码链接一律用机械报告的结果 —— 模型输出的数字不会污染这些字段。
+_AI_REPORT_KEYS = (
+    "summary", "paper_overview", "notes_analysis",
+    "references_stats", "references_review", "references_review_summary",
+    "code_repositories", "conclusion", "next_steps", "evidence",
+)
+
+
+def merge_agent_report(mechanical: dict, ai: dict | None) -> dict:
+    """把 Agent 的 AI 分析合并进机械报告（Agent 导出 = 机械导出 + AI 总结/核验）。
+
+    * 机械部分（`build_mechanical_report()` 的结果）**全部保留**：`section_overview`
+      / `stats` / `references` / `reference_check` / `code_links` / `figures` /
+      `notes_by_page`；它那句结构化的句子摘要改放在 `mechanical_summary`（不丢）；
+    * AI 部分只覆盖 `_AI_REPORT_KEYS`，而且**只有非空值才覆盖**：模型没给的字段
+      继续用机械结果（不会变成 null / 空对象）；
+    * `mode` 标成 `agent`，图片导出 / 前端据此判断「本轮有大模型参与」。
+    """
+    report = dict(mechanical or {})
+    ai = ai if isinstance(ai, dict) else {}
+    report["mechanical_summary"] = report.get("summary") or ""
+    report["mode"] = "agent"
+    for key in _AI_REPORT_KEYS:
+        value = ai.get(key)
+        if value not in (None, "", [], {}):
+            report[key] = value
+    if not report.get("summary"):
+        report["summary"] = report["mechanical_summary"]
+    return report
 
 
 # =====================================================================
@@ -795,12 +1182,22 @@ def _paper_meta(doc: dict, rec: dict | None, *, username: str = "") -> dict:
 def export_paper(*, doc: dict, rec: dict | None = None, anno: dict | None = None,
                  mode: str = "mechanical", llm: LlmClient | None = None,
                  username: str = "", instructions: str = "",
-                 scholar: dict | None = None) -> dict:
+                 scholar: dict | None = None,
+                 store=None, doc_id: str = "",
+                 images_dir: str | Path | None = None,
+                 with_fulltext: bool = True, with_images: bool = False,
+                 fulltext_limit: int = 0,
+                 image_budget_mb: float = 24.0, image_max_mb: float = 4.0,
+                 max_images: int = 60,
+                 refresh_references: bool = False) -> dict:
     """生成完整导出 JSON。
 
     * `mode="mechanical"`：纯本地，不需要 LLM；
     * `mode="agent"`：`llm` 必须是可用的 `agents/llm.py::LlmClient`
       （Google 免费兜底做不了工具调用与结构化报告）。
+
+    `store` / `doc_id` 用来取**配图字节**（`store.get_image(doc_id, file)`，
+    MongoDB 走 GridFS）；不传 `store` 时只能拿到图片文件名，没有 base64。
 
     返回结构：
 
@@ -818,12 +1215,43 @@ def export_paper(*, doc: dict, rec: dict | None = None, anno: dict | None = None
                        "entries": [...], "count": 12},
         "appendix": {...}, "front_matter": {...}
       },
+      "fulltext": {"chars": 42000, "text": "标题…摘要…正文…",
+                   "sections": [...], "paragraphs": [...]},
+      "figures": {"count": 12, "with_data": 12, "bytes": 2345678,
+                  "items": [{"page": 2, "file": "p002_i000.png",
+                             "caption": "Figure 1: …",
+                             "data_url": "data:image/png;base64,…"}]},
+      "code_links": ["https://github.com/owner/repo"],
+      "reference_check": {"ok": true, "count": 37, "cited": [1, 2],
+                          "missing": [], "uncited": [9], "links": [...]},
       "notes": {"sentence_notes": [...], "free_notes": [...],
                 "highlights": [...], "stats": {...}},
       "ai_summary": {"summary": {...}, "at": "…"} | null,
       "report": {...}
     }
     ```
+
+    * `fulltext` 是**整篇论文的纯文本**（不含 `x/y/w/h/bbox`，几何仍在
+      `sections[*].blocks` 里）；`with_fulltext=False` 时不给；
+    * `figures` 是**配图**：文件信息 + 图注 + base64 `data_url`（默认关闭，
+      传输给外部 Agent 时再打开）；
+    * `code_links` 是从正文 / 笔记里提取的代码仓地址（确定性提取，不联网）；
+    * `reference_check` 是参考文献的**结构检查**结果（引用编号对账、重复、DOI/arXiv）。
+
+    Agent 模式会把整张参考文献列表联网核验一遍，结果按「论文 + 参考文献指纹」缓存在
+    `store`（`get_refcheck` / `set_refcheck`）里：**同一篇论文只全量核验一次**，
+    之后的导出直接复用（`refresh_references=True` 可强制重查）。
+
+    `report` 在两种模式下的构成（关键）：
+
+    * `mechanical`：`build_mechanical_report()` 的确定性结果 —— `summary`（结构化一句话）、
+      `section_overview` / `stats` / `references` / `reference_check` / `code_links` /
+      `figures` / `notes_by_page`；
+    * `agent`：**在同一份机械报告上合并 AI 分析**（`merge_agent_report()`，`mode="agent"`）。
+      机械字段一个不丢（原 `summary` 移到 `mechanical_summary`），AI 只补
+      `summary` / `paper_overview` / `notes_analysis` / `references_stats` /
+      `references_review` / `code_repositories` / `conclusion` / `next_steps` —— 大模型
+      **不重写整份报告**，也不决定统计数字。
 
     `paper.authors` 是首页上猜到（也可能为空）的作者；`ai_summary` 是 AI 辅助阅读
     面板里的「整理笔记」，图片导出第三栏直接用它。
@@ -834,26 +1262,59 @@ def export_paper(*, doc: dict, rec: dict | None = None, anno: dict | None = None
     paper = _paper_meta(doc, rec, username=username)
     sections = build_sections(doc, title=paper["title"])
     notes_data = build_notes(anno, doc, rec)
+    fulltext = (build_fulltext(sections, limit_chars=fulltext_limit)
+                if with_fulltext else None)
+    figures = (build_figures(doc, store=store,
+                             doc_id=doc_id or paper.get("id") or "",
+                             images_dir=images_dir,
+                             include_data=True, max_images=max_images,
+                             max_image_kb=int(max(0.1, image_max_mb) * 1024),
+                             max_total_kb=int(max(1.0, image_budget_mb) * 1024))
+               if with_images else None)
+    reference_check = check_references(sections)
+    code_links = _code_links("\n".join(
+        [str((fulltext or {}).get("text") or "")]
+        + [f"{n.get('title')} {n.get('text')} {n.get('note')} "
+           for n in (notes_data.get("free_notes") or [])
+           + (notes_data.get("sentence_notes") or [])]))
+
+    # 机械报告永远先建：Agent 模式也只是在它上面补「AI 分析 / 联网核验结论」，
+    # 分节、统计、参考文献结构检查、配图、代码链接这些确定性结果不会因为模型
+    # 少给字段或幻觉而丢失。
+    report = build_mechanical_report(paper, sections, notes_data,
+                                     figures=figures,
+                                     reference_check=reference_check,
+                                     code_links=code_links)
     if mode == "agent":
         if llm is None:
             raise ValueError("Agent 导出需要可用的 LLM（请在设置里配置 OpenAI 兼容服务）")
         from ..agents.skills.note_out import run_note_out_agent
-        report = run_note_out_agent(llm, paper=paper, sections=sections,
-                                    notes=notes_data, instructions=instructions,
-                                    scholar=scholar)
-    else:
-        report = build_mechanical_report(paper, sections, notes_data)
-    return {
+        # 参考文献核验很慢（整张列表联网查）：把核验结论按论文落库缓存，
+        # 下次导出直接复用，只补查没结论的那几条。
+        ai_report = run_note_out_agent(
+            llm, paper=paper, sections=sections, notes=notes_data,
+            instructions=instructions, scholar=scholar,
+            store=store, doc_id=doc_id or str(paper.get("id") or ""),
+            refresh_ref_cache=refresh_references)
+        report = merge_agent_report(report, ai_report)
+    out = {
         "format": EXPORT_FORMAT,
         "version": EXPORT_VERSION,
         "exported_at": _now(),
         "mode": mode,
         "paper": paper,
         "sections": sections,
+        "code_links": code_links,
+        "reference_check": reference_check,
         "notes": notes_data,
         "ai_summary": build_ai_summary(rec),
         "report": report,
     }
+    if fulltext is not None:
+        out["fulltext"] = fulltext
+    if figures is not None:
+        out["figures"] = figures
+    return out
 
 
 def to_json(export: dict) -> str:
@@ -877,7 +1338,8 @@ def export_filename(paper: dict | None, mode: str = "mechanical",
 
 __all__ = [
     "EXPORT_FORMAT", "EXPORT_VERSION", "MODES",
-    "build_sections", "build_notes", "build_mechanical_report",
+    "build_sections", "build_fulltext", "build_figures", "check_references",
+    "build_notes", "build_mechanical_report", "merge_agent_report",
     "build_ai_summary", "paper_authors",
     "export_paper", "to_json", "export_filename",
 ]

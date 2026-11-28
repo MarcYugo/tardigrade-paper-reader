@@ -10,7 +10,13 @@
    * `find_code_repository`：从论文正文与笔记里提取 GitHub / GitLab 等代码地址，
      联网确认仓库可达；正文里没有时，还能按标题去 GitHub 搜一次仓库。
 2. 工具结果只作为**证据**记下来（不直接写正文），最后再用一次结构化 JSON 调用，
-   让模型把「论文分析 + 笔记分析 + 参考文献核验结论 + 代码仓库」整理成报告。
+   让模型只写「AI 分析部分」（论文要点 / 笔记整理 / 需人工复核的文献 / 代码仓库 /
+   结论 / 下一步）。
+
+**Agent 导出 = 机械导出 + AI 总结/检查**：分节结构、页数、笔记统计、参考文献结构检查、
+配图、代码链接这些**确定性内容由 `notes_out/note_out.py` 的机械导出发好**，本技能
+**不重写整份报告**；两边由 `notes_out.note_out.merge_agent_report()` 合并
+（机械打底，AI 只补文字分析与非空字段），所以模型少给字段或措辞跑偏也不会丢结构数据。
 
 **参考文献是全量核验的**（2026-11）：进模型之前先由 `_verify_all_references()`
 把整张列表（上限 `MAX_AUTO_VERIFY` 条、并发 `AUTO_VERIFY_WORKERS` 条、
@@ -19,6 +25,13 @@
 其中没过的那几条（最多 4 条），不再由它挑「值得核验的」。
 环境变量 `NOTE_OUT_VERIFY_ALL=0` 可关闭全量核验（离线环境/测试用）。
 
+**核验结果会缓存**（2026-11）：结论按「论文 doc_id + 参考文献指纹 + 学术库配置」
+落在存储里（`store.get_refcheck` / `set_refcheck`），之后的导出（包括并发导出同一篇
+论文的其它请求）**只补查没有结论的那几条**，不再每条都联网重查 —— 这也是
+`mode=agent` 导出第二次起能快一个量级的原因。`verified` / `likely` 一直复用；
+`not_found` 复用 `NOTE_OUT_REF_CACHE_DAYS`（默认 7 天）；`unverified` 不复用。
+`NOTE_OUT_REF_CACHE=0` 关闭缓存，调用方也可传 `refresh_ref_cache=True` 强制重查。
+
 设计原则：
 
 * **不臆造**：工具返回什么就记什么；检索失败（网络不可用 / 限流）记 `unverified`，
@@ -26,21 +39,23 @@
 * **离线安全**：所有联网检索都包在 try/except 里，失败只写进结果，不打断导出；
   测试环境没有网络时，机械导出不受影响，Agent 导出只是证据少一些。
 * **不依赖业务存储**：本模块只接收 `paper` / `sections` / `notes` 这些纯数据，
-  不读数据库、不碰权限（权限与落库由 `app.py` 负责）。
+  不读数据库、不碰权限（权限与落库由 `server/api/export.py` / `server/api/transfer.py` 负责）。
 
 对外接口：
 
 | 名字 | 作用 |
 | --- | --- |
 | `SKILL` | 技能声明（`name="note_out"`，提示词 + 两个只读工具） |
-| `run_note_out_agent()` | 跑工具循环 + 生成结构化报告，返回可序列化的 `report` 字典 |
+| `run_note_out_agent()` | 跑工具循环 + 生成**AI 分析部分**（由 `merge_agent_report()` 合进机械报告） |
 | `extract_code_links()` | 从任意文本里提取代码仓库地址（机械导出也会复用） |
 | `NOTE_OUT_TOOLS` | 工具声明（调试/测试用） |
 """
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
+import logging
 import re
 import threading
 import time
@@ -54,6 +69,8 @@ import httpx
 from ...envfile import env_value as _env_value
 from ..agent import Skill, blocking_completion, run_tool_loop
 from ..llm import LlmClient, LlmUnavailable
+
+log = logging.getLogger(__name__)
 
 # 学术库密钥的配置名（`.env` / 进程环境变量 / 账号设置都用这三个名字）
 CFG_OPENALEX = "OPENALEX_API_KEY"
@@ -147,11 +164,13 @@ _AGENT_SYSTEM = (
 )
 
 _REPORT_SYSTEM = (
-    "你是论文阅读助手。下面给出论文的分节内容、用户的笔记、以及刚才工具核验得到的证据。"
-    "请据此写一份**中文**分析报告，帮助用户回顾这篇论文和他的笔记。\n"
+    "你是论文阅读助手。论文的**分节结构、页数、笔记统计、参考文献结构检查**已由系统用"
+    "机械导出算好（导出 JSON 的 `report` 里已有这些字段），你**不需要复述它们**，"
+    "只写「AI 分析部分」。下面给出论文的分节内容、用户的笔记、以及刚才工具核验得到的证据。"
+    "请据此写一份**中文**分析，帮助用户回顾这篇论文和他的笔记。\n"
     "要求：\n"
     "1. 只依据给定内容，不要编造论文里没有的结论；正文被截断时不要假装看过全文。\n"
-    "2. `summary`：200~400 字，说明这篇论文研究什么、怎么做、主要结论，以及用户的笔记集中在哪些点。\n"
+    "2. `summary`：200~300 字，说明这篇论文研究什么、怎么做、主要结论，以及用户的笔记集中在哪些点。\n"
     "3. `paper_overview`：包含 problem（问题）、method（方法）、contributions（贡献数组）、"
     "findings（发现/结论数组）、limitations（局限数组，没有就给空数组）。\n"
     "4. `notes_analysis`：整理**用户的笔记**（不是复述论文）：overview（3~5 句）、"
@@ -168,17 +187,20 @@ _REPORT_SYSTEM = (
     "没有就返回空数组。\n"
     "7. `conclusion`：一段总结（100~200 字）；`next_steps`：3~6 条可执行建议。\n"
     "8. 参考文献核验统计（total / checked / matched / verified / likely / not_found / "
-    "unverified）由系统给出（`reference_stats`）。写 summary / conclusion 时可以直接引用"
-    "这些数字（尤其是「检索到且信息对得上」的 `matched` 条数），**不要自己计算或编造数字**。\n"
+    "unverified）已由系统写进机械报告。写 summary / conclusion 时可以直接引用"
+    "这些数字（尤其是「检索到且信息对得上」的 `matched` 条数），**不要自己计算或编造数字**，"
+    "也不要再单独输出一份统计。\n"
     "9. 没有内容的字段返回空数组或空字符串，不要写「暂无」「无」之类的占位符。\n"
     "10. 数学公式一律用 LaTeX：行内 `$…$`、独立成行 `$$…$$`；**不要**用反引号代码或纯文本写公式。\n"
+    "11. **输出要精简**：整份 JSON 控制在 2000 字以内，条目不要堆砌（每个数组最多 6 条）"
+    "—— 输出过长会被截断成非法 JSON。\n"
     "只输出 JSON："
     "{\"summary\":\"…\","
     "\"paper_overview\":{\"problem\":\"…\",\"method\":\"…\",\"contributions\":[],"
     "\"findings\":[],\"limitations\":[]},"
     "\"notes_analysis\":{\"overview\":\"…\",\"themes\":[{\"title\":\"…\",\"points\":[]}],"
     "\"connections\":[],\"questions\":[],\"next\":[]},"
-    "\"references_review\":[{\"id\":1,\"status\":\"verified\",\"note\":\"…\"}],"
+    "\"references_review\":[{\"id\":3,\"status\":\"not_found\",\"note\":\"…\"}],"
     "\"code_repositories\":[{\"url\":\"…\",\"verified\":true,\"note\":\"…\"}],"
     "\"conclusion\":\"…\",\"next_steps\":[]}"
 )
@@ -211,6 +233,12 @@ MAX_AUTO_VERIFY = 120        # 最多自动核验这么多条（再多也不会�
 AUTO_VERIFY_WORKERS = 3      # 并发核验的文献条数（每条内部还会并发查 3 个库）
 AUTO_VERIFY_DEADLINE = 180.0  # 全量核验的总时长上限（秒），超时剩下的标 unverified
 
+# 参考文献核验缓存：同一篇论文只联网核验一次，结果落库（store.get/set_refcheck），
+# 之后的导出直接复用 —— 不再每次导出都把整张列表重查一遍。
+REF_CACHE_VERSION = 1
+REF_CACHE_NEG_TTL = 7 * 86400   # not_found 结论的复用期（秒），过期后重查一次
+REF_CACHE_KEEP = ("verified", "likely")   # 这两类结论永远复用（不会随时间变化）
+
 _STRONG_STATUS = {"verified", "likely", "not_found", "unverified"}
 
 _UA = {
@@ -223,7 +251,7 @@ _UA = {
 #  配置：账号设置 → 进程环境变量 → 仓库里的 .env
 # =====================================================================
 # 前端「设置 → 学术检索」里填的 key 存在账号记录里（`users.prefs.scholar`），
-# 由 `app.py` 拼成这个模块认识的字典传进来；没配就回落到环境变量 / `.env`。
+# 由 `server/api/*` 拼成这个模块认识的字典传进来；没配就回落到环境变量 / `.env`。
 def _cfg_value(name: str, cfg: dict | None = None) -> str:
     """学术库配置值：账号配置 → 环境变量 → `.env` → 空串。"""
     if cfg:
@@ -1224,6 +1252,8 @@ def _reference_stats(sections: dict, state: dict | None) -> dict:
         "match_rate": round(matched / checked, 4) if checked else 0.0,
         # 本轮因限流/缺 API key 没能用上的学术库（结果可能偏保守）
         "sources_unavailable": sorted(_DOWN_SOURCES),
+        # 这次有多少条是直接复用上次核验结果（没有联网重查）
+        "reused": int((state or {}).get("ref_reused") or 0),
     }
 
 
@@ -1243,10 +1273,151 @@ def _attention_lines(sections: dict, state: dict | None, limit: int = 12) -> lis
     return lines
 
 
+# =====================================================================
+#  核验结果缓存（一次联网核验 → 落库 → 后续导出直接复用）
+# =====================================================================
+_REF_LOCKS: dict[str, threading.Lock] = {}
+_REF_LOCKS_GUARD = threading.Lock()
+
+
+def _ref_lock(key: str) -> threading.Lock:
+    """同一篇论文的核验在进程内串行：并发导出时只让一个请求联网，其余等它写缓存。"""
+    with _REF_LOCKS_GUARD:
+        lock = _REF_LOCKS.get(key)
+        if lock is None:
+            lock = _REF_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _ref_cache_enabled() -> bool:
+    return _env_value("NOTE_OUT_REF_CACHE").lower() not in ("0", "false", "no", "off")
+
+
+def _ref_cache_neg_ttl() -> float:
+    """`not_found` 结论的复用期（秒）：`NOTE_OUT_REF_CACHE_DAYS`，默认 7 天。"""
+    raw = _env_value("NOTE_OUT_REF_CACHE_DAYS")
+    try:
+        days = float(raw) if raw else REF_CACHE_NEG_TTL / 86400
+    except ValueError:
+        days = REF_CACHE_NEG_TTL / 86400
+    return max(0.0, days) * 86400
+
+
+def _scholar_sig(cfg: dict | None) -> str:
+    """学术库配置指纹：换了 Key（或第一次配 Key）后，旧缓存失效、重新核验。"""
+    return ",".join(
+        f"{name}={1 if _cfg_value(name, cfg) else 0}"
+        for name in (CFG_OPENALEX, CFG_S2, CFG_MAILTO, CFG_S2_BASE))
+
+
+def reference_fingerprint(sections: dict, cfg: dict | None = None) -> str:
+    """参考文献列表 + 学术库配置的指纹：列表一变（重解析 / 换论文）缓存自然失效。"""
+    parts = [f"v{REF_CACHE_VERSION}", "cfg:" + _scholar_sig(cfg)]
+    for pos, entry in enumerate(_refs_of(sections), 1):
+        parts.append(f"{_entry_ref_id(entry, pos)}:"
+                     f"{_title_key(entry.get('text'))[:300]}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def load_reference_cache(store, sections: dict, doc_id: str = "", *,
+                         cfg: dict | None = None,
+                         refresh: bool = False) -> dict[int, dict]:
+    """读上次的核验结果，返回 `{reference_id: 证据}`（可直接喂给全量核验）。
+
+    复用规则（保守）：
+
+    * `verified` / `likely`：**一直复用** —— 文献是否真实存在不随时间变化；
+    * `not_found`：`NOTE_OUT_REF_CACHE_DAYS`（默认 7 天）内复用，过期后重查；
+    * `unverified`（限流 / 网络不可用）：**不复用**，下次导出再试一次。
+
+    `refresh=True`、`NOTE_OUT_REF_CACHE=0`、没有 store / doc_id 时返回空。
+    """
+    if refresh or not doc_id or not store or not _ref_cache_enabled():
+        return {}
+    getter = getattr(store, "get_refcheck", None)
+    if not callable(getter):
+        return {}
+    try:
+        cached = getter(doc_id)
+    except Exception:                        # 缓存读失败不能影响导出
+        return {}
+    if not isinstance(cached, dict):
+        return {}
+    if cached.get("fingerprint") != reference_fingerprint(sections, cfg):
+        return {}
+    try:
+        at = float(cached.get("at") or 0)
+    except (TypeError, ValueError):
+        at = 0.0
+    neg_ok = bool(at) and (time.time() - at) <= _ref_cache_neg_ttl()
+    out: dict[int, dict] = {}
+    for key, ev in (cached.get("references") or {}).items():
+        if not isinstance(ev, dict):
+            continue
+        try:
+            rid = int(key)
+        except (TypeError, ValueError):
+            continue
+        status = str(ev.get("status") or "").strip().lower()
+        if status in REF_CACHE_KEEP or (status == "not_found" and neg_ok):
+            out[rid] = ev
+    log.info("复用参考文献核验缓存 %s：%d 条（跳过联网重查）", doc_id, len(out))
+    return out
+
+
+def save_reference_cache(store, sections: dict, doc_id: str, evidence: dict | None,
+                         *, cfg: dict | None = None) -> bool:
+    """把本轮核验证据落库（只存 `verified` / `likely` / `not_found` / `unverified`）。
+
+    返回是否写入成功；缓存写失败只是下次还要再查一遍，不影响本次导出。
+    """
+    if not doc_id or not store or not evidence or not _ref_cache_enabled():
+        return False
+    setter = getattr(store, "set_refcheck", None)
+    if not callable(setter):
+        return False
+    refs: dict[str, dict] = {}
+    for rid, ev in evidence.items():
+        if not isinstance(ev, dict):
+            continue
+        status = str(ev.get("status") or "").strip().lower()
+        if status in _STRONG_STATUS:
+            refs[str(rid)] = ev
+    if not refs:
+        return False
+    payload = {
+        "version": REF_CACHE_VERSION,
+        "doc_id": doc_id,
+        "fingerprint": reference_fingerprint(sections, cfg),
+        "at": time.time(),
+        "at_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "count": len(refs),
+        "references": refs,
+    }
+    try:
+        setter(doc_id, payload)
+    except Exception:                        # 缓存写失败：下次重新核验即可
+        return False
+    log.info("参考文献核验结果已缓存 %s：%d 条", doc_id, len(refs))
+    return True
+
+
+def _verify_with_cache(sections: dict, state: dict, *, store=None, doc_id: str = "",
+                       cfg: dict | None = None, refresh: bool = False) -> dict:
+    """核验：先用缓存、只查缺的那几条，结束后把完整结果写回缓存。"""
+    prefilled = load_reference_cache(store, sections, doc_id, cfg=cfg,
+                                     refresh=refresh)
+    stats = _verify_all_references(sections, state, cfg=cfg, prefilled=prefilled)
+    save_reference_cache(store, sections, doc_id, state.get("references") or {},
+                         cfg=cfg)
+    return stats
+
+
 def _verify_all_references(sections: dict, state: dict, *,
                            workers: int = AUTO_VERIFY_WORKERS,
                            deadline: float = AUTO_VERIFY_DEADLINE,
-                           cfg: dict | None = None) -> dict:
+                           cfg: dict | None = None,
+                           prefilled: dict | None = None) -> dict:
     """把**整张参考文献列表**逐条送去核验（不让模型决定查哪几条）。
 
     每条先按 DOI / arXiv 精确查，查不到再用「标题 + 作者 + 年份」去
@@ -1256,6 +1427,8 @@ def _verify_all_references(sections: dict, state: dict, *,
     证据表，状态取「更确定」的那个），并返回统计字典。
 
     `cfg`：当前账号的学术库配置（Key / 邮箱），不传就回落环境变量 / `.env`。
+    `prefilled`：之前核验过、可以直接复用的证据（`{reference_id: 证据}`）。
+    有结论的条目**不再联网重查**，只查缺的那些 —— 这是「第二次导出快很多」的关键。
     """
     entries = _refs_of(sections)[:MAX_AUTO_VERIFY]
     _DOWN_SOURCES.clear()                     # 每轮导出重新试一次，上一轮的熔断不带过来
@@ -1263,6 +1436,16 @@ def _verify_all_references(sections: dict, state: dict, *,
     todo: list[tuple[int, str]] = []
     seen: dict[str, int] = {}
     dup: list[tuple[int, int]] = []
+    reused = 0
+    for raw_rid, ev in (prefilled or {}).items():
+        try:
+            rid = int(raw_rid)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(ev, dict):
+            state["references"][rid] = ev      # 直接复用：不再联网核验
+            reused += 1
+    state["ref_reused"] = reused
     for pos, entry in enumerate(entries, 1):
         rid = _entry_ref_id(entry, pos)
         raw = str(entry.get("text") or "")
@@ -1272,6 +1455,8 @@ def _verify_all_references(sections: dict, state: dict, *,
             continue
         if key:
             seen[key] = rid
+        if rid in state["references"]:       # 已有结论（缓存/前面复用）：不用再查
+            continue
         todo.append((rid, raw))
 
     def work(item: tuple[int, str]) -> tuple[int, dict]:
@@ -1382,12 +1567,18 @@ def _ev_similarity(ev: Any) -> float | None:
 def run_note_out_agent(llm: LlmClient, *, paper: dict, sections: dict,
                        notes: dict, instructions: str = "",
                        verify_all: bool | None = None,
-                       scholar: dict | None = None) -> dict:
-    """跑 Agent 工具循环，再生成结构化分析报告。
+                       scholar: dict | None = None,
+                       store=None, doc_id: str = "",
+                       refresh_ref_cache: bool = False) -> dict:
+    """跑 Agent 工具循环，再生成**AI 分析部分**（不重写整份报告）。
 
     `llm` 直接使用 `agents/llm.py` 的 `LlmClient`（不经过 `translate.Translator` 转发）。
     `paper` / `sections` / `notes` 都由 `note_out.py` 准备好（纯数据）；
-    返回的 `report` 会直接放进导出 JSON。LLM 不可用时抛 `LlmUnavailable`。
+    返回值只有 AI 能提供的部分：`summary` / `paper_overview` / `notes_analysis` /
+    `references_stats` / `references_review` / `code_repositories` / `conclusion` /
+    `next_steps` / `evidence` —— 分节、统计、参考文献结构检查等确定性内容仍由
+    `build_mechanical_report()` 提供，两边由 `merge_agent_report()` 合并成最终 `report`。
+    LLM 不可用时抛 `LlmUnavailable`（上层按 `allow_fallback` 降级为机械导出）。
 
     `verify_all` 控制「是否先把整张参考文献列表自动核验一遍」：默认读环境变量
     `NOTE_OUT_VERIFY_ALL`（缺省为开），测试/离线环境可以直接传 `False`。
@@ -1395,6 +1586,11 @@ def run_note_out_agent(llm: LlmClient, *, paper: dict, sections: dict,
     `scholar`：当前账号在「设置 → 学术检索」里配的学术库 Key（键名
     `OPENALEX_API_KEY` / `SEMANTIC_SCHOLAR_API_KEY` / `SCHOLARLY_MAILTO`），
     不传就用环境变量 / `.env`。
+
+    `store` / `doc_id`：参考文献核验结果的**缓存位置**（`store.get_refcheck` /
+    `set_refcheck`）。传了就把整张列表的核验结论存下来，下次导出（以及并发导出
+    这篇论文的其它请求）直接复用、只查缺的那几条，不再每条都联网重查。
+    `refresh_ref_cache=True` 强制忽略旧缓存重新核验（`NOTE_OUT_REF_CACHE=0` 可关掉缓存）。
     """
     state: dict = {"references": {}, "code": None, "scholar": dict(scholar or {})}
     if verify_all is None:
@@ -1403,7 +1599,17 @@ def run_note_out_agent(llm: LlmClient, *, paper: dict, sections: dict,
     if verify_all:
         # 全量核验放在进模型之前：既能让报告给出准确条数，
         # 也省掉「让模型自己挑哪几条去查」这一步（原本最多只能查 12 条）。
-        _verify_all_references(sections, state, cfg=state["scholar"] or None)
+        # 有 store/doc_id 时走缓存；同一篇论文并发导出只让一个请求联网核验。
+        lock = _ref_lock(f"note-out-refcheck:{doc_id}") if doc_id else None
+        if lock is not None:
+            with lock:
+                _verify_with_cache(sections, state, store=store, doc_id=doc_id,
+                                   cfg=state["scholar"] or None,
+                                   refresh=refresh_ref_cache)
+        else:
+            _verify_with_cache(sections, state, store=store, doc_id=doc_id,
+                               cfg=state["scholar"] or None,
+                               refresh=refresh_ref_cache)
     system = SKILL.system_prompt
     msgs: list[dict] = [{"role": "user",
                          "content": _agent_context(paper, sections, notes,
@@ -1422,6 +1628,11 @@ def run_note_out_agent(llm: LlmClient, *, paper: dict, sections: dict,
             temperature=0.3):
         pass
 
+    # 模型在工具循环里可能把某条 not_found 复核成 verified：把更新后的证据再存一次
+    if verify_all:
+        save_reference_cache(store, sections, doc_id,
+                             state.get("references") or {},
+                             cfg=state["scholar"] or None)
     return _synthesize_report(llm, paper=paper, sections=sections,
                               notes=notes, state=state, instructions=instructions)
 
@@ -1708,6 +1919,11 @@ def _fallback_notes_analysis(notes: dict) -> dict:
 
 def _synthesize_report(llm: LlmClient, *, paper: dict, sections: dict,
                        notes: dict, state: dict, instructions: str) -> dict:
+    """让模型产出**AI 分析部分**（总结 / 论文要点 / 笔记整理 / 核验说明 / 结论）。
+
+    分节、统计、参考文献结构检查这些确定性内容不靠模型输出 —— 它们已经在机械报告里，
+    本函数的结果由 `merge_agent_report()` 叠加到机械报告上。
+    """
     raw = llm.chat_json(
         _REPORT_SYSTEM,
         _report_payload(paper, sections, notes, state, instructions),
@@ -1734,5 +1950,5 @@ def _synthesize_report(llm: LlmClient, *, paper: dict, sections: dict,
                 report["paper_overview"].get("method"),
                 report["notes_analysis"].get("overview"),
                 report["references_review"], report["code_repositories"])):
-        raise LlmUnavailable("模型没有返回可用的导出报告，请重试")
+        raise LlmUnavailable("模型没有返回可用的 AI 分析，请重试")
     return report

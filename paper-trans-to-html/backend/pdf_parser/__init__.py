@@ -25,7 +25,7 @@
     两条都不可用时直接报错。走了哪条看 `parser_info["unlimited_ocr_route"]`。
 
 对外接口：`parse_pdf(...)`(见 `entry.py`)与 `status(...)`(见 `options.py`)。
-`parse_pdf` 的签名与返回结构**保持不变** —— `converter.py`、`app.py` 与 `tools/*`
+`parse_pdf` 的签名与返回结构**保持不变** —— `converter.py`、`backend/server/api/*` 与 `tools/*`
 都不用改：`backend` / `options` / `config_file` 参数仍在。
 顶层 `formula_action` 与页级 `formula_boxes` 是**增量**字段(旧调用方忽略即可)；
 `formula_action` 取值：`"boxes"`（本地方案：页面级公式框覆盖层）/ `"surya"` /

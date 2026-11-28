@@ -1,0 +1,80 @@
+services:
+  redis:
+    image: redis:7-alpine
+    # 口令由 REDIS_PASSWORD 注入（缺省值是开发用的，生产务必在 .env 里覆盖）
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory-policy"
+      - "noeviction"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:-paper-redis-dev}"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-paper-redis-dev}
+    ports:
+      # 只绑宿主机回环：宿主机上的 reader 能连，外网 / 其它网段连不上
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  agent-comm:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "9500:8090"
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-paper-redis-dev}@redis:6379/0
+      # MongoDB 复用 mongo_configuration/ 的实例：容器内走同一网络的服务名 mongo:27017，
+      # 用业务账号 paper（仅 paper 库 readWrite），集合名与业务集合错开
+      MONGO_URL: ${MONGO_URL:-mongodb://paper:paper123@mongo:27017/paper?authSource=paper}
+      MONGO_DB: ${MONGO_DB:-paper}
+      KEY_COLLECTION: ${KEY_COLLECTION:-agent_transfer_keys}
+      KEY_HASH_PEPPER: ${KEY_HASH_PEPPER:-change-me-pepper}
+      # 准入：只认账号 transfer key（ptk_…），直读应用那套 transfer_keys / users
+      ACCOUNT_KEY_REQUIRED: ${ACCOUNT_KEY_REQUIRED:-1}
+      ALLOW_ENV_TRANSFER_KEYS: ${ALLOW_ENV_TRANSFER_KEYS:-0}
+      ACCOUNT_KEY_PREFIX: ${ACCOUNT_KEY_PREFIX:-ptk_}
+      ACCOUNT_KEY_COLLECTION: ${ACCOUNT_KEY_COLLECTION:-transfer_keys}
+      USER_COLLECTION: ${USER_COLLECTION:-users}
+      GATEWAY_META_COLLECTION: ${GATEWAY_META_COLLECTION:-agent_gateway_meta}
+      AUTH_STAMP_SECRET: ${AUTH_STAMP_SECRET:-}
+      STAMP_WINDOW: ${STAMP_WINDOW:-3600}
+      # 回包必须由 reader 签名（HMAC，密钥=盖章密钥），否则进 DLQ
+      REQUIRE_READER_SIG: ${REQUIRE_READER_SIG:-1}
+      ALLOWED_INTENTS: paper.insight.validate,paper.section.query,paper.note.export,paper.note.list
+      WORKER_CONCURRENCY: "16"
+      QUOTA_QPS: "20"
+      REQUIRE_SIGNATURE: "0"
+      # 传输层 agent 身份：JSON `{"agent-id":"密钥"}`，定义在 .env 里；
+      # 没配就在这里直接报错，避免“默默把鉴权关掉”。
+      AGENT_SECRETS: ${AGENT_SECRETS:?AGENT_SECRETS 未设置：请在 .env 里定义 {"<agent-id>":"<密钥>"}（见 .env.example）}
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8090/healthz')"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - default
+      - paper-net
+
+volumes:
+  redis-data:
+
+networks:
+  # 由 mongo_configuration/docker-compose.yml 创建，必须先把它跑起来
+  paper-net:
+    name: paper-mongo-net
+    external: true

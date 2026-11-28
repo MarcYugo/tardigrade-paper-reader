@@ -80,19 +80,7 @@ services:
       # （unlimited_ocr_online_api_key / unlimited_ocr_online_secret_key）；这里可覆盖
       UNLIMITED_OCR_ONLINE_API_KEY: ${UNLIMITED_OCR_ONLINE_API_KEY:-}
       UNLIMITED_OCR_ONLINE_SECRET_KEY: ${UNLIMITED_OCR_ONLINE_SECRET_KEY:-}
-
-      # ---- PaddleOCR-VL 解析服务（已删除：旧客户端与配对链路已随代码移除，
-      #      这组变量保留仅作历史记录，不再被读取）----
-      # 容器里的 127.0.0.1 连不到宿主机上的 paddleocr-vl 服务；
-      #    默认走 host.docker.internal（宿主端口 8080 由该服务映射，见
-      #    ../paddle_ocr_doc_parse_service/docker-compose.gpu.yml 的 HOST_PORT）。
-      #    若把它接进了同一个 Docker 网络，可改成 http://paddleocr-vl-vllm:8080/v1
-      PADDLE_OCR_URL: ${PADDLE_OCR_URL:-http://host.docker.internal:8080/v1}
-      # 模型别名要和服务端 --served-model-name 对得上（默认值即 compose 里挂的那个）
-      PADDLE_OCR_MODEL: ${PADDLE_OCR_MODEL:-PaddleOCR-VL-1.6-0.9B}
-      # 服务端设了 --api-key 时才需要；没设时留空即可（vLLM 会忽略该头）
-      PADDLE_OCR_API_KEY: ${PADDLE_OCR_API_KEY:-}
-
+      
       # ---- PDF 解析后端（OCR）----
       # ⚠️ 默认**留空**（不注入环境变量）= 用网页「⚙ 设置 → 存储 / OCR」里保存的值。
       #    以前这里硬编码成 `${PDF_PARSER_BACKEND:-auto}`，容器里永远存在这个变量，

@@ -67,11 +67,18 @@ def _new_profile_id() -> str:
 
 
 def _profile_label(p: dict, idx: int) -> str:
-    """配置槽的显示名：优先用自定义名，否则用“配置 N（模型/地址）”。"""
+    """配置槽的显示名：优先用自定义名，否则用“配置 N（模型/地址）”。
+
+    Google 免费兜底没有地址 / 模型：那种槽只写“（免费兜底）”，
+    免得把上一套配置残留的 deepseek-chat 之类当成它的模型显示。
+    """
     name = (p.get("name") or "").strip()
     if name:
         return name
-    tail = (p.get("model") or "").strip() or (p.get("base_url") or "").strip()
+    if str(p.get("provider") or "").strip().lower() == "google":
+        tail = "免费兜底"
+    else:
+        tail = (p.get("model") or "").strip() or (p.get("base_url") or "").strip()
     return f"配置 {idx}" + (f"（{tail}）" if tail else "")
 
 
@@ -522,6 +529,10 @@ class SettingsStore:
             provider = "custom"
         base_url = (base_url or "").strip().rstrip("/")
         model = (model or "").strip()
+        if provider == "google":
+            # 免费兜底不需要地址 / 模型：别把上一套配置残留的值存进这套里
+            base_url = ""
+            model = ""
 
         profs = self._profiles_raw(username)
         want = (profile_id or "").strip()
